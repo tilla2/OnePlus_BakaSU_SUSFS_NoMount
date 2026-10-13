@@ -1437,6 +1437,8 @@ jobs:
                   bbrv3) features+=("🚀 BBRv3") ;;
                   bore) features+=("🌀 BoRE") ;;
                   lz4) features+=("⚡ LZ4 1.10.0 + ARMv8 NEON") ;;
+                  zstd-upgrade) features+=("🗜️ zstd 1.5.7 + tunable level") ;;
+                  rtmutex-cve) features+=("🔒 CVE-2026-43499 fix") ;;
                   adios) features+=("🧭 ADIOS") ;;
                 esac
               done < "$status_file"
