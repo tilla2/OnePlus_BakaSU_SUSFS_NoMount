@@ -2415,7 +2415,7 @@ runs:
           echo "::endgroup::"
           exit 0
         fi
-        gen_patch rtmutex-cve /tmp/rtmutex_cve_6_12.patch "" "g:kernel/locking/rtmutex.c|waiter_task->pi_blocked_on = NULL;g:kernel/locking/rtmutex_api.c|waiter_task"
+        gen_patch rtmutex-cve /tmp/rtmutex_cve_6_12.patch "" "g:kernel/locking/rtmutex.c|waiter_task->pi_blocked_on = NULL;g:kernel/locking/rtmutex_api.c|unlikely\(ret < 0\)"
         if ! grep -Eq '^rtmutex-cve\|(applied|already)' "$PS_FILE" 2>/dev/null; then
           echo "::warning::CVE-2026-43499 fix did not stage at fuzz=0; continuing without it"
           sed -i '/^rtmutex-cve|/d' "$PS_FILE" 2>/dev/null || true
@@ -2426,7 +2426,7 @@ runs:
         if [ "$(grep -E '^rtmutex-cve\|' "$PS_FILE" | tail -n1)" = "rtmutex-cve|applied" ]; then
           grep -q 'waiter_task->pi_blocked_on = NULL' kernel/locking/rtmutex.c
           grep -q 'waiter::task != current' kernel/locking/rtmutex.c
-          grep -q 'waiter_task' kernel/locking/rtmutex_api.c
+          grep -qF 'unlikely(ret < 0)' kernel/locking/rtmutex_api.c
         fi
         echo "RTMUTEX_CVE_FIXED=true" >> "$GITHUB_ENV"
         echo "RTMUTEX_CVE_SOURCE=https://github.com/cctv18/oppo_oplus_realme_sm8850 other_patch/cve-2026-43499-rtmutex-6.12.patch @6c1ffda" >> "$GITHUB_ENV"
