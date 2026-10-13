@@ -147,6 +147,16 @@ runs:
         if ! jq -e 'has("opt")' /tmp/config.json >/dev/null; then
           echo "OP_OPT=true" >> "$GITHUB_ENV"
         fi
+        # Same defaulting rule for the zstd 1.5.7 upgrade (cctv18 6.12 port): when
+        # the config omits "zstd_upgrade", keep it enabled (step is 6.12-gated).
+        if ! jq -e 'has("zstd_upgrade")' /tmp/config.json >/dev/null; then
+          echo "OP_ZSTD_UPGRADE=true" >> "$GITHUB_ENV"
+        fi
+        # Same defaulting rule for the CVE-2026-43499 rtmutex fix: when the config
+        # omits "rtmutex_cve", keep it enabled (step is 6.12-gated).
+        if ! jq -e 'has("rtmutex_cve")' /tmp/config.json >/dev/null; then
+          echo "OP_RTMUTEX_CVE=true" >> "$GITHUB_ENV"
+        fi
         echo "Parsed config:"
         jq '.' /tmp/config.json
         jq -e . /tmp/config.json >/dev/null
@@ -323,7 +333,7 @@ runs:
           *) errors+=("optimize_level must be O2 or O3. Got: '$optimize'"); ;;
         esac
         
-        for bool_opt in OP_LZ4_UPGRADE OP_ADIOS OP_BBR3 OP_BORE; do
+        for bool_opt in OP_LZ4_UPGRADE OP_ZSTD_UPGRADE OP_ADIOS OP_RTMUTEX_CVE OP_BBR3 OP_BORE; do
           val="${!bool_opt:-}"
           if [[ -n "$val" && "$val" != "true" && "$val" != "false" ]]; then
             errors+=("$bool_opt must be true or false if set. Got: '$val'")
@@ -2223,6 +2233,48 @@ runs:
         echo "lz4|applied" >> "$PS_FILE"
         echo "::endgroup::"
 
+    - name: Upgrade zstd (1.5.7 + tunable level)
+      if: ${{ env.OP_ZSTD_UPGRADE == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Upgrade zstd"
+        if [ "${{ env.KERNEL_VER }}" != "6.12" ]; then
+          echo "zstd-upgrade|skipped" >> "$PS_FILE"
+          echo "zstd 1.5.7 upgrade is staged for 6.12 trees only; this is ${{ env.KERNEL_VER }} - skipping"
+          echo "::endgroup::"
+          exit 0
+        fi
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        if grep -Eq 'ZSTD_VERSION_RELEASE[[:space:]]+7' include/linux/zstd_lib.h && grep -q 'compression_level' crypto/zstd.c; then
+          echo "zstd already at 1.5.7 with tunable level, skipping"
+          echo "zstd-upgrade|already" >> "$PS_FILE"
+        else
+          zstd_url="https://raw.githubusercontent.com/cctv18/oppo_oplus_realme_sm8850/6c1ffdac3ebf7ebb80254427a7972262b0a8f64e/zram_patch/002-zstd.patch"
+          if ! fetch_patch "$zstd_url" /tmp/zstd_157.patch; then
+            echo "::warning::zstd 1.5.7 patch unavailable upstream; continuing without it"
+            echo "zstd-upgrade|skipped" >> "$PS_FILE"
+            echo "::endgroup::"
+            exit 0
+          fi
+          gen_patch zstd-upgrade /tmp/zstd_157.patch "" "g:crypto/zstd.c|compression_level"
+          if ! grep -Eq '^zstd-upgrade\|(applied|already)' "$PS_FILE" 2>/dev/null; then
+            echo "::warning::zstd 1.5.7 patch did not stage at fuzz=0; continuing without it"
+            sed -i '/^zstd-upgrade|/d' "$PS_FILE" 2>/dev/null || true
+            echo "zstd-upgrade|skipped" >> "$PS_FILE"
+            echo "::endgroup::"
+            exit 0
+          fi
+        fi
+        grep -Eq 'ZSTD_VERSION_RELEASE[[:space:]]+7' include/linux/zstd_lib.h
+        grep -q 'module_param(compression_level' crypto/zstd.c
+        grep -n 'ZSTD_VERSION_RELEASE' include/linux/zstd_lib.h || true
+        echo "ZSTD_UPGRADED=true" >> "$GITHUB_ENV"
+        echo "ZSTD_SOURCE=https://github.com/cctv18/oppo_oplus_realme_sm8850 zram_patch/002-zstd.patch @6c1ffda" >> "$GITHUB_ENV"
+        echo "✅ zstd upgraded to 1.5.7 with tunable crypto compression level"
+        echo "::endgroup::"
+
     - name: Enable ADIOS I/O Scheduler
       shell: bash
       run: |
@@ -2341,6 +2393,46 @@ runs:
         else
           echo "::error::gki_ptrace patch did not apply (no applied/already status in $PS_FILE)"; exit 1
         fi
+
+    - name: Apply rtmutex CVE-2026-43499 fix
+      if: ${{ env.OP_RTMUTEX_CVE == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Apply rtmutex CVE-2026-43499"
+        if [ "${{ env.KERNEL_VER }}" != "6.12" ]; then
+          echo "rtmutex-cve|skipped" >> "$PS_FILE"
+          echo "CVE-2026-43499 fix is staged for 6.12 trees only; this is ${{ env.KERNEL_VER }} - skipping"
+          echo "::endgroup::"
+          exit 0
+        fi
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        cve_url="https://raw.githubusercontent.com/cctv18/oppo_oplus_realme_sm8850/6c1ffdac3ebf7ebb80254427a7972262b0a8f64e/other_patch/cve-2026-43499-rtmutex-6.12.patch"
+        if ! fetch_patch "$cve_url" /tmp/rtmutex_cve_6_12.patch; then
+          echo "::warning::CVE-2026-43499 patch unavailable upstream; continuing without it"
+          echo "rtmutex-cve|skipped" >> "$PS_FILE"
+          echo "::endgroup::"
+          exit 0
+        fi
+        gen_patch rtmutex-cve /tmp/rtmutex_cve_6_12.patch "" "g:kernel/locking/rtmutex.c|waiter_task->pi_blocked_on = NULL;g:kernel/locking/rtmutex_api.c|waiter_task"
+        if ! grep -Eq '^rtmutex-cve\|(applied|already)' "$PS_FILE" 2>/dev/null; then
+          echo "::warning::CVE-2026-43499 fix did not stage at fuzz=0; continuing without it"
+          sed -i '/^rtmutex-cve|/d' "$PS_FILE" 2>/dev/null || true
+          echo "rtmutex-cve|skipped" >> "$PS_FILE"
+          echo "::endgroup::"
+          exit 0
+        fi
+        if [ "$(grep -E '^rtmutex-cve\|' "$PS_FILE" | tail -n1)" = "rtmutex-cve|applied" ]; then
+          grep -q 'waiter_task->pi_blocked_on = NULL' kernel/locking/rtmutex.c
+          grep -q 'waiter::task != current' kernel/locking/rtmutex.c
+          grep -q 'waiter_task' kernel/locking/rtmutex_api.c
+        fi
+        echo "RTMUTEX_CVE_FIXED=true" >> "$GITHUB_ENV"
+        echo "RTMUTEX_CVE_SOURCE=https://github.com/cctv18/oppo_oplus_realme_sm8850 other_patch/cve-2026-43499-rtmutex-6.12.patch @6c1ffda" >> "$GITHUB_ENV"
+        echo "✅ CVE-2026-43499 rtmutex fix applied (remove_waiter futex PI proxy path)"
+        echo "::endgroup::"
+
     - name: Apply HMBIRD Fengchi patches
       shell: bash
       run: |
@@ -3767,6 +3859,8 @@ runs:
           echo "NTSync: $(pstat ntsync)"
           echo "Droidspaces: $(pstat ds)"
           echo "LZ4 1.10.0 + ARMv8 NEON: $(pstat lz4)"
+          echo "zstd 1.5.7 + tunable level: $(pstat zstd-upgrade)"
+          echo "CVE-2026-43499 rtmutex fix: $(pstat rtmutex-cve)"
           echo "NoMount: $(pstat nomount)"
           echo "Vendor Module Blacklist: $(pstat vendor-modules-blacklist)"
           echo "WildKernels' Optimisations: $(pstat wk-opt)"
@@ -3841,6 +3935,8 @@ runs:
           echo "| **NTSync** | $(pstat ntsync) |"
           echo "| **Droidspaces** | $(pstat ds) |"
           echo "| **LZ4 1.10.0 + ARMv8 NEON** | $(pstat lz4) |"
+          echo "| **zstd 1.5.7 + tunable level** | $(pstat zstd-upgrade) |"
+          echo "| **CVE-2026-43499 rtmutex fix** | $(pstat rtmutex-cve) |"
           echo "| **NoMount** | $(pstat nomount) |"
           echo "| **Vendor Module Blacklist** | $(pstat vendor-modules-blacklist) |"
           echo "| **WildKernels' Optimisations** | $(pstat wk-opt) |"
