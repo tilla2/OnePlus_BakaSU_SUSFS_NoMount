@@ -2218,6 +2218,13 @@ runs:
       run: |
         set -euo pipefail
         echo "::group::Enable ADIOS I/O scheduler"
+        if [ "${OP_ADIOS:-true}" != true ]; then
+          echo "adios|skipped" >> "$PS_FILE"
+          echo "ADIOS_SKIPPED=disabled-by-config" >> "$GITHUB_ENV"
+          echo "ADIOS disabled by config (adios: false); skipping"
+          echo "::endgroup::"
+          exit 0
+        fi
         cd "$COMMON_KERNEL_FOLDER"
         source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
         if [ ! -f block/adios.c ]; then
@@ -2798,6 +2805,13 @@ runs:
       run: |
         set -euo pipefail
         echo "::group::Apply BBRv3"
+        if [ "${OP_BBR3:-true}" != true ]; then
+          echo "bbrv3|skipped" >> "$PS_FILE"
+          echo "BBR3_SKIPPED=disabled-by-config" >> "$GITHUB_ENV"
+          echo "BBRv3 disabled by config (bbr3: false); skipping"
+          echo "::endgroup::"
+          exit 0
+        fi
         cd "$COMMON_KERNEL_FOLDER"
         source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
         BBR3_BASE="https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/common/bbrv3"
@@ -2854,6 +2868,13 @@ runs:
       run: |
         set -euo pipefail
         echo "::group::Apply BoRE scheduler"
+        if [ "${OP_BORE:-true}" != true ]; then
+          echo "bore|skipped" >> "$PS_FILE"
+          echo "BORE_SKIPPED=disabled-by-config" >> "$GITHUB_ENV"
+          echo "BoRE disabled by config (bore: false); skipping"
+          echo "::endgroup::"
+          exit 0
+        fi
         cd "$COMMON_KERNEL_FOLDER"
         source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
         BORE_PATCH="bore_${KERNEL_VER}.patch"
