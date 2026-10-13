@@ -22,6 +22,8 @@
   "bbr3": true,
   "bore": false,
   "lz4_upgrade": true,
+  "zstd_upgrade": true,
+  "rtmutex_cve": true,
   "adios": true,
   "ttl": true,
   "ip_set": true,
