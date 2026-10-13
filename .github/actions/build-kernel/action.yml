@@ -137,6 +137,11 @@ runs:
         if ! jq -e 'has("bore")' /tmp/config.json >/dev/null; then
           echo "OP_BORE=true" >> "$GITHUB_ENV"
         fi
+        # Same defaulting rule for the WildKernels' optimisations bundle: when the
+        # config omits "opt", keep the historical always-apply behaviour.
+        if ! jq -e 'has("opt")' /tmp/config.json >/dev/null; then
+          echo "OP_OPT=true" >> "$GITHUB_ENV"
+        fi
         echo "Parsed config:"
         jq '.' /tmp/config.json
 
@@ -399,7 +404,7 @@ runs:
 
         KERNEL_SYNC_SHA="$(git -C "$COMMON_KERNEL_DIR" rev-parse HEAD 2>/dev/null || echo unavailable)"
         echo "KERNEL_SYNC_SHA=$KERNEL_SYNC_SHA" >> "$GITHUB_ENV"
-        echo "Kernel tree synced at: $KERNEL_SYNC_SHA (use this as the anchor SHA in patch-anchors.txt for any patch that stops applying at fuzz=0)"
+        echo "Kernel tree synced at: $KERNEL_SYNC_SHA (patch staging runs against this tree)"
 
     - name: Prepare patch generation harness
       shell: bash
@@ -407,6 +412,7 @@ runs:
         set -euo pipefail
         mkdir -p "$GITHUB_WORKSPACE/patchgen" "$GITHUB_WORKSPACE/patch-faillogs"
         cat > "$GITHUB_WORKSPACE/patchgen/gen_patch.sh" <<'GEN_PATCH_EOF'
+
         split_hunks() {
           local patch_file="$1" out_dir="$2"
           rm -rf "$out_dir" && mkdir -p "$out_dir"
@@ -438,212 +444,146 @@ runs:
             }
           ' "$patch_file"
         }
-        anchor_rescue() {
-          local name="$1" patch_file="$2" verify_spec="${3:-}"
-          local anchors="$GITHUB_WORKSPACE/patch-anchors.txt"
-          local sha
-          sha=$(awk -v n="$name" '$1 == n && $2 ~ /^[0-9a-fA-F]{7,40}$/ { print $2; exit }' "$anchors" 2>/dev/null || true)
-          if [ -z "$sha" ]; then
-            echo "[patchgen] ${name}: no patch-anchors.txt entry; skipping 3-way rescue"
+        regen_hunk() {
+          # Exact drift-tolerant hunk regeneration (diff @ generate).
+          # Locates the hunk's core change in the sandbox copy of the live tree by
+          # exact line matching only - no fuzz, no anchor sidecars, no 3-way merge.
+          # Edits the sandbox copy in place; the caller regenerates the final diff
+          # from the sandbox, so the live-tree apply stays fuzz=0.
+          # rc: 0 = edited exactly, 2 = change already present, 1 = not placeable.
+          local hunk="$1" root="$2" tgt f src errf tmp_out rc diag
+          tgt=$( { grep -m1 -E '^\+\+\+ ' "$hunk" || true; } | awk '{print $2}' | sed 's#^b/##;s#^a/##' )
+          src=$( { grep -m1 -E '^--- ' "$hunk" || true; } | awk '{print $2}' | sed 's#^a/##;s#^b/##' )
+          if [ -z "$tgt" ] || [ "$tgt" = "/dev/null" ]; then
+            echo "hunk has no file target"
             return 1
           fi
-          local kdir="$COMMON_KERNEL_FOLDER" adir="/tmp/pg_${name}_anchor" bdir="/tmp/pg_${name}_base" mdir="/tmp/pg_${name}_merged"
-          local alog="/tmp/pg_${name}_anchor.log"
-          rm -rf "$adir" "$bdir" "$mdir" && mkdir -p "$adir" "$bdir" "$mdir"
-          echo "[patchgen] ${name}: staging failed — attempting anchor 3-way merge (base ${sha})"
-          : > "$alog"
-          git -C "$kdir" fetch --depth=1 origin "$sha" >> "$alog" 2>&1 || true
-          if ! git -C "$kdir" cat-file -e "$sha" 2>/dev/null; then
-            echo "::warning::[patchgen] ${name}: anchor ${sha} not fetchable from origin; rescue aborted"
-            return 1
-          fi
-          if ! git -C "$kdir" archive "$sha" | tar -x -C "$bdir" >> "$alog" 2>&1; then
-            echo "::warning::[patchgen] ${name}: anchor ${sha} archive failed; rescue aborted"
-            return 1
-          fi
-          cp -a "$bdir/." "$adir/"
-          if ! patch -p1 --dry-run --fuzz=0 --no-backup-if-mismatch -d "$adir" < "$patch_file" >> "$alog" 2>&1; then
-            echo "::warning::[patchgen] ${name}: patch does not apply cleanly on anchor ${sha} (stale anchor); rescue aborted"
-            cp "$alog" "$GITHUB_WORKSPACE/patch-faillogs/${name}_anchor.log" 2>/dev/null || true
-            return 1
-          fi
-          local targets f rc status=0
-          targets=$( { grep -E '^(\+\+\+|---) ' "$patch_file" || true; } | awk '{print $2}' | sed 's#^a/##;s#^b/##' | sort -u )
-          patch -p1 --forward --fuzz=0 --no-backup-if-mismatch -d "$adir" < "$patch_file" >> "$alog" 2>&1 || true
-          : > "${mdir}/.ops"
-          for f in $targets; do
-            case "$f" in /dev/null) continue ;; esac
-            if [ -f "$bdir/$f" ] && [ -f "$adir/$f" ] && [ -f "$kdir/$f" ]; then
-              mkdir -p "${mdir}/$(dirname "$f")"
-              git merge-file -L ours -L base -L theirs -p "$kdir/$f" "$bdir/$f" "$adir/$f" > "${mdir}/$f" 2>>"$alog"
-              rc=$?
-              if [ "$rc" -ne 0 ]; then
-                echo "conflict: $f (exit $rc)" >> "$alog"; status=1
-              else
-                echo "keep $f" >> "${mdir}/.ops"
-              fi
-            elif [ ! -f "$bdir/$f" ] && [ -f "$adir/$f" ] && [ ! -f "$kdir/$f" ]; then
-              mkdir -p "${mdir}/$(dirname "$f")"
-              cp "$adir/$f" "${mdir}/$f"
-              echo "keep $f" >> "${mdir}/.ops"
-            elif [ ! -f "$bdir/$f" ] && [ -f "$adir/$f" ] && [ -f "$kdir/$f" ]; then
-              mkdir -p "${mdir}/$(dirname "$f")"
-              git merge-file -L ours -L base -L theirs -p "$kdir/$f" /dev/null "$adir/$f" > "${mdir}/$f" 2>>"$alog"
-              rc=$?
-              if [ "$rc" -ne 0 ]; then
-                echo "conflict: $f (created on both sides, exit $rc)" >> "$alog"; status=1
-              else
-                echo "keep $f" >> "${mdir}/.ops"
-              fi
-            elif [ -f "$bdir/$f" ] && [ ! -f "$adir/$f" ]; then
-              if [ -f "$kdir/$f" ] && cmp -s "$kdir/$f" "$bdir/$f"; then
-                echo "delete $f" >> "${mdir}/.ops"
-              else
-                echo "conflict: $f (deleted by patch but modified in tree)" >> "$alog"; status=1
-              fi
-            elif [ -f "$bdir/$f" ] && [ -f "$adir/$f" ] && [ ! -f "$kdir/$f" ]; then
-              mkdir -p "${mdir}/$(dirname "$f")"
-              git merge-file -L ours -L base -L theirs -p /dev/null "$bdir/$f" "$adir/$f" > "${mdir}/$f" 2>>"$alog"
-              rc=$?
-              if [ "$rc" -ne 0 ]; then
-                echo "conflict: $f (missing in tree, exit $rc)" >> "$alog"; status=1
-              else
-                echo "keep $f" >> "${mdir}/.ops"
-              fi
-            else
-              echo "conflict: $f (unresolvable file state)" >> "$alog"; status=1
-            fi
-          done
-          if [ "$status" -ne 0 ]; then
-            echo "::warning::[patchgen] ${name}: anchor 3-way merge hit conflicts; patch rejected (all-or-nothing)"
-            cp "$alog" "$GITHUB_WORKSPACE/patch-faillogs/${name}_anchor.log" 2>/dev/null || true
-            return 1
-          fi
-          if [ -n "$verify_spec" ]; then
-            local spec vrc=0
-            local -a vlist
-            ( cd "$mdir" || exit 1
-              IFS=';' read -ra vlist <<< "$verify_spec"
-              for spec in "${vlist[@]}"; do
-                [ -n "$spec" ] || continue
-                case "$spec" in
-                  g:*) verify_grep "${spec#g:}" || { vrc=1; break; } ;;
-                  f:*) verify_infn "${spec#f:}" || { vrc=1; break; } ;;
-                esac
-              done ) || vrc=1
-            if [ "$vrc" -ne 0 ]; then
-              echo "::warning::[patchgen] ${name}: anchor-merged result failed verification; patch rejected"
-              cp "$alog" "$GITHUB_WORKSPACE/patch-faillogs/${name}_anchor.log" 2>/dev/null || true
-              return 1
-            fi
-            echo "[patchgen] ${name}: anchor-merge verification passed"
-            echo "✅ ${name} verified (anchor-merge)"
-          fi
-          local op p
-          while read -r op; do
-            case "$op" in
-              keep\ *) p="${op#keep }"; cp "${mdir}/${p}" "${kdir}/${p}" ;;
-              delete\ *) p="${op#delete }"; rm -f "${kdir}/${p}" ;;
-            esac
-          done < "${mdir}/.ops"
-          echo "[patchgen] ${name}: applied via anchor 3-way merge (base ${sha})"
-          echo "${name}|applied" >> "${PS_FILE:-patch-status-raw.txt}"
-          cp "$alog" "$GITHUB_WORKSPACE/patch-faillogs/${name}_anchor.log" 2>/dev/null || true
-          return 0
-        }
-        fuzz_restage() {
-          local name="$1" src="$2" md="$3" targets="$4" base="$5"
-          local f h hdir hlist ok=1
-          for f in $targets; do
-            case "$f" in /dev/null) continue ;; esac
-            [ -f "$f" ] || continue
-            cp "$f" "${md}/$f"
-          done
-          : > "${base}/fuzz.log"
-          hdir="${base}/hunks_fuzz"
-          split_hunks "$src" "$hdir"
-          hlist=$(ls "$hdir"/*.hunk 2>/dev/null || true)
-          for h in $hlist; do
-            if patch -p1 --forward --fuzz=0 --no-backup-if-mismatch -d "$md" < "$h" >> "${base}/fuzz.log" 2>&1; then
-              continue
-            fi
-            if patch -p1 --forward --fuzz=2 --no-backup-if-mismatch -d "$md" < "$h" >> "${base}/fuzz.log" 2>&1; then
-              echo "hunk ${h##*/} staged at fuzz=2 (sandbox only)" >> "${base}/fuzz.log"
-              continue
-            fi
-            echo "hunk ${h##*/} not stageable even at fuzz=2" >> "${base}/fuzz.log"
-            ok=0
-          done
-          find "$md" -name '*.rej' -delete 2>/dev/null || true
-          find "$md" -name '*.orig' -delete 2>/dev/null || true
-          if [ "$ok" -eq 1 ]; then
-            cp "${base}/fuzz.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_fuzz.log" 2>/dev/null || true
-            echo "[patchgen] ${name}: staged with bounded per-hunk fuzz (sandbox only); regenerating exact patch for the target tree"
-            return 0
-          fi
-          cp "${base}/fuzz.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_fuzz.log" 2>/dev/null || true
-          return 1
-        }
-        anchor_place() {
-          # Exact, fuzz-free placement of a pure-insertion hunk: the last
-          # non-blank pre-image context line before the insertion must be
-          # unique in the target file. Returns 0=placed, 2=already placed.
-          local hunk="$1" root="$2" tgt f anchor added i j
-          tgt=$(grep -m1 -E '^\+\+\+ ' "$hunk" | awk '{print $2}' | sed 's#^b/##;s#^a/##')
-          if [ -z "$tgt" ] || [ "$tgt" = "/dev/null" ] || [ ! -f "$root/$tgt" ]; then
-            echo "target missing from sandbox"; return 1
-          fi
-          if grep -qE '^-[^-]' "$hunk"; then
-            echo "not a pure-insertion hunk"; return 1
-          fi
-          added=$(sed -n '/^@@/,$p' "$hunk" | grep -E '^\+' | sed 's/^+//')
-          [ -n "$added" ] || { echo "no added lines"; return 1; }
-          anchor=$(awk '/^@@/{b=1; next} !b{next} /^\+/{print a; exit} /^ /{l=substr($0,2); if (l !~ /^[[:space:]]*$/) a=l}' "$hunk")
-          [ -n "$anchor" ] || { echo "no context anchor"; return 1; }
           f="$root/$tgt"
-          local -a fl ab hits=()
-          mapfile -t fl < "$f"
-          mapfile -t ab <<< "$added"
-          for i in "${!fl[@]}"; do
-            [ "${fl[$i]}" = "$anchor" ] && hits+=("$i")
-          done
-          if [ "${#hits[@]}" -ne 1 ]; then
-            echo "anchor not unique (${#hits[@]}x)"; return 1
-          fi
-          local ai="${hits[0]}" dup=1
-          for j in "${!ab[@]}"; do
-            [ "${fl[$((ai + 1 + j))]:-}" = "${ab[$j]}" ] || { dup=0; break; }
-          done
-          if [ "$dup" = "1" ]; then
-            echo "already placed after anchor"; return 2
-          fi
-          local -a out=("${fl[@]:0:$((ai + 1))}" "${ab[@]}" "${fl[@]:$((ai + 1))}")
-          printf '%s\n' "${out[@]}" > "$f"
-          echo "placed at exact unique anchor"; return 0
-        }
-        exact_restage() {
-          # Restage only the failed hunks of a patch via exact anchor placement
-          # (no fuzz). Returns 0 only if every failed hunk was placed.
-          local name="$1" md="$2" failed_list="$3" base="$4" h rc verdict all=0 resolved=""
-          : > "${base}/exact.log"
-          for h in $failed_list; do
-            [ -f "${base}/hunks/$h" ] || { all=1; continue; }
-            verdict=$(anchor_place "${base}/hunks/$h" "$md")
-            rc=$?
-            echo "hunk ${h}: ${verdict}" >> "${base}/exact.log"
-            if [ "$rc" = "2" ]; then
-              resolved+="${h%.hunk}(already) "
-            elif [ "$rc" = "0" ]; then
-              resolved+="${h%.hunk}(exact) "
+          if [ ! -f "$f" ]; then
+            if [ "$src" = "/dev/null" ]; then
+              echo "file-creation hunk; handled by verbatim staging"
             else
-              all=1
+              echo "target missing from sandbox"
             fi
-          done
-          cp "${base}/exact.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_exact.log" 2>/dev/null || true
-          if [ "$all" = "0" ]; then
-            echo "[patchgen] ${name}: exact anchor placement resolved: ${resolved% }"
-            return 0
+            return 1
           fi
+          errf=$(mktemp); tmp_out=$(mktemp); rc=0
+          awk '
+            function fail2(msg) { printf "FAIL %s\n", msg > "/dev/stderr"; exit 1 }
+            function nonblank(s) { return s !~ /^[ \t]*$/ }
+            function sufmatch(i, maxk,   k) {
+              k = 0
+              while (k < maxk && i - k - 1 >= 1 && fl[i - k - 1] == lctx[maxk - k]) k++
+              return k
+            }
+            function prefmatch(i, maxk,   t) {
+              t = 0
+              while (t < maxk && i + t <= n && fl[i + t] == tctx[t + 1]) t++
+              return t
+            }
+            function anchored(j, len,   k, t, ok, m) {
+              k = sufmatch(j, nl); t = prefmatch(j + len, nt)
+              if (k + t == 0) return 0
+              ok = 0
+              for (m = 1; m <= k && !ok; m++) if (nonblank(lctx[nl - k + m])) ok = 1
+              for (m = 1; m <= t && !ok; m++) if (nonblank(tctx[m])) ok = 1
+              return ok ? (k + t) : 0
+            }
+            function remeq(j,   m) { for (m = 1; m <= nrem; m++) if (fl[j + m - 1] != rem[m]) return 0; return 1 }
+            function addeq(j,   m) { for (m = 1; m <= nadd; m++) if (fl[j + m - 1] != add[m]) return 0; return 1 }
+            FNR == NR {
+              if (!inh) { if ($0 ~ /^@@ /) inh = 1; next }
+              if ($0 ~ /^\\/) { noeno = 1; next }
+              b[++nb] = $0
+              next
+            }
+            { fl[++n] = $0 }
+            END {
+              if (noeno) fail2("no-newline marker in hunk; not regenerating")
+              firstchg = 0; lastchg = 0
+              for (i = 1; i <= nb; i++) {
+                c = substr(b[i], 1, 1)
+                if (c == "+" || c == "-") { if (firstchg == 0) firstchg = i; lastchg = i }
+              }
+              if (firstchg == 0) fail2("hunk carries no changes")
+              for (i = 1; i < firstchg; i++) if (substr(b[i], 1, 1) == " ") lctx[++nl] = substr(b[i], 2)
+              for (i = lastchg + 1; i <= nb; i++) if (substr(b[i], 1, 1) == " ") tctx[++nt] = substr(b[i], 2)
+              state = ""
+              for (i = firstchg; i <= lastchg; i++) {
+                c = substr(b[i], 1, 1); ln = substr(b[i], 2)
+                if (c == "+") { if (state != "add") naddrun++; state = "add"; add[++nadd] = ln }
+                else if (c == "-") { if (state != "rem") nremrun++; state = "rem"; rem[++nrem] = ln }
+                else state = "ctx"
+              }
+              adjacent = 1
+              if (nrem > 0 && nadd > 0) {
+                lastminus = 0; firstplus = 0
+                for (i = firstchg; i <= lastchg; i++) {
+                  if (substr(b[i], 1, 1) == "-") lastminus = i
+                  if (substr(b[i], 1, 1) == "+" && firstplus == 0) firstplus = i
+                }
+                if (lastminus + 1 != firstplus) adjacent = 0
+              }
+              if (nremrun > 1 || naddrun > 1 || !adjacent)
+                fail2("complex hunk shape; needs rebase")
+              if (nadd > 0) {
+                for (j = 1; j <= n - nadd + 1; j++)
+                  if (addeq(j) && anchored(j, nadd) > 0) { printf "ALREADY\n" > "/dev/stderr"; exit 2 }
+              }
+              if (nrem == 0) {
+                best = 0; ties = 0; bestpos = 0
+                for (i = 1; i <= n + 1; i++) {
+                  k = sufmatch(i, nl); t = prefmatch(i, nt)
+                  score = k + t
+                  if (score == 0) continue
+                  ok = 0
+                  for (m = 1; m <= k && !ok; m++) if (nonblank(lctx[nl - k + m])) ok = 1
+                  for (m = 1; m <= t && !ok; m++) if (nonblank(tctx[m])) ok = 1
+                  if (!ok) continue
+                  if (score > best) { best = score; bestpos = i; ties = 1 }
+                  else if (score == best) ties++
+                }
+                if (best == 0) fail2("no recognizable anchor context in target")
+                if (ties > 1) fail2("ambiguous anchor (" ties " equally-good sites)")
+                for (i = 1; i < bestpos; i++) print fl[i]
+                for (m = 1; m <= nadd; m++) print add[m]
+                for (i = bestpos; i <= n; i++) print fl[i]
+                printf "inserted %d line(s) after line %d (anchor score %d)\n", nadd, bestpos - 1, best > "/dev/stderr"
+                exit 0
+              }
+              nsites = 0
+              for (j = 1; j <= n - nrem + 1; j++) if (remeq(j)) site[++nsites] = j
+              if (nsites == 0) fail2("removed lines not found verbatim (semantic drift; needs rebase)")
+              best = -1; ties = 0; bestj = 0
+              for (s = 1; s <= nsites; s++) {
+                j = site[s]
+                k = sufmatch(j, nl); t = prefmatch(j + nrem, nt)
+                score = k + t
+                if (score > best) { best = score; bestj = j; ties = 1 }
+                else if (score == best) ties++
+              }
+              if (nsites > 1 && ties > 1) fail2("ambiguous removed-block site (" nsites " verbatim, " ties " equally good)")
+              j = bestj
+              for (i = 1; i < j; i++) print fl[i]
+              for (m = 1; m <= nadd; m++) print add[m]
+              for (i = j + nrem; i <= n; i++) print fl[i]
+              printf "replaced %d line(s) at line %d with %d\n", nrem, j, nadd > "/dev/stderr"
+              exit 0
+            }
+          ' "$hunk" "$f" > "$tmp_out" 2> "$errf" || rc=$?
+          diag=$(paste -sd ';' "$errf" 2>/dev/null || true)
+          rm -f "$errf"
+          if [ "$rc" = "0" ]; then
+            cat "$tmp_out" > "$f"; rm -f "$tmp_out"
+            echo "${diag:-regenerated exactly}"
+            return 0
+          elif [ "$rc" = "2" ]; then
+            rm -f "$tmp_out"
+            echo "${diag:-already present}"
+            return 2
+          fi
+          rm -f "$tmp_out"
+          echo "${diag:-not placeable}"
           return 1
         }
         gen_patch() {
@@ -667,7 +607,7 @@ runs:
             mkdir -p "${um}/$(dirname "$f")" "${md}/$(dirname "$f")"
             cp "$f" "${um}/$f" && cp "$f" "${md}/$f"
           done
-          local hunk_dir="${base}/hunks" h hlist staged already_ct failed_ct
+          local hunk_dir="${base}/hunks" h hlist staged already_ct failed_ct failed_list htarget verdict rcv
           mkdir -p "$hunk_dir"
           split_hunks "$src" "$hunk_dir"
           hlist=$(ls "$hunk_dir"/*.hunk 2>/dev/null || true)
@@ -684,55 +624,47 @@ runs:
               echo "${name}|already" >> "$psf"
               return 0
             else
-              anchor_rescue "$name" "$src" "$verify_spec" && return 0
-              if fuzz_restage "$name" "$src" "$md" "$targets" "$base"; then
-                staged=1; already_ct=0; failed_ct=0
-              else
-                cp "${base}/stage.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_stage.log" 2>/dev/null || true
-                find "$md" -name '*.rej' -exec sh -c 'cp "$1" "$2/$(basename "${1%.rej}")_$(basename "$1")"' _ {} "$GITHUB_WORKSPACE/patch-faillogs" \; 2>/dev/null || true
-                echo "[patchgen] ${name}: stage failure tail: $(tail -n 3 "${base}/stage.log" | tr '\n' ' ' | tr -s ' ')"
-                echo "::warning::[patchgen] ${name} failed to stage in sandbox; not applied"
-                echo "${name}|failed" >> "$psf"
-                return 0
-              fi
+              cp "${base}/stage.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_stage.log" 2>/dev/null || true
+              echo "[patchgen] ${name}: stage failure tail: $(tail -n 3 "${base}/stage.log" | tr '\n' ' ' | tr -s ' ')"
+              echo "::warning::[patchgen] ${name} failed to stage in sandbox; not applied"
+              echo "${name}|failed" >> "$psf"
+              return 0
             fi
           else
-            staged=0; already_ct=0; failed_ct=0
+            staged=0; already_ct=0; failed_ct=0; failed_list=""
             for h in $hlist; do
+              htarget=$( { grep -m1 -E '^\+\+\+ ' "$h" || true; } | awk '{print $2}')
               if patch -p1 --forward --fuzz=0 --no-backup-if-mismatch -d "$md" < "$h" >> "${base}/stage.log" 2>&1; then
                 staged=$((staged+1))
               elif patch -p1 --dry-run -R --fuzz=0 -d "$md" < "$h" >> "${base}/stage.log" 2>&1; then
                 already_ct=$((already_ct+1))
               else
-                failed_ct=$((failed_ct+1))
-                echo "hunk not stageable: ${h##*/}" >> "${base}/stage.log"
-                local htarget vtail
-                htarget=$(grep -m1 -E '^\+\+\+ ' "$h" | awk '{print $2}')
-                vtail=$(tail -n 2 "${base}/stage.log" | tr '\n' ' ' | tr -s ' ')
-                echo "[patchgen] ${name}: FAIL ${h##*/} (${htarget:-?}): ${vtail:-no detail}"
-                failed_list+="$(basename "$h") "
+                rcv=0
+                verdict=$(regen_hunk "$h" "$md") || rcv=$?
+                if [ "$rcv" = "0" ]; then
+                  staged=$((staged+1))
+                  echo "hunk ${h##*/} regenerated exactly: ${verdict}" >> "${base}/stage.log"
+                  echo "[patchgen] ${name}: REGEN ${h##*/} (${htarget:-?}): ${verdict}"
+                elif [ "$rcv" = "2" ]; then
+                  already_ct=$((already_ct+1))
+                  echo "hunk ${h##*/} already in tree: ${verdict}" >> "${base}/stage.log"
+                  echo "[patchgen] ${name}: SKIP ${h##*/} (${htarget:-?}): already in tree"
+                else
+                  failed_ct=$((failed_ct+1))
+                  echo "hunk not stageable: ${h##*/} (${verdict})" >> "${base}/stage.log"
+                  echo "[patchgen] ${name}: FAIL ${h##*/} (${htarget:-?}): ${verdict}"
+                  failed_list+="$(basename "$h") "
+                fi
               fi
             done
             find "$md" -name '*.rej' -delete 2>/dev/null || true
             find "$md" -name '*.orig' -delete 2>/dev/null || true
             echo "[patchgen] ${name}: staged=${staged} already=${already_ct} failed=${failed_ct}"
-            [ "$failed_ct" -eq 0 ] || cp "${base}/stage.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_stage.log" 2>/dev/null || true
             if [ "$failed_ct" -gt 0 ]; then
-              anchor_rescue "$name" "$src" "$verify_spec" && return 0
-              if exact_restage "$name" "$md" "$failed_list" "$base"; then
-                staged=1; already_ct=0; failed_ct=0
-              elif [ "${GEN_PATCH_NO_FUZZ:-0}" = "1" ]; then
-                echo "::warning::[patchgen] ${name}: ${failed_ct} of $((staged + already_ct + failed_ct)) hunk(s) not stageable at fuzz=0 and exact placement failed; no-fuzz mode: NOT applying a partial patch"
-                echo "${name}|failed" >> "$psf"
-                return 0
-              elif fuzz_restage "$name" "$src" "$md" "$targets" "$base"; then
-                staged=1; already_ct=0; failed_ct=0
-                echo "::warning::[patchgen] ${name}: hunks staged at fuzz=2 (context drift); see patch-faillogs/${name}_fuzz.log"
-              else
-                echo "::warning::[patchgen] ${name}: ${failed_ct} of $((staged + already_ct + failed_ct)) hunk(s) not stageable at fuzz=0; fuzz re-stage failed; NOT applying a partial patch"
-                echo "${name}|failed" >> "$psf"
-                return 0
-              fi
+              cp "${base}/stage.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_stage.log" 2>/dev/null || true
+              echo "::warning::[patchgen] ${name}: ${failed_ct} of $((staged + already_ct + failed_ct)) hunk(s) not stageable at fuzz=0; NOT applying a partial patch"
+              echo "${name}|failed" >> "$psf"
+              return 0
             fi
           fi
           if [ "$staged" -eq 0 ]; then
@@ -745,7 +677,6 @@ runs:
               echo "✅ ${name} verified (already in tree)"
               echo "${name}|already" >> "$psf"
             else
-              anchor_rescue "$name" "$src" "$verify_spec" && return 0
               echo "::warning::[patchgen] ${name} failed to stage in sandbox; not applied"
               echo "${name}|failed" >> "$psf"
             fi
@@ -811,27 +742,6 @@ runs:
           echo "${name}|applied" >> "$psf"
           return 0
         }
-        gen_patch_fb() {
-          # Runs the primary patch; on failure wipes stale status lines and
-          # retries once with the fallback. Sets GEN_PATCH_FB_VIA: primary|fallback|none.
-          local name="$1" primary="$2" fallback="$3" sed_expr="${4:-}" verify_spec="${5:-}"
-          local psf="${PS_FILE:-patch-status-raw.txt}"
-          GEN_PATCH_FB_VIA="none"
-          if [ -n "$primary" ] && [ -f "$primary" ]; then
-            GEN_PATCH_FB_VIA="primary"
-            sed -i "/^${name}|/d" "$psf" 2>/dev/null || true
-            gen_patch "$name" "$primary" "$sed_expr" "$verify_spec" || true
-            grep -Eq "^${name}\|(applied|already)" "$psf" 2>/dev/null && return 0
-          fi
-          if [ -n "$fallback" ] && [ -f "$fallback" ]; then
-            GEN_PATCH_FB_VIA="fallback"
-            echo "[patchgen] ${name}: primary patch did not land; falling back to $(basename "$fallback")"
-            sed -i "/^${name}|/d" "$psf" 2>/dev/null || true
-            gen_patch "$name" "$fallback" "$sed_expr" "$verify_spec" || true
-            grep -Eq "^${name}\|(applied|already)" "$psf" 2>/dev/null && return 0
-          fi
-          return 1
-        }
         verify_grep() {
           local spec="$1"
           local file="${spec%%|*}" regex="${spec#*|}"
@@ -872,9 +782,6 @@ runs:
           return 1
         }
         verify_applied() {
-          # Post-apply self-verification: sample lines the patch adds, confirm
-          # present in the live tree, print evidence. Handles '+++ b/path' and
-          # '+++ modified/path' header shapes.
           local name="$1" patch_file="$2"
           local map
           map=$(awk '
@@ -2056,16 +1963,14 @@ runs:
         # Stage SUSFS through patchgen (diff & generate), fuzz=0 only. The
         # SUS_MAP include pre-shim runs only when the patch lacks the block
         # itself; on gki-android16-6.12 the upstream hunk adds it and a shim
-        # would break that hunk's context (duplicate block, fuzz=2 staging).
+        # would break that hunk's context.
         if ! grep -q 'CONFIG_KSU_SUSFS_SUS_MAP' mm/memory.c && grep -q '#include <linux/vmalloc.h>' mm/memory.c \
            && ! grep -q 'CONFIG_KSU_SUSFS_SUS_MAP' "$patch_to_apply"; then
           echo "[patchgen] susfs-main: pre-shimming mm/memory.c SUS_MAP include block (patch lacks it)"
           sed -i '/#include <linux\/vmalloc.h>/a #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n#include <linux\/susfs_def.h>\n#endif \/\/ #ifdef CONFIG_KSU_SUSFS_SUS_MAP' mm/memory.c
         fi
         source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        GEN_PATCH_NO_FUZZ=1
         gen_patch susfs-main "$patch_to_apply" "" "g:fs/Makefile|susfs.o"
-        GEN_PATCH_NO_FUZZ=0
         if ! grep -Eq '^susfs-main\|(applied|already)' "$PS_FILE" 2>/dev/null; then
           echo "::error::SUSFS kernel patch failed to stage at fuzz=0 (see patch-faillogs/)"
           exit 1
@@ -2534,203 +2439,88 @@ runs:
         ccache --set-config=extra_files_to_hash="$copied_modules"
         echo "✅ module overlay applied"
         echo "::endgroup::"
-    - name: Apply optimized_mem_operations patch
+    - name: Apply WildKernels' optimisations
+      if: ${{ env.OP_OPT == 'true' }}
       shell: bash
       run: |
         set -euo pipefail
+        echo "::group::Apply WildKernels' optimisations (opt bundle, patchgen staging @ fuzz=0)"
         cd "$COMMON_KERNEL_FOLDER"
         source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        gen_patch optimized_mem_operations "$KERNEL_PATCHES_FOLDER/common/optimized_mem_operations.patch"
-    - name: Apply file_struct_8bytes_align patch
-      shell: bash
-      run: |
-        set -euo pipefail
-        cd "$COMMON_KERNEL_FOLDER"
-        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        gen_patch file_struct_8bytes_align "$KERNEL_PATCHES_FOLDER/common/file_struct_8bytes_align.patch"
-    - name: Apply reduce_cache_pressure patch
-      shell: bash
-      run: |
-        set -euo pipefail
-        cd "$COMMON_KERNEL_FOLDER"
-        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        gen_patch reduce_cache_pressure "$KERNEL_PATCHES_FOLDER/common/reduce_cache_pressure.patch"
-    - name: Apply mem_opt_prefetch patch
-      shell: bash
-      run: |
-        set -euo pipefail
-        cd "$COMMON_KERNEL_FOLDER"
-        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        gen_patch mem_opt_prefetch "$KERNEL_PATCHES_FOLDER/common/mem_opt_prefetch.patch"
-    - name: Apply optimise_memcmp patch
-      shell: bash
-      run: |
-        set -euo pipefail
-        cd "$COMMON_KERNEL_FOLDER"
-        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        # The opt switch only decides WHETHER the bundle runs, never HOW: every
+        # member still goes through patchgen staging (fuzz=0 or not applied, exact
+        # anchor rescue, post-apply self-verification). gen_patch returns 0 even
+        # when a member can't stage (it writes '<name>|failed' to $PS_FILE), so one
+        # drifted member skips itself instead of aborting the remaining members.
+        WK_SKIPPED=""
+        wk_tally() { # <name>: read the latest status gen_patch recorded
+          local st
+          st="$(grep -E "^$1\|" "$PS_FILE" 2>/dev/null | tail -n1 || true)"
+          case "$st" in
+            *"|failed"|*"|skipped") WK_SKIPPED="$WK_SKIPPED $1" ;;
+          esac
+        }
+        wk_apply() { # <name> [sed_expr]
+          if [ $# -gt 1 ]; then
+            gen_patch "$1" "$KERNEL_PATCHES_FOLDER/common/$1.patch" "$2"
+          else
+            gen_patch "$1" "$KERNEL_PATCHES_FOLDER/common/$1.patch"
+          fi
+          wk_tally "$1"
+        }
+        for p in optimized_mem_operations file_struct_8bytes_align \
+                 reduce_cache_pressure mem_opt_prefetch; do
+          wk_apply "$p"
+        done
+        # optimise_memcmp: symbol-shape dependent (weak-PI memcmp variant)
         MEMCMP_SRC="$KERNEL_PATCHES_FOLDER/common/optimise_memcmp.patch"
         if grep -q 'SYM_FUNC_START(__pi_memcmp)' arch/arm64/lib/memcmp.S 2>/dev/null; then
           gen_patch optimise_memcmp "$MEMCMP_SRC"
         elif grep -q 'SYM_FUNC_START_WEAK_PI(memcmp)' arch/arm64/lib/memcmp.S 2>/dev/null; then
           echo "Patching optimise_memcmp.patch (sed variant for the weak-PI memcmp shape)"
-          gen_patch optimise_memcmp "$MEMCMP_SRC" "s/SYM_FUNC_START(__pi_memcmp)/SYM_FUNC_START_WEAK_PI(memcmp)/; s/SYM_FUNC_END(__pi_memcmp)/SYM_FUNC_END_PI(memcmp)/; s/SYM_FUNC_ALIAS_WEAK(memcmp, __pi_memcmp)/EXPORT_SYMBOL_NOKASAN(memcmp)/"
+          gen_patch optimise_memcmp "$MEMCMP_SRC" "$MEMCMP_SRC" "s/SYM_FUNC_START(__pi_memcmp)/SYM_FUNC_START_WEAK_PI(memcmp)/; s/SYM_FUNC_END(__pi_memcmp)/SYM_FUNC_END_PI(memcmp)/; s/SYM_FUNC_ALIAS_WEAK(memcmp, __pi_memcmp)/EXPORT_SYMBOL_NOKASAN(memcmp)/"
         else
           echo "::warning::optimise_memcmp: unrecognized memcmp.S symbol shape; skipping"
           echo "optimise_memcmp|skipped" >> "$PS_FILE"
         fi
-    - name: Apply minimise_wakeup_time patch
-      shell: bash
-      run: |
-        set -euo pipefail
-        cd "$COMMON_KERNEL_FOLDER"
-        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        gen_patch minimise_wakeup_time "$KERNEL_PATCHES_FOLDER/common/minimise_wakeup_time.patch"
-    - name: Apply int_sqrt patch
-      shell: bash
-      run: |
-        set -euo pipefail
-        cd "$COMMON_KERNEL_FOLDER"
-        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        gen_patch int_sqrt "$KERNEL_PATCHES_FOLDER/common/int_sqrt.patch"
-    - name: Apply force_tcp_nodelay patch
-      shell: bash
-      run: |
-        set -euo pipefail
-        cd "$COMMON_KERNEL_FOLDER"
-        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        gen_patch force_tcp_nodelay "$KERNEL_PATCHES_FOLDER/common/force_tcp_nodelay.patch"
-    - name: Apply reduce_gc_thread_sleep_time patch
-      shell: bash
-      run: |
-        set -euo pipefail
-        cd "$COMMON_KERNEL_FOLDER"
-        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        gen_patch reduce_gc_thread_sleep_time "$KERNEL_PATCHES_FOLDER/common/reduce_gc_thread_sleep_time.patch"
-    - name: Apply add_timeout_wakelocks_globally patch
-      shell: bash
-      run: |
-        set -euo pipefail
-        cd "$COMMON_KERNEL_FOLDER"
-        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        gen_patch add_timeout_wakelocks_globally "$KERNEL_PATCHES_FOLDER/common/add_timeout_wakelocks_globally.patch"
-    - name: Apply f2fs_reduce_congestion patch
-      shell: bash
-      run: |
-        set -euo pipefail
-        cd "$COMMON_KERNEL_FOLDER"
-        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        gen_patch f2fs_reduce_congestion "$KERNEL_PATCHES_FOLDER/common/f2fs_reduce_congestion.patch"
-    - name: Apply reduce_freeze_timeout patch
-      shell: bash
-      run: |
-        set -euo pipefail
-        cd "$COMMON_KERNEL_FOLDER"
-        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        gen_patch reduce_freeze_timeout "$KERNEL_PATCHES_FOLDER/common/reduce_freeze_timeout.patch"
-    - name: Apply clear_page_16bytes_align patch
-      shell: bash
-      run: |
-        set -euo pipefail
-        cd "$COMMON_KERNEL_FOLDER"
-        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        wk_tally optimise_memcmp
+        for p in minimise_wakeup_time int_sqrt force_tcp_nodelay \
+                 reduce_gc_thread_sleep_time add_timeout_wakelocks_globally \
+                 f2fs_reduce_congestion reduce_freeze_timeout; do
+          wk_apply "$p"
+        done
+        # clear_page_16bytes_align: symbol-shape dependent (__pi clear_page variants)
         CLEAR_PAGE_SRC="$KERNEL_PATCHES_FOLDER/common/clear_page_16bytes_align.patch"
         if grep -q 'SYM_FUNC_START_PI(clear_page)' arch/arm64/lib/clear_page.S 2>/dev/null; then
           gen_patch clear_page_16bytes_align "$CLEAR_PAGE_SRC"
         elif grep -q 'SYM_FUNC_START_PI(__pi_clear_page)' arch/arm64/lib/clear_page.S 2>/dev/null; then
           echo "Patching clear_page_16bytes_align.patch (sed variant for the __pi clear_page shape)"
-          gen_patch clear_page_16bytes_align "$CLEAR_PAGE_SRC" "s/SYM_FUNC_START_PI(clear_page)/SYM_FUNC_START_PI(__pi_clear_page)/"
+          gen_patch clear_page_16bytes_align "$CLEAR_PAGE_SRC" "$CLEAR_PAGE_SRC" "s/SYM_FUNC_START_PI(clear_page)/SYM_FUNC_START_PI(__pi_clear_page)/"
         elif grep -q 'SYM_FUNC_START(__pi_clear_page)' arch/arm64/lib/clear_page.S 2>/dev/null; then
           echo "Patching clear_page_16bytes_align.patch (sed variant for the plain __pi clear_page shape)"
-          gen_patch clear_page_16bytes_align "$CLEAR_PAGE_SRC" "s/SYM_FUNC_START_PI(clear_page)/SYM_FUNC_START(__pi_clear_page)/"
+          gen_patch clear_page_16bytes_align "$CLEAR_PAGE_SRC" "$CLEAR_PAGE_SRC" "s/SYM_FUNC_START_PI(clear_page)/SYM_FUNC_START(__pi_clear_page)/"
         else
           echo "::warning::clear_page_16bytes_align: unrecognized clear_page.S symbol shape; skipping"
           echo "clear_page_16bytes_align|skipped" >> "$PS_FILE"
         fi
-    - name: Apply add_limitation_scaling_min_freq patch
-      shell: bash
-      run: |
-        set -euo pipefail
-        cd "$COMMON_KERNEL_FOLDER"
-        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        gen_patch add_limitation_scaling_min_freq "$KERNEL_PATCHES_FOLDER/common/add_limitation_scaling_min_freq.patch"
-    - name: Apply re_write_limitation_scaling_min_freq patch
-      shell: bash
-      run: |
-        set -euo pipefail
-        cd "$COMMON_KERNEL_FOLDER"
-        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        gen_patch re_write_limitation_scaling_min_freq "$KERNEL_PATCHES_FOLDER/common/re_write_limitation_scaling_min_freq.patch"
-    - name: Apply adjust_cpu_scan_order patch
-      shell: bash
-      run: |
-        set -euo pipefail
-        cd "$COMMON_KERNEL_FOLDER"
-        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        gen_patch adjust_cpu_scan_order "$KERNEL_PATCHES_FOLDER/common/adjust_cpu_scan_order.patch"
-    - name: Apply avoid_extra_s2idle_wake_attempts patch
-      shell: bash
-      run: |
-        set -euo pipefail
-        cd "$COMMON_KERNEL_FOLDER"
-        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        gen_patch avoid_extra_s2idle_wake_attempts "$KERNEL_PATCHES_FOLDER/common/avoid_extra_s2idle_wake_attempts.patch"
-    - name: Apply disable_cache_hot_buddy patch
-      shell: bash
-      run: |
-        set -euo pipefail
-        cd "$COMMON_KERNEL_FOLDER"
-        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        gen_patch disable_cache_hot_buddy "$KERNEL_PATCHES_FOLDER/common/disable_cache_hot_buddy.patch"
-    - name: Apply f2fs_enlarge_min_fsync_blocks patch
-      shell: bash
-      run: |
-        set -euo pipefail
-        cd "$COMMON_KERNEL_FOLDER"
-        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        gen_patch f2fs_enlarge_min_fsync_blocks "$KERNEL_PATCHES_FOLDER/common/f2fs_enlarge_min_fsync_blocks.patch"
-    - name: Apply increase_ext4_default_commit_age patch
-      shell: bash
-      run: |
-        set -euo pipefail
-        cd "$COMMON_KERNEL_FOLDER"
-        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        gen_patch increase_ext4_default_commit_age "$KERNEL_PATCHES_FOLDER/common/increase_ext4_default_commit_age.patch"
-    - name: Apply increase_sk_mem_packets patch
-      shell: bash
-      run: |
-        set -euo pipefail
-        cd "$COMMON_KERNEL_FOLDER"
-        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        gen_patch increase_sk_mem_packets "$KERNEL_PATCHES_FOLDER/common/increase_sk_mem_packets.patch"
-    - name: Apply reduce_pci_pme_wakeups patch
-      shell: bash
-      run: |
-        set -euo pipefail
-        cd "$COMMON_KERNEL_FOLDER"
-        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        gen_patch reduce_pci_pme_wakeups "$KERNEL_PATCHES_FOLDER/common/reduce_pci_pme_wakeups.patch"
-    - name: Apply silence_irq_cpu_logspam patch
-      shell: bash
-      run: |
-        set -euo pipefail
-        cd "$COMMON_KERNEL_FOLDER"
-        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        gen_patch silence_irq_cpu_logspam "$KERNEL_PATCHES_FOLDER/common/silence_irq_cpu_logspam.patch"
-    - name: Apply silence_system_logspam patch
-      shell: bash
-      run: |
-        set -euo pipefail
-        cd "$COMMON_KERNEL_FOLDER"
-        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        gen_patch silence_system_logspam "$KERNEL_PATCHES_FOLDER/common/silence_system_logspam.patch"
-    - name: Apply use_unlikely_wrap_cpufreq patch
-      shell: bash
-      run: |
-        set -euo pipefail
-        cd "$COMMON_KERNEL_FOLDER"
-        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        gen_patch use_unlikely_wrap_cpufreq "$KERNEL_PATCHES_FOLDER/common/use_unlikely_wrap_cpufreq.patch"
-
+        wk_tally clear_page_16bytes_align
+        for p in add_limitation_scaling_min_freq re_write_limitation_scaling_min_freq \
+                 adjust_cpu_scan_order avoid_extra_s2idle_wake_attempts \
+                 disable_cache_hot_buddy f2fs_enlarge_min_fsync_blocks \
+                 increase_ext4_default_commit_age increase_sk_mem_packets \
+                 reduce_pci_pme_wakeups silence_irq_cpu_logspam \
+                 silence_system_logspam use_unlikely_wrap_cpufreq; do
+          wk_apply "$p"
+        done
+        if [ -z "$WK_SKIPPED" ]; then
+          echo "wk-opt|applied" >> "$PS_FILE"
+          echo "✅ wildkernels-optimisations verified (25/25 applied or already in tree)"
+        else
+          echo "wk-opt|skipped" >> "$PS_FILE"
+          echo "::warning::wildkernels-optimisations: member(s) not applied:$WK_SKIPPED"
+          echo "⚠️ wildkernels-optimisations verified with skips (not applied:$WK_SKIPPED)"
+        fi
+        echo "::endgroup::"
     - name: Apply NTSync Patch
       shell: bash
       if: ${{ env.OP_NTSYNC == 'true' }}
@@ -2957,59 +2747,31 @@ runs:
           6.6|6.12) BORE_SPEC="g:kernel/sched/bore.c|sched_bore_init" ;;
           *) BORE_SPEC="g:kernel/fork.c|sched_bore_free;g:kernel/sysctl.c|sched_bore" ;;
         esac
-        # PRIMARY: tree-exact BoRE regen patches in scripts/patches keyed by version;
-        # they run the same gen_patch pipeline, so patchgen staging wins when committed.
-        # Bouteillepleine's upstream patch targets the reworked EEVDF base and cannot
-        # stage on this tree - it is the fallback when no regen patch is committed.
-        BORE_REGEN="$GITHUB_WORKSPACE/scripts/patches/bore_${KERNEL_VER}_oneplus_regen.patch"
-        [ -f "$BORE_REGEN" ] || BORE_REGEN=""
-        # Fail-safe: a regen patch with the duplicated return-curr construct
-        # (added line directly above identical context in a brace-less if)
-        # bootloops the device - refuse it rather than build an unbootable kernel.
-        if [ -n "$BORE_REGEN" ] && awk '
-            /^\+[[:space:]]*return curr;[[:space:]]*$/ { if ((getline nxt) > 0 && nxt ~ /^[[:space:]]*return curr;[[:space:]]*$/) { found = 1; exit } }
-            END { exit !(found) }
-          ' "$BORE_REGEN"; then
-          echo "::warning::bore: committed regen patch matches the duplicated return-curr bootloop signature; refusing it — re-commit the corrected bore_${KERNEL_VER}_oneplus_regen.patch"
-          BORE_REGEN=""
-        fi
-        BORE_UPSTREAM=""
-        if fetch_patch "https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/experimental/${BORE_PATCH}" /tmp/bore.patch; then
-          BORE_UPSTREAM="/tmp/bore.patch"
-        fi
-        if [ -z "$BORE_REGEN" ] && [ -z "$BORE_UPSTREAM" ]; then
-          echo "::warning::BoRE patch unavailable (${BORE_PATCH}); skipping"
+        # Upstream only: Bouteillepleine/kernel_patches experimental/bore_*.patch
+        # at OP_BORE_REF (branch name = head of that branch, or a pinned commit).
+        # No repo-local copies; when BP updates the patch, staging picks it up.
+        BORE_REF="${OP_BORE_REF:-main}"
+        if ! fetch_patch "https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/${BORE_REF}/experimental/${BORE_PATCH}" /tmp/bore.patch; then
+          echo "::warning::BoRE patch unavailable (experimental/${BORE_PATCH} @ ${BORE_REF}); skipping"
           echo "bore|skipped" >> "$PS_FILE"
-          echo "BORE_SKIPPED=${BORE_PATCH}" >> "$GITHUB_ENV"
+          echo "BORE_SKIPPED=${BORE_PATCH}@${BORE_REF}" >> "$GITHUB_ENV"
           echo "::endgroup::"
           exit 0
         fi
-        gen_patch_fb bore "$BORE_REGEN" "$BORE_UPSTREAM" "" "$BORE_SPEC" || true
-        if [ "${GEN_PATCH_FB_VIA:-none}" = "none" ] || ! grep -Eq '^bore\|(applied|already)' "$PS_FILE" 2>/dev/null; then
-          echo "BORE_SKIPPED=${BORE_PATCH}" >> "$GITHUB_ENV"
+        gen_patch bore /tmp/bore.patch "" "$BORE_SPEC" || true
+        if ! grep -Eq '^bore\|(applied|already)' "$PS_FILE" 2>/dev/null; then
+          echo "BORE_SKIPPED=${BORE_PATCH}@${BORE_REF} (staging failed; see patch-faillogs)" >> "$GITHUB_ENV"
           echo "::endgroup::"
           exit 0
-        fi
-        if [ "$GEN_PATCH_FB_VIA" = "primary" ]; then
-          echo "[patchgen] bore: landed via tree-exact regen (patchgen staging, $(basename "$BORE_REGEN"))"
-          echo "BORE_VIA=patchgen-regen" >> "$GITHUB_ENV"
-        else
-          echo "[patchgen] bore: landed via latest-upstream ($(basename "$BORE_UPSTREAM"))"
-          echo "BORE_VIA=latest-upstream" >> "$GITHUB_ENV"
         fi
         grep -q 'config SCHED_BORE' init/Kconfig
         grep -q '^CONFIG_SCHED_BORE=y' arch/arm64/configs/gki_defconfig || \
           echo 'CONFIG_SCHED_BORE=y' >> arch/arm64/configs/gki_defconfig
         grep -n 'CONFIG_SCHED_BORE' arch/arm64/configs/gki_defconfig
         echo "BORE_APPLIED=true" >> "$GITHUB_ENV"
-        if [ "$GEN_PATCH_FB_VIA" = "primary" ]; then
-          echo "BORE_SOURCE=scripts/patches/$(basename "$BORE_REGEN") (tree-exact regen)" >> "$GITHUB_ENV"
-        else
-          echo "BORE_SOURCE=https://github.com/Bouteillepleine/kernel_patches/tree/main/experimental" >> "$GITHUB_ENV"
-        fi
+        echo "BORE_SOURCE=https://github.com/Bouteillepleine/kernel_patches/tree/${BORE_REF}/experimental" >> "$GITHUB_ENV"
         echo "✅ BoRE applied for ${ANDROID_VER}-${KERNEL_VER}"
         echo "::endgroup::"
-
     - name: Add TTL Target Support
       if: ${{ env.OP_TTL == 'true' }}
       shell: bash
@@ -3935,6 +3697,7 @@ runs:
           echo "LZ4 1.10.0 + ARMv8 NEON: $(pstat lz4)"
           echo "NoMount: $(pstat nomount)"
           echo "Vendor Module Blacklist: $(pstat vendor-modules-blacklist)"
+          echo "WildKernels' Optimisations: $(pstat wk-opt)"
           echo ""
           echo "Image SHA256: ${{ steps.collect_stats.outputs.image_sha256 }}"
           echo "AnyKernel3 ZIP SHA256: ${{ steps.create_zip.outputs.zip_sha256 }}"
@@ -4008,6 +3771,7 @@ runs:
           echo "| **LZ4 1.10.0 + ARMv8 NEON** | $(pstat lz4) |"
           echo "| **NoMount** | $(pstat nomount) |"
           echo "| **Vendor Module Blacklist** | $(pstat vendor-modules-blacklist) |"
+          echo "| **WildKernels' Optimisations** | $(pstat wk-opt) |"
           
           echo ""
           echo "### 📊 Build Metrics"
