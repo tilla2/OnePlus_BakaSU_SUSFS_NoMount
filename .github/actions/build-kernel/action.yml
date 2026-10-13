@@ -110,6 +110,8 @@ runs:
         set -euo pipefail
         echo "ACTION_REPO=$ACTION_REPO_VAL" >> $GITHUB_ENV
         echo "ACTION_REF=$ACTION_REF_VAL" >> $GITHUB_ENV
+        [ -n "$ACTION_REPO_VAL" ] && [ -n "$ACTION_REF_VAL" ] || { echo "::error::Action repo/ref inputs missing"; exit 1; }
+        echo "✅ Action info resolved (repo=$ACTION_REPO_VAL @ $ACTION_REF_VAL)"
 
     - name: 📥 Checkout Code
       uses: actions/checkout@v6
@@ -144,6 +146,8 @@ runs:
         fi
         echo "Parsed config:"
         jq '.' /tmp/config.json
+        jq -e . /tmp/config.json >/dev/null
+        echo "✅ op_config.json parsed (model=$P_MODEL, os=$P_OSVER, PS_BASE=$PS_BASE)"
 
     - name: Validate Inputs
       shell: bash
@@ -348,6 +352,9 @@ runs:
           chmod +x "$REPO"
         fi
         echo "REPO=$REPO" >> "$GITHUB_ENV"
+        [ -x "$REPO" ] || { echo "::error::repo tool not executable at $REPO"; exit 1; }
+        [ -d "$CONFIG" ] || { echo "::error::config folder $CONFIG missing"; exit 1; }
+        echo "✅ Base environment ready (repo tool installed, config folder: $CONFIG)"
 
     - name: Optimize Global Git for Repo Tool
       shell: bash
@@ -356,6 +363,8 @@ runs:
         git config --global feature.manyFiles true
         git config --global core.fsmonitor true
         git config --global pack.sparse true
+        [ "$(git config --global feature.manyFiles)" = "true" ] && [ "$(git config --global core.fsmonitor)" = "true" ] && [ "$(git config --global pack.sparse)" = "true" ] || { echo "::error::global git optimizations not applied"; exit 1; }
+        echo "✅ Global git optimizations applied (manyFiles, fsmonitor, sparse-pack)"
 
     - name: Sync Kernel Source
       id: sync-kernel-source
@@ -405,6 +414,11 @@ runs:
         KERNEL_SYNC_SHA="$(git -C "$COMMON_KERNEL_DIR" rev-parse HEAD 2>/dev/null || echo unavailable)"
         echo "KERNEL_SYNC_SHA=$KERNEL_SYNC_SHA" >> "$GITHUB_ENV"
         echo "Kernel tree synced at: $KERNEL_SYNC_SHA (patch staging runs against this tree)"
+        for d in "$CONFIG_DIR" "$ARTIFACTS_DIR" "$DEBUG_ARTIFACTS_DIR"; do
+          [ -d "$d" ] || { echo "::error::required directory missing: $d"; exit 1; }
+        done
+        [ -n "$KERNEL_SYNC_SHA" ] && [ "$KERNEL_SYNC_SHA" != "unavailable" ] || { echo "::error::common kernel tree not synced (no git HEAD)"; exit 1; }
+        echo "✅ Directory layout prepared (kernel tree synced at $KERNEL_SYNC_SHA)"
 
     - name: Prepare patch generation harness
       shell: bash
@@ -719,7 +733,7 @@ runs:
               case "$spec" in
                 g:*) verify_grep "${spec#g:}" || { rc=1; break; } ;;
                 f:*) verify_infn "${spec#f:}" || { rc=1; break; } ;;
-                *) echo "::warning::[patchgen] ${name}: unknown verify directive '${spec}'" ;;
+                *) echo "::warning::[patchgen] ${name}: unknown verify directive '${spec}'; treating as verification failure"; rc=1; break ;;
               esac
             done
             if [ "$rc" -ne 0 ]; then
@@ -837,7 +851,7 @@ runs:
           return 0
         }
         GEN_PATCH_EOF
-        echo "patch generation harness ready"
+        echo "✅ patch generation harness ready"
     - name: Set Kernel build-tools to Path
       shell: bash
       run: |
@@ -845,6 +859,9 @@ runs:
         set -euo pipefail
         echo "${KERNEL_PLATFORM_FOLDER}/prebuilts/kernel-build-tools/linux-x86/bin/" >> $GITHUB_PATH
         echo "${KERNEL_PLATFORM_FOLDER}/prebuilts/kernel-build-tools/linux_musl-x86/bin/" >> $GITHUB_PATH
+        [ -d "${KERNEL_PLATFORM_FOLDER}/prebuilts/kernel-build-tools/linux-x86/bin/" ] || { echo "::error::kernel-build-tools linux-x86/bin missing — repo sync incomplete?"; exit 1; }
+        [ -d "${KERNEL_PLATFORM_FOLDER}/prebuilts/kernel-build-tools/linux_musl-x86/bin/" ] || echo "::warning::linux_musl-x86 build-tools not present (its PATH entry will be inert)"
+        echo "✅ Kernel build-tools added to PATH"
 
     - name: Get Kernel Version Info
       shell: bash
@@ -1125,6 +1142,8 @@ runs:
         # Verify
         bindgen --version
         echo "::endgroup::"
+        command -v bindgen >/dev/null || { echo "::error::bindgen not found on PATH after install"; exit 1; }
+        echo "✅ bindgen installed ($(bindgen --version))"
 
     - name: Test Rust & bindgen
       shell: bash
@@ -1137,6 +1156,7 @@ runs:
         export RUSTTARGET="aarch64-linux-android"
         make V=1 rustavailable
         echo "::endgroup::"
+        echo "✅ Rust availability confirmed in kernel tree (make rustavailable passed)"
 
     - name: Restore ccache cache
       id: restore-ccache-cache
@@ -1424,6 +1444,13 @@ runs:
         rm -f common/android/abi_gki_protected_exports_* || true
         sed -i 's/protected_modules = \[.*\]/protected_modules = []/' common/modules.bzl || true
         echo "::endgroup::"
+        if ls common/android/abi_gki_protected_exports_* >/dev/null 2>&1; then
+          echo "::error::ABI protected exports files still present"; exit 1
+        fi
+        if grep -q 'protected_modules' common/modules.bzl && ! grep -q 'protected_modules = \[\]' common/modules.bzl; then
+          echo "::error::modules.bzl protected_modules not emptied"; exit 1
+        fi
+        echo "✅ ABI protected exports cleared (exports files removed, protected_modules emptied)"
 
 
     - name: Add KernelSU
@@ -1583,7 +1610,7 @@ runs:
         EOF
         grep -n 'CONFIG_KSU_FULL_NAME_FORMAT' "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig"
         echo "ROOT_TAG_APPLIED=${OP_ROOT_TAG}" >> "$GITHUB_ENV"
-        echo "Root tag applied: ${OP_ROOT_TAG}"
+        echo "✅ BakaSU root tag applied: ${OP_ROOT_TAG} (CONFIG_KSU_FULL_NAME_FORMAT in gki_defconfig)"
         echo "::endgroup::"
 
     - name: Apply SUSFS Patches
@@ -2304,6 +2331,13 @@ runs:
           echo "Kernel >= $MIN_VERSION, skipping ptrace patch"
         fi
         echo "::endgroup::"
+        if grep -Eq '^gki_ptrace\|(applied|already)' "$PS_FILE" 2>/dev/null; then
+          echo "✅ gki_ptrace patch applied at fuzz=0"
+        elif [ "$(printf '%s\n' "$KERNEL_VERSION" "5.16" | sort -V | head -n1)" != "$KERNEL_VERSION" ]; then
+          echo "✅ gki_ptrace skipped by design (applies only on kernels <= 5.16; this is $KERNEL_VERSION)"
+        else
+          echo "::error::gki_ptrace patch did not apply (no applied/already status in $PS_FILE)"; exit 1
+        fi
     - name: Apply HMBIRD Fengchi patches
       shell: bash
       run: |
@@ -2478,7 +2512,7 @@ runs:
           gen_patch optimise_memcmp "$MEMCMP_SRC"
         elif grep -q 'SYM_FUNC_START_WEAK_PI(memcmp)' arch/arm64/lib/memcmp.S 2>/dev/null; then
           echo "Patching optimise_memcmp.patch (sed variant for the weak-PI memcmp shape)"
-          gen_patch optimise_memcmp "$MEMCMP_SRC" "$MEMCMP_SRC" "s/SYM_FUNC_START(__pi_memcmp)/SYM_FUNC_START_WEAK_PI(memcmp)/; s/SYM_FUNC_END(__pi_memcmp)/SYM_FUNC_END_PI(memcmp)/; s/SYM_FUNC_ALIAS_WEAK(memcmp, __pi_memcmp)/EXPORT_SYMBOL_NOKASAN(memcmp)/"
+          gen_patch optimise_memcmp "$MEMCMP_SRC" "s/SYM_FUNC_START(__pi_memcmp)/SYM_FUNC_START_WEAK_PI(memcmp)/; s/SYM_FUNC_END(__pi_memcmp)/SYM_FUNC_END_PI(memcmp)/; s/SYM_FUNC_ALIAS_WEAK(memcmp, __pi_memcmp)/EXPORT_SYMBOL_NOKASAN(memcmp)/"
         else
           echo "::warning::optimise_memcmp: unrecognized memcmp.S symbol shape; skipping"
           echo "optimise_memcmp|skipped" >> "$PS_FILE"
@@ -2495,10 +2529,10 @@ runs:
           gen_patch clear_page_16bytes_align "$CLEAR_PAGE_SRC"
         elif grep -q 'SYM_FUNC_START_PI(__pi_clear_page)' arch/arm64/lib/clear_page.S 2>/dev/null; then
           echo "Patching clear_page_16bytes_align.patch (sed variant for the __pi clear_page shape)"
-          gen_patch clear_page_16bytes_align "$CLEAR_PAGE_SRC" "$CLEAR_PAGE_SRC" "s/SYM_FUNC_START_PI(clear_page)/SYM_FUNC_START_PI(__pi_clear_page)/"
+          gen_patch clear_page_16bytes_align "$CLEAR_PAGE_SRC" "s/SYM_FUNC_START_PI(clear_page)/SYM_FUNC_START_PI(__pi_clear_page)/"
         elif grep -q 'SYM_FUNC_START(__pi_clear_page)' arch/arm64/lib/clear_page.S 2>/dev/null; then
           echo "Patching clear_page_16bytes_align.patch (sed variant for the plain __pi clear_page shape)"
-          gen_patch clear_page_16bytes_align "$CLEAR_PAGE_SRC" "$CLEAR_PAGE_SRC" "s/SYM_FUNC_START_PI(clear_page)/SYM_FUNC_START(__pi_clear_page)/"
+          gen_patch clear_page_16bytes_align "$CLEAR_PAGE_SRC" "s/SYM_FUNC_START_PI(clear_page)/SYM_FUNC_START(__pi_clear_page)/"
         else
           echo "::warning::clear_page_16bytes_align: unrecognized clear_page.S symbol shape; skipping"
           echo "clear_page_16bytes_align|skipped" >> "$PS_FILE"
@@ -2641,6 +2675,9 @@ runs:
         CONFIG_TMPFS_XATTR=y
         CONFIG_TMPFS_POSIX_ACL=y
         EOF
+        grep -q '^CONFIG_TMPFS_XATTR=y' "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" || { echo "::error::CONFIG_TMPFS_XATTR missing from gki_defconfig"; exit 1; }
+        grep -q '^CONFIG_TMPFS_POSIX_ACL=y' "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" || { echo "::error::CONFIG_TMPFS_POSIX_ACL missing from gki_defconfig"; exit 1; }
+        echo "✅ Tmpfs support added (CONFIG_TMPFS_XATTR=y, CONFIG_TMPFS_POSIX_ACL=y)"
 
 
     - name: Add BBR
@@ -2901,6 +2938,7 @@ runs:
         CONFIG_POSIX_MQUEUE = y
         EOF
         echo "ds|applied" >> "$PS_FILE"
+        echo "✅ LXC / Droidspaces support added (SYSVIPC enabled, namespaces + POSIX mqueue configured)"
 
     - name: Add Droidspaces support
       shell: bash
@@ -2985,17 +3023,24 @@ runs:
         CONFIG_FRAME_WARN=0
         CONFIG_TRACEPOINTS=y
         EOF
+        for cfg in CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE_O3=n CONFIG_OPTIMIZE_INLINING=y CONFIG_FRAME_WARN=0 CONFIG_TRACEPOINTS=y; do
+          grep -q "^$cfg" "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" || { echo "::error::$cfg missing from gki_defconfig"; exit 1; }
+        done
+        echo "✅ Build-based configs added (O2 perf, forced inlining, FRAME_WARN=0, TRACEPOINTS)"
 
     - name: Add RUST build configs
       shell: bash
       if: ${{ env.OP_RUST_BUILD == 'true' }}
       run: |
         set -euo pipefail
-        echo "Add Build based configs"
+        echo "Add RUST build configs"
         cat >> "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" <<EOF
         CONFIG_ANDROID_BINDER_IPC_RUST=m
         CONFIG_RUST=y
         EOF
+        grep -q '^CONFIG_RUST=y' "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" || { echo "::error::CONFIG_RUST=y missing from gki_defconfig"; exit 1; }
+        grep -q '^CONFIG_ANDROID_BINDER_IPC_RUST=m' "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" || { echo "::error::CONFIG_ANDROID_BINDER_IPC_RUST=m missing from gki_defconfig"; exit 1; }
+        echo "✅ RUST build configs added (CONFIG_RUST=y, CONFIG_ANDROID_BINDER_IPC_RUST=m)"
     
     - name: Resolve KSU Symbol Dependencies
       shell: bash
@@ -3047,6 +3092,9 @@ runs:
         if [ "${{ env.OP_SUSFS }}" = true ]; then
           echo "susfs_version=${SUSVER:-unknown}" >> "$GITHUB_OUTPUT"
         fi
+        grep -q '^kernel_version=' "$GITHUB_OUTPUT" || { echo "::error::kernel_version missing from build metadata"; exit 1; }
+        grep -q '^nomount_commit=' "$GITHUB_OUTPUT" || { echo "::error::nomount_commit missing from build metadata"; exit 1; }
+        echo "✅ Build metadata saved (kernel, ksu type/version, nomount commit, timestamp)"
 
     - name: Customize Kernel Branding
       shell: bash
@@ -3057,6 +3105,8 @@ runs:
         mkdir -p out
         CUSTOM_LOCALVERSION="-${ANDROID_VER}-${OP_UNAME}"
         echo "CUSTOM_LOCALVERSION=$CUSTOM_LOCALVERSION" >> "$GITHUB_ENV"
+        [ -n "$CUSTOM_LOCALVERSION" ] || { echo "::error::CUSTOM_LOCALVERSION is empty"; exit 1; }
+        echo "✅ Kernel branding customized (LOCALVERSION suffix: $CUSTOM_LOCALVERSION)"
 
     - name: Disable GPUEB
       shell: bash
@@ -3065,6 +3115,15 @@ runs:
         set -euo pipefail
         echo "Disabling GPUEB for MTK kernel 5.10"
         sed -i '/obj-y.*gpueb/d' "$COMMON_KERNEL_FOLDER/drivers/gpu/mediatek/Makefile"
+        if [ -f "$COMMON_KERNEL_FOLDER/drivers/gpu/mediatek/Makefile" ]; then
+          if grep -qE 'obj-y.*gpueb' "$COMMON_KERNEL_FOLDER/drivers/gpu/mediatek/Makefile"; then
+            echo "::error::gpueb obj-y entries still present in mediatek Makefile"
+            exit 1
+          fi
+          echo "✅ GPUEB disabled (obj-y gpueb entries removed)"
+        else
+          echo "✅ GPUEB step not applicable (no mediatek gpu Makefile in this tree)"
+        fi
 
     - name: Apply Fake config.gz patch
       shell: bash
@@ -3091,6 +3150,7 @@ runs:
         
         CONFIG_STRING="${OPTIONS[*]}"
         echo "CONFIG_FAKE_DISABLE=${CONFIG_STRING}" >> $GITHUB_ENV
+        echo "✅ Fake config.gz patched (KCONFIG_CONFIG_PATCHED verified in kernel/Makefile; CONFIG_FAKE_DISABLE=${CONFIG_STRING:-none})"
 
     - name: Disable Vendor / Kernel Modules
       shell: bash
@@ -3207,6 +3267,11 @@ runs:
           echo "::notice::patch_dry_run=true — every requested patch applied cleanly for ${OP_MODEL} ${OP_OS_VERSION}. Compilation intentionally skipped."
         fi
         echo "::endgroup::"
+        if [ "${failed_patches:-0}" -gt 0 ] || [ "${skipped_patches:-0}" -gt 0 ]; then
+          echo "⚠️ Dry-run verdict written (failed=$failed_patches, skipped=$skipped_patches — see artifact)"
+        else
+          echo "✅ Dry-run verdict written (every requested patch applied cleanly at fuzz=0)"
+        fi
 
     - name: Upload patch dry-run verdict
       if: ${{ inputs.patch_dry_run == true || inputs.patch_dry_run == 'true' }}
@@ -3231,6 +3296,7 @@ runs:
       shell: bash
       run: |
         echo "Dry run complete — see the patch-dry-run artifact. Not building."
+        echo "✅ Dry-run gate reached (compilation intentionally skipped)"
         exit 0
         
     - name: Build Kernel
@@ -3447,6 +3513,7 @@ runs:
           ccache -s
         fi
         echo "============================================"
+        echo "✅ Kernel build completed"
         echo "::endgroup::"
 
     - name: 📊 ccache Post-Build Statistics
@@ -3518,6 +3585,7 @@ runs:
         echo '```' >> $GITHUB_STEP_SUMMARY
         ccache -s --verbose >> $GITHUB_STEP_SUMMARY
         echo '```' >> $GITHUB_STEP_SUMMARY
+        echo "✅ ccache post-build statistics written (hit_rate=${HIT_RATE}%)"
 
     - name: Collect Build Stats / Validate Image
       id: collect_stats
@@ -3580,6 +3648,7 @@ runs:
         echo "   - Image size: $(numfmt --to=iec-i --suffix=B "$IMG_SIZE")"
         echo "   - SHA256: $IMG_SHA256"
         echo "   - Build time: ${BUILD_TIME}s"
+        echo "✅ Image validated (SHA256 + warnings recorded)"
         echo "::endgroup::"
 
     - name: Create Kernel ZIP
@@ -3793,6 +3862,7 @@ runs:
           echo "| **Artifact Name** | \`${{ env.ZIP_NAME }}\` |"
           echo "| **AnyKernel3 SHA256** | \`${{ steps.create_zip.outputs.zip_sha256 }}\` |"
         } >> "$GITHUB_STEP_SUMMARY"
+        echo "✅ Final build summary written to $GITHUB_STEP_SUMMARY"
 
     - name: Upload Debug Artifacts
       if: ${{ always() && !cancelled() && inputs.debug == 'true' }}
