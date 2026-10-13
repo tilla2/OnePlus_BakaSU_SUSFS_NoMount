@@ -130,7 +130,11 @@ runs:
         PS_BASE="$(echo "$P_MODEL" | sed 's/-[0-9]\+\.[0-9]\+\.[0-9]\+$//')_${P_OSVER}"
         echo "PS_BASE=$PS_BASE" >> "$GITHUB_ENV"
         echo "PS_FILE=$GITHUB_WORKSPACE/patch-status-$PS_BASE.txt" >> "$GITHUB_ENV"
-        if [ -z "${OP_BORE:-}" ]; then
+        # Default only when the config omits the key. Do NOT test ${OP_BORE:-} here:
+        # the to_entries export above only lands in LATER steps, so OP_BORE is always
+        # unset in this same step and an unconditional default would clobber a parsed
+        # bore:false (last GITHUB_ENV write wins).
+        if ! jq -e 'has("bore")' /tmp/config.json >/dev/null; then
           echo "OP_BORE=true" >> "$GITHUB_ENV"
         fi
         echo "Parsed config:"
@@ -3260,6 +3264,86 @@ runs:
         CONFIG_STRING="${OPTIONS[*]}"
         echo "CONFIG_FAKE_DISABLE=${CONFIG_STRING}" >> $GITHUB_ENV
 
+    - name: Disable Vendor / Kernel Modules
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Disable Vendor / Kernel Modules"
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+
+        # Kernel-side refusal of vendor module loads via
+        # CONFIG_DEBLOAT_VENDOR_MODULES (comma-separated list compiled into the
+        # kernel and checked in blacklisted()). The debloater disables itself
+        # via a static key on non-normal boots (recovery/OTA), so it can never
+        # break non-standard boot paths.
+        RISKY_MODULES=("coresight" "rust_binder" "msm_kgsl" "camera" "oplusboot" "rmnet_wlan" "rmnet_core" "msm_drm" "cnss2" "oplus_chg_v2" "reboot_mode" "rfkill" "bootloader_log")
+
+        declare -a modules=()
+        IFS=',' read -ra ADDR <<< "${OP_BLACKLIST_MODULES:-}"
+        for mod in "${ADDR[@]}"; do
+          [[ -n "$mod" ]] && modules+=("$mod")
+        done
+
+        # OEM network-tuning modules fight BBR/BBRv3 congestion control
+        if [ "${OP_BBR:-false}" = "true" ] || [ "${OP_BBR3:-false}" = "true" ]; then
+          if [[ ! " ${modules[*]:-} " =~ " oplus_network_tuning " ]]; then
+            modules+=("oplus_network_tuning")
+          fi
+          if [[ ! " ${modules[*]:-} " =~ " oplus_networks_tuning " ]]; then
+            modules+=("oplus_networks_tuning")
+          fi
+        fi
+
+        # Safety filter: exact-match against the protected list
+        declare -a validated_modules=()
+        for mod in "${modules[@]:-}"; do
+          [ -z "$mod" ] && continue
+          is_risky=false
+          for risky in "${RISKY_MODULES[@]}"; do
+            if [ "$mod" = "$risky" ]; then
+              is_risky=true
+              echo "::warning::Blocked attempt to blacklist protected module: $mod"
+              break
+            fi
+          done
+          if [ "$is_risky" = false ]; then
+            validated_modules+=("$mod")
+          fi
+        done
+
+        if [ ${#validated_modules[@]} -gt 0 ]; then
+          RAW_JOINED=$(IFS=,; echo "${validated_modules[*]}")
+          RESULT_LIST="\"${RAW_JOINED}\""
+        else
+          RESULT_LIST='""'
+        fi
+        echo "Blacklisting ${#validated_modules[@]} vendor module(s): ${RESULT_LIST}"
+
+        grep -q '^CONFIG_DEBLOAT_VENDOR_MODULES=' arch/arm64/configs/gki_defconfig || \
+          echo "CONFIG_DEBLOAT_VENDOR_MODULES=${RESULT_LIST}" >> arch/arm64/configs/gki_defconfig
+
+        # <=5.15 trees use kernel/module.c, >=6.1 trees use kernel/module/main.c
+        if [ "$(printf '%s\n' "$KERNEL_VER" "5.16" | sort -V | head -n1)" = "$KERNEL_VER" ]; then
+          VM_PATCH="$KERNEL_PATCHES_FOLDER/common/vendor_modules/0001-Support-conditional-vendor-modules-blacklisting-5.15-and-below.patch"
+          VM_VERIFY="g:kernel/module.c|CONFIG_DEBLOAT_VENDOR_MODULES"
+        else
+          VM_PATCH="$KERNEL_PATCHES_FOLDER/common/vendor_modules/0001-Support-conditional-vendor-modules-blacklisting-6.1-and-above.patch"
+          VM_VERIFY="g:kernel/module/main.c|CONFIG_DEBLOAT_VENDOR_MODULES"
+        fi
+        [ -f "$VM_PATCH" ] || { echo "::error::vendor_modules patch missing: $VM_PATCH"; exit 1; }
+
+        gen_patch vendor-modules-blacklist "$VM_PATCH" "" "$VM_VERIFY"
+        if ! grep -Eq '^vendor-modules-blacklist\|(applied|already)' "$PS_FILE" 2>/dev/null; then
+          echo "::error::vendor-modules-blacklist patch failed to stage at fuzz=0 (see patch-faillogs)"
+          exit 1
+        fi
+
+        grep -n 'CONFIG_DEBLOAT_VENDOR_MODULES' kernel/module/main.c kernel/module.c 2>/dev/null || true
+        grep -n '^CONFIG_DEBLOAT_VENDOR_MODULES=' arch/arm64/configs/gki_defconfig
+        echo "✅ [vendor-modules-blacklist] verified"
+        echo "::endgroup::"
+
     - name: Patch dry-run verdict
       if: ${{ inputs.patch_dry_run == true || inputs.patch_dry_run == 'true' }}
       shell: bash
@@ -3650,7 +3734,12 @@ runs:
         IMG_SHA256=$(sha256sum "$IMG" | awk '{print $1}')
         BUILD_TIME="${BUILD_TIME:-0}"
         
-        KERNEL_UNAME=$(strings "$IMG" | grep -E 'Linux version.*#' | tail -n1)
+        KERNEL_UNAME_BANNER=$(strings "$IMG" | grep -E 'Linux version.*#' | tail -n1)
+        # Keep only the release string (e.g. 6.12.58-android16-5-g16e473de48a3-abogki462654244-4k) for
+        # the summary; the full banner (compiler, build user@host, SMP PREEMPT + timestamp) stays in
+        # this log group only, mirroring a clean uname like BP's build reports.
+        KERNEL_UNAME=$(printf '%s' "$KERNEL_UNAME_BANNER" | sed -e 's/^Linux version //' -e 's/ .*//')
+        echo "Kernel Uname (full banner): $KERNEL_UNAME_BANNER"
         echo "Kernel Uname: $KERNEL_UNAME"
         echo "KERNEL_UNAME=$KERNEL_UNAME" >> "$GITHUB_ENV"
         
@@ -3779,6 +3868,7 @@ runs:
           echo "Droidspaces: $(pstat ds)"
           echo "LZ4 1.10.0 + ARMv8 NEON: $(pstat lz4)"
           echo "NoMount: $(pstat nomount)"
+          echo "Vendor Module Blacklist: $(pstat vendor-modules-blacklist)"
           echo ""
           echo "Image SHA256: ${{ steps.collect_stats.outputs.image_sha256 }}"
           echo "AnyKernel3 ZIP SHA256: ${{ steps.create_zip.outputs.zip_sha256 }}"
@@ -3851,6 +3941,7 @@ runs:
           echo "| **Droidspaces** | $(pstat ds) |"
           echo "| **LZ4 1.10.0 + ARMv8 NEON** | $(pstat lz4) |"
           echo "| **NoMount** | $(pstat nomount) |"
+          echo "| **Vendor Module Blacklist** | $(pstat vendor-modules-blacklist) |"
           
           echo ""
           echo "### 📊 Build Metrics"
