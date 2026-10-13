@@ -1394,6 +1394,14 @@ runs:
         echo "Using NoMount commit: $NOMOUNT_COMMIT_SHA"
         if [ "${{ env.OP_SUSFS }}" = true ]; then
           echo "Using SUSFS branch/commit: $SUSFS_BRANCH"
+          resolve_susfs_sha() {
+            # Resolve a susfs4ksu branch/tag ref to its true commit SHA via the GitLab API.
+            local api="https://gitlab.com/api/v4/projects/simonpunk%2Fsusfs4ksu/repository/commits/$1"
+            local sha=""
+            sha="$(curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 "$api" 2>/dev/null \
+              | grep -o '"id" *: *"[0-9a-fA-F]\{40\}"' | head -n1 | sed 's/.*"id" *: *"//; s/"$//')" || true
+            printf '%s' "$sha"
+          }
           if ! retry_fetch_archive "https://gitlab.com/simonpunk/susfs4ksu.git" "$SUSFS_BRANCH"; then
             echo "::warning::SUSFS archive fetch throttled; falling back to a plain git clone"
             rm -rf "$SUSFS_FOLDER"
@@ -1405,7 +1413,22 @@ runs:
               exit 1
             fi
           fi
-          echo "SUSFS_COMMIT_SHA=$SUSFS_BRANCH" >> $GITHUB_ENV
+          # Provenance: record the resolved commit SHA, not the ref name, so the
+          # build summary links to the exact susfs4ksu commit that was built.
+          if [ -d "$SUSFS_FOLDER/.git" ]; then
+            SUSFS_RESOLVED_SHA="$(git -C "$SUSFS_FOLDER" rev-parse HEAD 2>/dev/null || true)"
+          elif [[ "$SUSFS_BRANCH" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            SUSFS_RESOLVED_SHA="$SUSFS_BRANCH"
+          else
+            SUSFS_RESOLVED_SHA="$(resolve_susfs_sha "$SUSFS_BRANCH")"
+          fi
+          if [[ "$SUSFS_RESOLVED_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "SUSFS_COMMIT_SHA=$SUSFS_RESOLVED_SHA" >> "$GITHUB_ENV"
+            echo "🔒 SUSFS resolved commit: $SUSFS_RESOLVED_SHA"
+          else
+            echo "::warning::Could not resolve SUSFS commit SHA for '$SUSFS_BRANCH'; recording the ref name instead"
+            echo "SUSFS_COMMIT_SHA=$SUSFS_BRANCH" >> "$GITHUB_ENV"
+          fi
         fi
         echo "✅ Dependencies cloned"
         echo "::endgroup::"
@@ -1613,7 +1636,8 @@ runs:
           "v1.5.8")
             if [ "${{ inputs.ksu_type }}" = "KSU" ]; then
               cd "$KSU_FOLDER"
-              patch -p1 --forward < "$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || echo "::warning::[susfs] 10_enable_susfs_for_ksu.patch did not apply cleanly (soft-fail, continuing)"
+              source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+              gen_patch susfs-ksu-enable "$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || echo "::warning::[susfs] 10_enable_susfs_for_ksu.patch did not stage cleanly (soft-fail, continuing)"
             else
               echo "ℹ️ Skipping KernelSU folder patch for BakaSU"
             fi
@@ -1621,7 +1645,8 @@ runs:
           "v1.5.9"|"v1.5.10"|"v1.5.11"|"v1.5.12"|"v2.0.0"|"v2.1.0")
             if [ "${{ inputs.ksu_type }}" = "KSU" ]; then
               cd "$KSU_FOLDER"
-              patch -p1 --forward < "$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || true
+              source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+              gen_patch susfs-ksu-enable "$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
             else
               echo "ℹ️ Skipping KernelSU folder patch for BakaSU"
             fi
@@ -1636,7 +1661,12 @@ runs:
                 /^diff --git / { skip = 0 }
                 !skip { print }
               ' "$susfs_ksun_patch" > "$filtered_susfs_patch"
-              patch -p1 --forward < "$filtered_susfs_patch"
+              source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+              gen_patch susfs-ksun-enable "$filtered_susfs_patch"
+              if ! grep -Eq '^susfs-ksun-enable\|(applied|already)' "$PS_FILE" 2>/dev/null; then
+                echo "::error::KernelSU Next SUSFS enable patch failed to stage at fuzz=0 (see patch-faillogs)"
+                exit 1
+              fi
               rm "$filtered_susfs_patch"
 
               if ! grep -q '^config KSU_SUSFS' ./kernel/Kconfig; then
@@ -1685,13 +1715,28 @@ runs:
                 "$init_source"
               if [ -d "$KERNEL_PATCHES_FOLDER/next/susfs_fix_patches/$susfs_version" ]; then
                 for compatibility_patch in fix_Kbuild.patch fix_init.c.patch fix_kernel_umount.c.patch fix_setuid_hook.c.patch fix_sucompat.c.patch fix_supercall.c.patch; do
-                  if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/next/susfs_fix_patches/$susfs_version/$compatibility_patch"; then
-                    echo "::warning::KernelSU Next susfs fix ${compatibility_patch} did not apply; continuing"
-                    echo "susfs-fix-${compatibility_patch%.patch}|failed" >> "$PS_FILE"
-                  fi
+                  gen_patch "susfs-fix-${compatibility_patch%.patch}" "$KERNEL_PATCHES_FOLDER/next/susfs_fix_patches/$susfs_version/$compatibility_patch"
                 done
               else
-                echo "::warning::No KernelSU Next susfs fix patches for ${susfs_version}; continuing without them"
+                # WK has no susfs fix set for this version (e.g. v2.3.0).
+                # Bouteillepleine tracks newer susfs releases and additionally
+                # ships fix_dispatch.c.patch, so fall back to that set.
+                susfs_fix_base="https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/next/susfs_fix_patches/${susfs_version}"
+                susfs_fix_dir="$(mktemp -d)"
+                if fetch_patch "$susfs_fix_base/fix_Kbuild.patch" "$susfs_fix_dir/fix_Kbuild.patch"; then
+                  for compatibility_patch in fix_init.c.patch fix_kernel_umount.c.patch fix_setuid_hook.c.patch fix_sucompat.c.patch fix_supercall.c.patch fix_dispatch.c.patch; do
+                    if ! fetch_patch "$susfs_fix_base/$compatibility_patch" "$susfs_fix_dir/$compatibility_patch"; then
+                      echo "::error::Bouteillepleine susfs fix set for ${susfs_version} is incomplete (missing ${compatibility_patch})"
+                      exit 1
+                    fi
+                  done
+                  for compatibility_patch in fix_Kbuild.patch fix_init.c.patch fix_kernel_umount.c.patch fix_setuid_hook.c.patch fix_sucompat.c.patch fix_supercall.c.patch fix_dispatch.c.patch; do
+                    gen_patch "susfs-fix-${compatibility_patch%.patch}" "$susfs_fix_dir/$compatibility_patch"
+                  done
+                  echo "✅ susfs-fix (${susfs_version}, Bouteillepleine fallback) staged"
+                else
+                  echo "::warning::No KernelSU Next susfs fix patches for ${susfs_version} in WK or Bouteillepleine; continuing without them"
+                fi
               fi
               # Filtering the upstream SUSFS patch skips its local sucompat
               # helper and imports. Restore those exact dependencies here.
@@ -1721,9 +1766,8 @@ runs:
               mv "$tmp_sucompat" "$sucompat_source"
               for compatibility_patch in overwrite_hook_mode.patch ksu_toolkit.patch; do
                 fix_path="$KERNEL_PATCHES_FOLDER/next/susfs_fix_patches/$susfs_version/$compatibility_patch"
-                if [ -f "$fix_path" ] && ! patch -p1 --forward < "$fix_path"; then
-                  echo "::warning::KernelSU Next susfs fix ${compatibility_patch} did not apply; continuing"
-                  echo "susfs-fix-${compatibility_patch%.patch}|failed" >> "$PS_FILE"
+                if [ -f "$fix_path" ]; then
+                  gen_patch "susfs-fix-${compatibility_patch%.patch}" "$fix_path"
                 fi
               done
             elif [ "${{ inputs.ksu_type }}" = "KSU" ]; then
@@ -1737,7 +1781,12 @@ runs:
                 /^diff --git / { skip = 0 }
                 !skip { print }
               ' "$susfs_ksu_patch" > "$filtered_susfs_patch"
-              patch -p1 --forward < "$filtered_susfs_patch"
+              source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+              gen_patch susfs-ksu-enable "$filtered_susfs_patch"
+              if ! grep -Eq '^susfs-ksu-enable\|(applied|already)' "$PS_FILE" 2>/dev/null; then
+                echo "::error::KernelSU SUSFS enable patch failed to stage at fuzz=0 (see patch-faillogs)"
+                exit 1
+              fi
               rm "$filtered_susfs_patch"
 
               if ! grep -q '^config KSU_SUSFS' ./kernel/Kconfig; then
@@ -1929,29 +1978,21 @@ runs:
           ' "$susfs_kernel_patch" > "$filtered_kernel_patch"
           patch_to_apply="$filtered_kernel_patch"
         fi
-        # Attempt to apply the patch; enter error handling if it doesn't apply cleanly
-        if ! patch -p1 --forward < "$patch_to_apply"; then
-          echo "Patch reported errors. Checking for known mm/memory.c Hunk #1 context mismatch..."
-          
-          # If mm/memory.c.rej exists and is caused by the SUSFS macro insertion failure
-          if [ -f mm/memory.c.rej ] && grep -q 'CONFIG_KSU_SUSFS_SUS_MAP' mm/memory.c.rej; then
-            echo "Manually injecting SUSFS headers into mm/memory.c..."
-            # Bypass context checks and forcefully inject the code right below vmalloc.h
-            sed -i '/#include <linux\/vmalloc.h>/a #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n#include <linux\/susfs_def.h>\n#endif \/\/ #ifdef CONFIG_KSU_SUSFS_SUS_MAP' mm/memory.c
-            
-            # We have manually fixed Hunk #1, so safely remove this reject file
-            rm mm/memory.c.rej
-          fi
-        
-          # Check again for other real errors (unhandled .rej files, e.g., in avc.c)
-          if [ -n "$(find . -name "*.rej")" ]; then
-            echo "::error::SUSFS patch failed. Dumping all remaining .rej files:"
-            find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-            exit 1
-          else
-            echo "Patch applied successfully with manual fallback for mm/memory.c!"
-          fi
+        # Stage SUSFS through patchgen (diff & generate): per-file, per-hunk,
+        # fuzz=0 only. Pre-shim: idempotently insert the known SUS_MAP include
+        # block into mm/memory.c (formerly the post-failure .rej sed rescue)
+        # so that hunk stages or lands as "already" at fuzz=0.
+        if ! grep -q 'CONFIG_KSU_SUSFS_SUS_MAP' mm/memory.c && grep -q '#include <linux/vmalloc.h>' mm/memory.c; then
+          echo "[patchgen] susfs-main: pre-shimming mm/memory.c SUS_MAP include block"
+          sed -i '/#include <linux\/vmalloc.h>/a #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n#include <linux\/susfs_def.h>\n#endif \/\/ #ifdef CONFIG_KSU_SUSFS_SUS_MAP' mm/memory.c
         fi
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch susfs-main "$patch_to_apply" "" "g:fs/Makefile|susfs.o"
+        if ! grep -Eq '^susfs-main\|(applied|already)' "$PS_FILE" 2>/dev/null; then
+          echo "::error::SUSFS kernel patch failed to stage at fuzz=0 (see patch-faillogs/)"
+          exit 1
+        fi
+        echo "✅ [susfs-main] verified"
         if [ -n "$filtered_kernel_patch" ]; then
           rm "$filtered_kernel_patch"
         fi
@@ -2068,6 +2109,25 @@ runs:
         else
           echo "::warning::fs/susfs.c missing after SUSFS application"
           echo "susfs|failed" >> "$PS_FILE"
+        fi
+
+        # pershoot: SuSFS / Toolkit coexistence. Upstream only ever ENABLES the
+        # uname-spoof static key; resetting spoofing to "default" leaves the
+        # stale spoof active until reboot. Track the reset and disable the key
+        # so toolkits can toggle SPOOF_UNAME off. Optional: warn and continue
+        # when it cannot stage at fuzz=0. The upstream patch prefixes paths
+        # with kernel_patches/, so rewrite them for a plain -p1 apply.
+        pershoot_uname_url="https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/pershoot/susfs4ksu/0002-pershoot-Implement-SuSFS-and-Toolkit-coexistence.patch"
+        if fetch_patch "$pershoot_uname_url" /tmp/pershoot_uname_coexistence.patch; then
+          gen_patch pershoot-uname-coexistence /tmp/pershoot_uname_coexistence.patch 's|kernel_patches/fs/|fs/|g'
+          if ! grep -Eq '^pershoot-uname-coexistence\|(applied|already)' "$PS_FILE" 2>/dev/null; then
+            echo "::warning::pershoot uname coexistence patch did not stage at fuzz=0; continuing without it"
+            sed -i '/^pershoot-uname-coexistence|/d' "$PS_FILE" 2>/dev/null || true
+            echo "pershoot-uname-coexistence|skipped" >> "$PS_FILE"
+          fi
+        else
+          echo "::warning::pershoot uname coexistence patch unavailable; skipping"
+          echo "pershoot-uname-coexistence|skipped" >> "$PS_FILE"
         fi
         
         echo "::endgroup::"
@@ -2232,9 +2292,10 @@ runs:
         echo "::group::Apply KSU hooks"
         cd "$COMMON_KERNEL_FOLDER"
         echo "Applying KSU hooks patch..."
-        if ! patch -p1 < "$KERNEL_PATCHES_FOLDER/next/scope_min_manual_hooks_v1.4.patch"; then
-          echo "::error::KSU hooks patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch ksu-hooks-manual "$KERNEL_PATCHES_FOLDER/next/scope_min_manual_hooks_v1.4.patch"
+        if ! grep -Eq '^ksu-hooks-manual\|(applied|already)' "$PS_FILE" 2>/dev/null; then
+          echo "::error::KSU hooks patch failed to stage at fuzz=0 (see patch-faillogs)"
           exit 1
         fi
         echo "✅ KSU hooks applied"
@@ -2278,43 +2339,22 @@ runs:
           HMBIRD_OS="${OP_OS_VERSION/OOS/A}"
           dos2unix "$FENGCHI_DIR/fengchi_${HMBIRD_MODEL}_${HMBIRD_OS}.patch"
           FENGCHI_OK=true
-          if ! patch -p1 --fuzz=2 < "$FENGCHI_DIR/fengchi_${HMBIRD_MODEL}_${HMBIRD_OS}.patch"; then
-            echo "::warning::hmbird fengchi patch did not apply cleanly. Applying known compatibility fallbacks."
-            if [ -f kernel/fork.c.rej ] && grep -Fq 'sched_ext_free(tsk);' kernel/fork.c.rej; then
-              sched_ext_free_count=$(grep -cFx $'\tsched_ext_free(tsk);' kernel/fork.c || true)
-              if [ "$sched_ext_free_count" -eq 1 ]; then
-                perl -0pi -e 's/\tsched_ext_free\(tsk\);\n/#ifdef CONFIG_HMBIRD_SCHED\n\thmbird_free(tsk);\n#endif\n/' kernel/fork.c
-                if grep -Fq 'sched_ext_free(tsk);' kernel/fork.c; then
-                  echo "hmbird|failed" >> "$PS_FILE"
-                  echo "::error::Failed to adapt kernel/fork.c for HMBIRD"
-                  exit 1
-                fi
-                rm kernel/fork.c.rej
-                echo "Applied HMBIRD kernel/fork.c compatibility fallback"
-              else
-                echo "hmbird|failed" >> "$PS_FILE"
-                echo "::error::Expected one sched_ext_free() call for the HMBIRD fallback, found $sched_ext_free_count"
-                exit 1
-              fi
-            else
-              FENGCHI_OK=false
+          source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+          gen_patch fengchi "$FENGCHI_DIR/fengchi_${HMBIRD_MODEL}_${HMBIRD_OS}.patch"
+          if ! grep -Eq '^fengchi\|(applied|already)' "$PS_FILE" 2>/dev/null; then
+            echo "::warning::fengchi did not stage at fuzz=0; retrying after kernel/fork.c compat shim"
+            sed -i "/^fengchi|/d" "$PS_FILE" 2>/dev/null || true
+            if [ "$(grep -cFx $'\tsched_ext_free(tsk);' kernel/fork.c 2>/dev/null || true)" = "1" ] && ! grep -q 'hmbird_free(tsk);' kernel/fork.c; then
+              perl -0pi -e 's/\tsched_ext_free\(tsk\);\n/#ifdef CONFIG_HMBIRD_SCHED\n\thmbird_free(tsk);\n#endif\n/' kernel/fork.c
+              gen_patch fengchi "$FENGCHI_DIR/fengchi_${HMBIRD_MODEL}_${HMBIRD_OS}.patch"
             fi
-            find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-            find . -name "*.rej" -delete 2>/dev/null || true
           fi
+          grep -Eq '^fengchi\|(applied|already)' "$PS_FILE" 2>/dev/null || FENGCHI_OK=false
           dos2unix "$KERNEL_PATCHES_FOLDER/oneplus/hmbird/overwriter.patch"
-          if ! patch -p1 --fuzz=2 < "$KERNEL_PATCHES_FOLDER/oneplus/hmbird/overwriter.patch"; then
-            echo "::warning::hmbird overwriter patch did not apply cleanly. Continuing without it."
-            find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-            find . -name "*.rej" -delete 2>/dev/null || true
-          fi
+          gen_patch hmbird-overwriter "$KERNEL_PATCHES_FOLDER/oneplus/hmbird/overwriter.patch"
           chmod +x ./drivers/of/overwriter/overwrite_configs/convert_configs.sh 2>/dev/null || true
           dos2unix "$KERNEL_PATCHES_FOLDER/oneplus/hmbird/hmbird_config.patch"
-          if ! patch -p1 --fuzz=2 < "$KERNEL_PATCHES_FOLDER/oneplus/hmbird/hmbird_config.patch"; then
-            echo "::warning::hmbird config patch did not apply cleanly. Continuing without it."
-            find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-            find . -name "*.rej" -delete 2>/dev/null || true
-          fi
+          gen_patch hmbird-config "$KERNEL_PATCHES_FOLDER/oneplus/hmbird/hmbird_config.patch"
           if [ "$FENGCHI_OK" = true ]; then
             grep -n 'CONFIG_HMBIRD' arch/arm64/configs/gki_defconfig 2>/dev/null | head -n 3 || true
             grep -n 'hmbird_free' kernel/fork.c 2>/dev/null | head -n 2 || true
@@ -2658,29 +2698,28 @@ runs:
         fi
         
         echo "Patching $(basename $NTSYNC_PATCH)!"
-        if ! patch -p1 --forward < "$NTSYNC_PATCH"; then
-          echo "::warning::NTSync compat patch did not apply cleanly. Checking for manual fallback..."
-          REJ_COUNT=$(find . -name "*.rej" | wc -l)
-          if [ "$REJ_COUNT" -eq 1 ] && [ -f include/linux/lockdep.h.rej ]; then
-            echo "Only lockdep.h failed. Applying lockdep.h changes manually..."
-            # Add missing lockdep macros if not already present
-            grep -q '#define lockdep_assert(c)' include/linux/lockdep.h || \
-              sed -i '/#define lockdep_is_held_type(l, r)/a\#define lockdep_assert(c)\t\t\tdo { } while (0)' include/linux/lockdep.h
-            grep -q '#define lockdep_assert_once(c)' include/linux/lockdep.h || \
-              sed -i '/#define lockdep_assert(c)/a\#define lockdep_assert_once(c)\t\t\tdo { } while (0)' include/linux/lockdep.h
-            grep -q '#define lockdep_assert_not_held(l)' include/linux/lockdep.h || \
-              sed -i '/#define lockdep_assert_held(l)/a\#define lockdep_assert_not_held(l)\t\tdo { (void)(l); } while (0)' include/linux/lockdep.h
-            grep -q '#define lockdep_assert_none_held_once()' include/linux/lockdep.h || \
-              sed -i '/#define lockdep_assert_held_once(l)/a\#define lockdep_assert_none_held_once()\tdo { } while (0)' include/linux/lockdep.h
-            rm -f include/linux/lockdep.h.rej
-            echo "✅ lockdep.h manual fallback applied"
-          else
-            echo "::warning::$(basename "$NTSYNC_PATCH") patch failed; continuing without NTSync"
-            echo "ntsync|failed" >> "$PS_FILE"
-            echo "::endgroup::"
-            exit 0
-          fi
+        # Pre-shim: only when this compat patch actually targets lockdep.h,
+        # idempotently add the missing no-op lockdep macros (formerly the
+        # post-failure .rej rescue) so the hunk lands at fuzz=0.
+        if grep -Eq '^\+\+\+ (a/|b/)?include/linux/lockdep\.h' "$NTSYNC_PATCH" && [ -f include/linux/lockdep.h ]; then
+          grep -q '#define lockdep_assert(c)' include/linux/lockdep.h || \
+            sed -i '/#define lockdep_is_held_type(l, r)/a\#define lockdep_assert(c)\t\t\tdo { } while (0)' include/linux/lockdep.h
+          grep -q '#define lockdep_assert_once(c)' include/linux/lockdep.h || \
+            sed -i '/#define lockdep_assert(c)/a\#define lockdep_assert_once(c)\t\t\tdo { } while (0)' include/linux/lockdep.h
+          grep -q '#define lockdep_assert_not_held(l)' include/linux/lockdep.h || \
+            sed -i '/#define lockdep_assert_held(l)/a\#define lockdep_assert_not_held(l)\t\tdo { (void)(l); } while (0)' include/linux/lockdep.h
+          grep -q '#define lockdep_assert_none_held_once()' include/linux/lockdep.h || \
+            sed -i '/#define lockdep_assert_held_once(l)/a\#define lockdep_assert_none_held_once()\tdo { } while (0)' include/linux/lockdep.h
         fi
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch ntsync-compat "$NTSYNC_PATCH"
+        if ! grep -Eq '^ntsync-compat\|(applied|already)' "$PS_FILE" 2>/dev/null; then
+          echo "::warning::$(basename "$NTSYNC_PATCH") failed to stage at fuzz=0; continuing without NTSync compat"
+          echo "ntsync|failed" >> "$PS_FILE"
+          echo "::endgroup::"
+          exit 0
+        fi
+
         source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
         gen_patch ntsync "$NTSYNC_FOLDER/ntsync_base.patch" "" "g:drivers/misc/ntsync.c|ntsync_misc"
         if grep -Eq '^ntsync\|(applied|already)$' "$PS_FILE"; then
@@ -2995,9 +3034,10 @@ runs:
         cd "$COMMON_KERNEL_FOLDER"
         
         echo "Applying patch to enable SYSVIPC without breaking ABI"
-        if ! patch -p1 --fuzz=2 --forward < "$KERNEL_PATCHES_FOLDER/oneplus/lxc_droidspaces/enable_sysvipc.patch"; then
-          echo "::error::enable_sysvipc patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch ds-enable-sysvipc "$KERNEL_PATCHES_FOLDER/oneplus/lxc_droidspaces/enable_sysvipc.patch"
+        if ! grep -Eq '^ds-enable-sysvipc\|(applied|already)' "$PS_FILE" 2>/dev/null; then
+          echo "::error::enable_sysvipc patch failed to stage at fuzz=0 (see patch-faillogs)"
           exit 1
         fi
         
@@ -3018,56 +3058,39 @@ runs:
         cd "$COMMON_KERNEL_FOLDER"
         
         echo "Applying patch to enable SYSVIPC without breaking ABI"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        require_staged() {
+          grep -Eq "^$1\|(applied|already)" "$PS_FILE" 2>/dev/null || { echo "::error::$1 failed to stage at fuzz=0 (see patch-faillogs)"; exit 1; }
+        }
         case "$OP_BRANCH" in
           wild/sm8850|wild/sm8845)
-            if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/droidspaces/fix_sysvipc_kabi_a16-6.12.patch"; then
-              echo "::error::fix_sysvipc_kabi_a16-6.12 patch failed. Dumping all .rej files:"
-              find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-              exit 1
-            fi
+            gen_patch ds-kabi-a16 "$KERNEL_PATCHES_FOLDER/common/droidspaces/fix_sysvipc_kabi_a16-6.12.patch"
+            require_staged ds-kabi-a16
             ;;
           wild/sm8550|wild/sm7550)
-            if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/droidspaces/fix_sysvipc_kabi_1_2_3.patch"; then
-              echo "::error::fix_sysvipc_kabi_1_2_3 patch failed. Dumping all .rej files:"
-              find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-              exit 1
-            fi
+            gen_patch ds-kabi-123 "$KERNEL_PATCHES_FOLDER/common/droidspaces/fix_sysvipc_kabi_1_2_3.patch"
+            require_staged ds-kabi-123
             ;;
           wild/sm8450|wild/sm8475|wild/mt6895|wild/mt6983|wild/mt6789)
             if [ "$ANDROID_VER" = "android12" ] && [ "$KERNEL_VER" = "5.10" ]; then
-              if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/droidspaces/fix_sysvipc_kabi_bypass_a16-6.12_below.patch"; then
-                echo "::error::fix_sysvipc_kabi_bypass_a16-6.12_below patch failed. Dumping all .rej files:"
-                find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-                exit 1
-              fi
-              if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/droidspaces/fix_abi_padding_for_posix_mqueue.patch"; then
-                echo "::error::fix_abi_padding_for_posix_mqueue patch failed. Dumping all .rej files:"
-                find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-                exit 1
-              fi
+              gen_patch ds-kabi-bypass "$KERNEL_PATCHES_FOLDER/common/droidspaces/fix_sysvipc_kabi_bypass_a16-6.12_below.patch"
+              require_staged ds-kabi-bypass
+              gen_patch ds-mqueue-padding "$KERNEL_PATCHES_FOLDER/common/droidspaces/fix_abi_padding_for_posix_mqueue.patch"
+              require_staged ds-mqueue-padding
             else
-              if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/droidspaces/fix_sysvipc_kabi_6_7_8.patch"; then
-                echo "::error::fix_sysvipc_kabi_6_7_8 patch failed. Dumping all .rej files:"
-                find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-                exit 1
-              fi
+              gen_patch ds-kabi-678 "$KERNEL_PATCHES_FOLDER/common/droidspaces/fix_sysvipc_kabi_6_7_8.patch"
+              require_staged ds-kabi-678
             fi
             ;;
           *)
-            if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/droidspaces/fix_sysvipc_kabi_6_7_8.patch"; then
-              echo "::error::fix_sysvipc_kabi_6_7_8 patch failed. Dumping all .rej files:"
-              find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-              exit 1
-            fi
+            gen_patch ds-kabi-678 "$KERNEL_PATCHES_FOLDER/common/droidspaces/fix_sysvipc_kabi_6_7_8.patch"
+            require_staged ds-kabi-678
             ;;
         esac
         
         echo "Patch to fix kernel panic caused by oplus_bsp_midas"
-        if ! patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/common/droidspaces/0001-Return-ghost-task-if-task-is-null-and-is-requested-b.patch"; then
-          echo "::error::ghost-task patch failed. Dumping all .rej files:"
-          find . -name "*.rej" -exec echo "=== {} ===" \; -exec cat {} \;
-          exit 1
-        fi
+        gen_patch ds-ghost-task "$KERNEL_PATCHES_FOLDER/common/droidspaces/0001-Return-ghost-task-if-task-is-null-and-is-requested-b.patch"
+        require_staged ds-ghost-task
         
         cat >> "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" <<EOF
         CONFIG_SYSVIPC=y
@@ -3080,7 +3103,8 @@ runs:
         CONFIG_USER_NS=y
         EOF
         
-        patch -p1 < "$KERNEL_PATCHES_FOLDER/common/droidspaces/0001-Guard-USER_NS-for-non-root-users.patch"
+        gen_patch ds-guard-userns "$KERNEL_PATCHES_FOLDER/common/droidspaces/0001-Guard-USER_NS-for-non-root-users.patch"
+        require_staged ds-guard-userns
         
         if [ "${{ env.OP_RUST_BUILD }}" = "true" ]; then
           echo "Add IPC NS missing symbols for rust binder"
@@ -3195,7 +3219,12 @@ runs:
         set -euo pipefail
         echo "Apply Fake config.gz patch"
         cd "$COMMON_KERNEL_FOLDER"
-        patch -p1 < "$KERNEL_PATCHES_FOLDER/common/fake_config.patch"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch fake-config "$KERNEL_PATCHES_FOLDER/common/fake_config.patch" "" "g:kernel/Makefile|KCONFIG_CONFIG_PATCHED"
+        if ! grep -Eq '^fake-config\|(applied|already)' "$PS_FILE" 2>/dev/null; then
+          echo "::error::fake_config patch failed to stage at fuzz=0 (see patch-faillogs)"
+          exit 1
+        fi
         
         OPTIONS=()
         
