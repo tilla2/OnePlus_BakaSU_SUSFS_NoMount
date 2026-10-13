@@ -584,6 +584,68 @@ runs:
           cp "${base}/fuzz.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_fuzz.log" 2>/dev/null || true
           return 1
         }
+        anchor_place() {
+          # Exact, fuzz-free placement of a pure-insertion hunk: the last
+          # non-blank pre-image context line before the insertion must be
+          # unique in the target file. Returns 0=placed, 2=already placed.
+          local hunk="$1" root="$2" tgt f anchor added i j
+          tgt=$(grep -m1 -E '^\+\+\+ ' "$hunk" | awk '{print $2}' | sed 's#^b/##;s#^a/##')
+          if [ -z "$tgt" ] || [ "$tgt" = "/dev/null" ] || [ ! -f "$root/$tgt" ]; then
+            echo "target missing from sandbox"; return 1
+          fi
+          if grep -qE '^-[^-]' "$hunk"; then
+            echo "not a pure-insertion hunk"; return 1
+          fi
+          added=$(sed -n '/^@@/,$p' "$hunk" | grep -E '^\+' | sed 's/^+//')
+          [ -n "$added" ] || { echo "no added lines"; return 1; }
+          anchor=$(awk '/^@@/{b=1; next} !b{next} /^\+/{print a; exit} /^ /{l=substr($0,2); if (l !~ /^[[:space:]]*$/) a=l}' "$hunk")
+          [ -n "$anchor" ] || { echo "no context anchor"; return 1; }
+          f="$root/$tgt"
+          local -a fl ab hits=()
+          mapfile -t fl < "$f"
+          mapfile -t ab <<< "$added"
+          for i in "${!fl[@]}"; do
+            [ "${fl[$i]}" = "$anchor" ] && hits+=("$i")
+          done
+          if [ "${#hits[@]}" -ne 1 ]; then
+            echo "anchor not unique (${#hits[@]}x)"; return 1
+          fi
+          local ai="${hits[0]}" dup=1
+          for j in "${!ab[@]}"; do
+            [ "${fl[$((ai + 1 + j))]:-}" = "${ab[$j]}" ] || { dup=0; break; }
+          done
+          if [ "$dup" = "1" ]; then
+            echo "already placed after anchor"; return 2
+          fi
+          local -a out=("${fl[@]:0:$((ai + 1))}" "${ab[@]}" "${fl[@]:$((ai + 1))}")
+          printf '%s\n' "${out[@]}" > "$f"
+          echo "placed at exact unique anchor"; return 0
+        }
+        exact_restage() {
+          # Restage only the failed hunks of a patch via exact anchor placement
+          # (no fuzz). Returns 0 only if every failed hunk was placed.
+          local name="$1" md="$2" failed_list="$3" base="$4" h rc verdict all=0 resolved=""
+          : > "${base}/exact.log"
+          for h in $failed_list; do
+            [ -f "${base}/hunks/$h" ] || { all=1; continue; }
+            verdict=$(anchor_place "${base}/hunks/$h" "$md")
+            rc=$?
+            echo "hunk ${h}: ${verdict}" >> "${base}/exact.log"
+            if [ "$rc" = "2" ]; then
+              resolved+="${h%.hunk}(already) "
+            elif [ "$rc" = "0" ]; then
+              resolved+="${h%.hunk}(exact) "
+            else
+              all=1
+            fi
+          done
+          cp "${base}/exact.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_exact.log" 2>/dev/null || true
+          if [ "$all" = "0" ]; then
+            echo "[patchgen] ${name}: exact anchor placement resolved: ${resolved% }"
+            return 0
+          fi
+          return 1
+        }
         gen_patch() {
           local name="$1" patch_file="$2" sed_expr="${3:-}" verify_spec="${4:-}"
           local base="$GITHUB_WORKSPACE/patchgen/${name}"
@@ -628,6 +690,7 @@ runs:
               else
                 cp "${base}/stage.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_stage.log" 2>/dev/null || true
                 find "$md" -name '*.rej' -exec sh -c 'cp "$1" "$2/$(basename "${1%.rej}")_$(basename "$1")"' _ {} "$GITHUB_WORKSPACE/patch-faillogs" \; 2>/dev/null || true
+                echo "[patchgen] ${name}: stage failure tail: $(tail -n 3 "${base}/stage.log" | tr '\n' ' ' | tr -s ' ')"
                 echo "::warning::[patchgen] ${name} failed to stage in sandbox; not applied"
                 echo "${name}|failed" >> "$psf"
                 return 0
@@ -643,6 +706,11 @@ runs:
               else
                 failed_ct=$((failed_ct+1))
                 echo "hunk not stageable: ${h##*/}" >> "${base}/stage.log"
+                local htarget vtail
+                htarget=$(grep -m1 -E '^\+\+\+ ' "$h" | awk '{print $2}')
+                vtail=$(tail -n 2 "${base}/stage.log" | tr '\n' ' ' | tr -s ' ')
+                echo "[patchgen] ${name}: FAIL ${h##*/} (${htarget:-?}): ${vtail:-no detail}"
+                failed_list+="$(basename "$h") "
               fi
             done
             find "$md" -name '*.rej' -delete 2>/dev/null || true
@@ -651,8 +719,15 @@ runs:
             [ "$failed_ct" -eq 0 ] || cp "${base}/stage.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_stage.log" 2>/dev/null || true
             if [ "$failed_ct" -gt 0 ]; then
               anchor_rescue "$name" "$src" "$verify_spec" && return 0
-              if fuzz_restage "$name" "$src" "$md" "$targets" "$base"; then
+              if exact_restage "$name" "$md" "$failed_list" "$base"; then
                 staged=1; already_ct=0; failed_ct=0
+              elif [ "${GEN_PATCH_NO_FUZZ:-0}" = "1" ]; then
+                echo "::warning::[patchgen] ${name}: ${failed_ct} of $((staged + already_ct + failed_ct)) hunk(s) not stageable at fuzz=0 and exact placement failed; no-fuzz mode: NOT applying a partial patch"
+                echo "${name}|failed" >> "$psf"
+                return 0
+              elif fuzz_restage "$name" "$src" "$md" "$targets" "$base"; then
+                staged=1; already_ct=0; failed_ct=0
+                echo "::warning::[patchgen] ${name}: hunks staged at fuzz=2 (context drift); see patch-faillogs/${name}_fuzz.log"
               else
                 echo "::warning::[patchgen] ${name}: ${failed_ct} of $((staged + already_ct + failed_ct)) hunk(s) not stageable at fuzz=0; fuzz re-stage failed; NOT applying a partial patch"
                 echo "${name}|failed" >> "$psf"
@@ -737,10 +812,8 @@ runs:
           return 0
         }
         gen_patch_fb() {
-          # Primary-with-fallback wrapper around gen_patch. Runs the primary
-          # patch first; if it does not land, wipes the stale per-patch status
-          # lines and retries once with the fallback patch.
-          # Sets GEN_PATCH_FB_VIA for the caller: primary | fallback | none.
+          # Runs the primary patch; on failure wipes stale status lines and
+          # retries once with the fallback. Sets GEN_PATCH_FB_VIA: primary|fallback|none.
           local name="$1" primary="$2" fallback="$3" sed_expr="${4:-}" verify_spec="${5:-}"
           local psf="${PS_FILE:-patch-status-raw.txt}"
           GEN_PATCH_FB_VIA="none"
@@ -799,11 +872,9 @@ runs:
           return 1
         }
         verify_applied() {
-          # Generic post-apply self-verification driven by the patch itself:
-          # sample lines the patch adds and confirm they are present in the
-          # live tree. Prints matched evidence lines; non-zero if any sampled
-          # line is missing. Handles both '+++ b/path' (upstream) and
-          # '+++ modified/path' (diff -ruN regen) header shapes.
+          # Post-apply self-verification: sample lines the patch adds, confirm
+          # present in the live tree, print evidence. Handles '+++ b/path' and
+          # '+++ modified/path' header shapes.
           local name="$1" patch_file="$2"
           local map
           map=$(awk '
@@ -1982,16 +2053,19 @@ runs:
           ' "$susfs_kernel_patch" > "$filtered_kernel_patch"
           patch_to_apply="$filtered_kernel_patch"
         fi
-        # Stage SUSFS through patchgen (diff & generate): per-file, per-hunk,
-        # fuzz=0 only. Pre-shim: idempotently insert the known SUS_MAP include
-        # block into mm/memory.c (formerly the post-failure .rej sed rescue)
-        # so that hunk stages or lands as "already" at fuzz=0.
-        if ! grep -q 'CONFIG_KSU_SUSFS_SUS_MAP' mm/memory.c && grep -q '#include <linux/vmalloc.h>' mm/memory.c; then
-          echo "[patchgen] susfs-main: pre-shimming mm/memory.c SUS_MAP include block"
+        # Stage SUSFS through patchgen (diff & generate), fuzz=0 only. The
+        # SUS_MAP include pre-shim runs only when the patch lacks the block
+        # itself; on gki-android16-6.12 the upstream hunk adds it and a shim
+        # would break that hunk's context (duplicate block, fuzz=2 staging).
+        if ! grep -q 'CONFIG_KSU_SUSFS_SUS_MAP' mm/memory.c && grep -q '#include <linux/vmalloc.h>' mm/memory.c \
+           && ! grep -q 'CONFIG_KSU_SUSFS_SUS_MAP' "$patch_to_apply"; then
+          echo "[patchgen] susfs-main: pre-shimming mm/memory.c SUS_MAP include block (patch lacks it)"
           sed -i '/#include <linux\/vmalloc.h>/a #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n#include <linux\/susfs_def.h>\n#endif \/\/ #ifdef CONFIG_KSU_SUSFS_SUS_MAP' mm/memory.c
         fi
         source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        GEN_PATCH_NO_FUZZ=1
         gen_patch susfs-main "$patch_to_apply" "" "g:fs/Makefile|susfs.o"
+        GEN_PATCH_NO_FUZZ=0
         if ! grep -Eq '^susfs-main\|(applied|already)' "$PS_FILE" 2>/dev/null; then
           echo "::error::SUSFS kernel patch failed to stage at fuzz=0 (see patch-faillogs/)"
           exit 1
@@ -2115,12 +2189,9 @@ runs:
           echo "susfs|failed" >> "$PS_FILE"
         fi
 
-        # pershoot: SuSFS / Toolkit coexistence. Upstream only ever ENABLES the
-        # uname-spoof static key; resetting spoofing to "default" leaves the
-        # stale spoof active until reboot. Track the reset and disable the key
-        # so toolkits can toggle SPOOF_UNAME off. Optional: warn and continue
-        # when it cannot stage at fuzz=0. The upstream patch prefixes paths
-        # with kernel_patches/, so rewrite them for a plain -p1 apply.
+        # pershoot SuSFS/Toolkit coexistence: upstream only ENABLES the uname-spoof
+        # static key, so track the reset and disable the key. Optional: warn+continue
+        # if it can't stage at fuzz=0. Upstream paths carry kernel_patches/ - rewrite to -p1.
         pershoot_uname_url="https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/pershoot/susfs4ksu/0002-pershoot-Implement-SuSFS-and-Toolkit-coexistence.patch"
         if fetch_patch "$pershoot_uname_url" /tmp/pershoot_uname_coexistence.patch; then
           gen_patch pershoot-uname-coexistence /tmp/pershoot_uname_coexistence.patch 's|kernel_patches/fs/|fs/|g'
@@ -2886,20 +2957,15 @@ runs:
           6.6|6.12) BORE_SPEC="g:kernel/sched/bore.c|sched_bore_init" ;;
           *) BORE_SPEC="g:kernel/fork.c|sched_bore_free;g:kernel/sysctl.c|sched_bore" ;;
         esac
-        # Tree-exact regen patch is the PRIMARY source: pre-ported BoRE patches
-        # live in scripts/patches, keyed by kernel version
-        # (bore_<ver>_oneplus_regen.patch). They run through the same gen_patch
-        # pipeline (stage fuzz=0 -> regen -> apply fuzz=0 -> verify), so patchgen
-        # staging wins whenever a committed override exists. Bouteillepleine's
-        # upstream patch targets the reworked EEVDF base and structurally cannot
-        # stage on this tree, so the upstream fetch is the fallback, used only
-        # when no regen patch is committed for this kernel version.
+        # PRIMARY: tree-exact BoRE regen patches in scripts/patches keyed by version;
+        # they run the same gen_patch pipeline, so patchgen staging wins when committed.
+        # Bouteillepleine's upstream patch targets the reworked EEVDF base and cannot
+        # stage on this tree - it is the fallback when no regen patch is committed.
         BORE_REGEN="$GITHUB_WORKSPACE/scripts/patches/bore_${KERNEL_VER}_oneplus_regen.patch"
         [ -f "$BORE_REGEN" ] || BORE_REGEN=""
-        # Fail-safe content guard: a regen patch carrying the duplicated
-        # return-curr construct (added line directly above an identical
-        # context line in a brace-less if) bootloops the device. Refuse it
-        # rather than build an unbootable kernel.
+        # Fail-safe: a regen patch with the duplicated return-curr construct
+        # (added line directly above identical context in a brace-less if)
+        # bootloops the device - refuse it rather than build an unbootable kernel.
         if [ -n "$BORE_REGEN" ] && awk '
             /^\+[[:space:]]*return curr;[[:space:]]*$/ { if ((getline nxt) > 0 && nxt ~ /^[[:space:]]*return curr;[[:space:]]*$/) { found = 1; exit } }
             END { exit !(found) }
