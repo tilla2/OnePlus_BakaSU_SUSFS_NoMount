@@ -2129,9 +2129,11 @@ runs:
         grep -nE '^CONFIG_KSU_SUSFS' "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" | head -n 20 || true
         if [ -f "$COMMON_KERNEL_FOLDER/fs/susfs.c" ]; then
           echo "susfs|applied" >> "$PS_FILE"
+          echo "✅ SUSFS config settings added (fs/susfs.c present)"
         else
-          echo "::warning::fs/susfs.c missing after SUSFS application"
+          echo "::error::fs/susfs.c missing after SUSFS application"
           echo "susfs|failed" >> "$PS_FILE"
+          exit 1
         fi
 
         # pershoot SuSFS/Toolkit coexistence: upstream only ENABLES the uname-spoof
@@ -2415,7 +2417,7 @@ runs:
           echo "::endgroup::"
           exit 0
         fi
-        gen_patch rtmutex-cve /tmp/rtmutex_cve_6_12.patch "" "g:kernel/locking/rtmutex.c|waiter_task->pi_blocked_on = NULL;g:kernel/locking/rtmutex_api.c|waiter_task"
+        gen_patch rtmutex-cve /tmp/rtmutex_cve_6_12.patch "" "g:kernel/locking/rtmutex.c|waiter_task->pi_blocked_on = NULL;g:kernel/locking/rtmutex_api.c|if \(unlikely\(ret < 0\)\)"
         if ! grep -Eq '^rtmutex-cve\|(applied|already)' "$PS_FILE" 2>/dev/null; then
           echo "::warning::CVE-2026-43499 fix did not stage at fuzz=0; continuing without it"
           sed -i '/^rtmutex-cve|/d' "$PS_FILE" 2>/dev/null || true
@@ -2426,7 +2428,7 @@ runs:
         if [ "$(grep -E '^rtmutex-cve\|' "$PS_FILE" | tail -n1)" = "rtmutex-cve|applied" ]; then
           grep -q 'waiter_task->pi_blocked_on = NULL' kernel/locking/rtmutex.c
           grep -q 'waiter::task != current' kernel/locking/rtmutex.c
-          grep -q 'waiter_task' kernel/locking/rtmutex_api.c
+          grep -q 'if (unlikely(ret < 0))' kernel/locking/rtmutex_api.c
         fi
         echo "RTMUTEX_CVE_FIXED=true" >> "$GITHUB_ENV"
         echo "RTMUTEX_CVE_SOURCE=https://github.com/cctv18/oppo_oplus_realme_sm8850 other_patch/cve-2026-43499-rtmutex-6.12.patch @6c1ffda" >> "$GITHUB_ENV"
@@ -3849,7 +3851,7 @@ runs:
           echo "SusFS: $(pstat susfs)"
           echo "BBR: $(pstat bbr)"
           echo "BBRv3: $(pstat bbrv3)"
-          echo "BoRE: $(pstat bore) (via ${BORE_VIA:-n/a})"
+          echo "BoRE: $(pstat bore) (via ${BORE_SKIPPED:-n/a})"
           echo "ADIOS: $(pstat adios)"
           echo "BBG: $(pstat bbg)"
           echo "HMBIRD SCX: $(pstat hmbird)"
@@ -3925,7 +3927,7 @@ runs:
           echo "| **SusFS** | $(pstat susfs) |"
           echo "| **BBR** | $(pstat bbr) |"
           echo "| **BBRv3** | $(pstat bbrv3) |"
-          echo "| **BoRE** | $(pstat bore) (via ${BORE_VIA:-n/a}) |"
+          echo "| **BoRE** | $(pstat bore) (via ${BORE_SKIPPED:-n/a}) |"
           echo "| **ADIOS** | $(pstat adios) |"
           echo "| **BBG** | $(pstat bbg) |"
           echo "| **HMBIRD SCX** | $(pstat hmbird) |"
