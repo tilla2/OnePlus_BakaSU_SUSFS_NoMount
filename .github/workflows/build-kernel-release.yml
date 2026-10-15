@@ -494,16 +494,23 @@ jobs:
           ksu_type="${{ inputs.ksu_type }}"
           ksu_ref="${{ inputs.ksu_branch_or_hash }}"
           
-          # ── Load "last successful run" pin store (artifact 'last-success-pins', file pins.json) ──
+          # ── Load "last successful run" pin store (artifact 'last-success-pins') ──
           PINS_JSON="{}"
           pins_art="$(gh api "repos/${{ github.repository }}/actions/artifacts?name=last-success-pins&per_page=100" \
             --jq '[.artifacts[] | select(.expired == false)] | sort_by(.id) | last | .id // empty' 2>/dev/null || true)"
+          if [ -z "$pins_art" ]; then
+            # upload-artifact@v7 (archive: false) stores under the path basename:
+            # pre-fix stores live under the legacy name 'pins.json' — try it too
+            pins_art="$(gh api "repos/${{ github.repository }}/actions/artifacts?name=pins.json&per_page=100" \
+              --jq '[.artifacts[] | select(.expired == false)] | sort_by(.id) | last | .id // empty' 2>/dev/null || true)"
+          fi
           if [ -n "$pins_art" ]; then
             rm -rf pins_store && mkdir -p pins_store
             if gh api "repos/${{ github.repository }}/actions/artifacts/$pins_art/zip" > pins_store/pins.zip 2>/dev/null \
                && unzip -oq pins_store/pins.zip -d pins_store \
-               && [ -f pins_store/pins.json ]; then
-              pins_raw="$(cat pins_store/pins.json)"
+               && { [ -f pins_store/last-success-pins ] || [ -f pins_store/pins.json ]; }; then
+              pins_raw="$(cat pins_store/last-success-pins 2>/dev/null || true)"
+              [ -n "$pins_raw" ] || pins_raw="$(cat pins_store/pins.json 2>/dev/null || true)"
               if [ -n "$pins_raw" ] && echo "$pins_raw" | jq -e . >/dev/null 2>&1; then
                 PINS_JSON="$pins_raw"
                 echo "📌 Pin store loaded from artifact $pins_art: $(jq -c . <<<"$pins_raw")"
@@ -991,12 +998,19 @@ jobs:
           PINS_JSON="{}"
           pins_art="$(gh api "repos/${{ github.repository }}/actions/artifacts?name=last-success-pins&per_page=100" \
             --jq '[.artifacts[] | select(.expired == false)] | sort_by(.id) | last | .id // empty' 2>/dev/null || true)"
+          if [ -z "$pins_art" ]; then
+            # upload-artifact@v7 (archive: false) stores under the path basename:
+            # pre-fix stores live under the legacy name 'pins.json' — try it too
+            pins_art="$(gh api "repos/${{ github.repository }}/actions/artifacts?name=pins.json&per_page=100" \
+              --jq '[.artifacts[] | select(.expired == false)] | sort_by(.id) | last | .id // empty' 2>/dev/null || true)"
+          fi
           if [ -n "$pins_art" ]; then
             rm -rf pins_store && mkdir -p pins_store
             if gh api "repos/${{ github.repository }}/actions/artifacts/$pins_art/zip" > pins_store/pins.zip 2>/dev/null \
                && unzip -oq pins_store/pins.zip -d pins_store \
-               && [ -f pins_store/pins.json ]; then
-              pins_raw="$(cat pins_store/pins.json)"
+               && { [ -f pins_store/last-success-pins ] || [ -f pins_store/pins.json ]; }; then
+              pins_raw="$(cat pins_store/last-success-pins 2>/dev/null || true)"
+              [ -n "$pins_raw" ] || pins_raw="$(cat pins_store/pins.json 2>/dev/null || true)"
               if [ -n "$pins_raw" ] && echo "$pins_raw" | jq -e . >/dev/null 2>&1; then
                 PINS_JSON="$pins_raw"
                 echo "📌 NoMount pin store loaded from artifact $pins_art"
@@ -2387,12 +2401,18 @@ jobs:
           old_pins="{}"
           old_art="$(gh api "repos/${{ github.repository }}/actions/artifacts?name=${PINS_ARTIFACT}&per_page=100" \
             --jq '[.artifacts[] | select(.expired == false)] | sort_by(.id) | last | .id // empty' 2>/dev/null || true)"
+          if [ -z "$old_art" ]; then
+            # pre-fix stores live under the legacy name 'pins.json' (path basename)
+            old_art="$(gh api "repos/${{ github.repository }}/actions/artifacts?name=pins.json&per_page=100" \
+              --jq '[.artifacts[] | select(.expired == false)] | sort_by(.id) | last | .id // empty' 2>/dev/null || true)"
+          fi
           if [ -n "$old_art" ]; then
             rm -rf pins_prev && mkdir -p pins_prev
             if gh api "repos/${{ github.repository }}/actions/artifacts/$old_art/zip" > pins_prev/store.zip 2>/dev/null \
                && unzip -oq pins_prev/store.zip -d pins_prev \
-               && [ -f pins_prev/pins.json ]; then
-              raw="$(cat pins_prev/pins.json)"
+               && { [ -f pins_prev/last-success-pins ] || [ -f pins_prev/pins.json ]; }; then
+              raw="$(cat pins_prev/last-success-pins 2>/dev/null || true)"
+              [ -n "$raw" ] || raw="$(cat pins_prev/pins.json 2>/dev/null || true)"
               if [ -n "$raw" ] && echo "$raw" | jq -e . >/dev/null 2>&1; then
                 old_pins="$raw"
                 echo "  📥 Previous pin artifact $old_art loaded"
@@ -2408,9 +2428,12 @@ jobs:
           merged=$(jq -n --argjson new "$new_pins" --argjson old "$old_pins" \
             '$new + {susfs: (($old.susfs // {}) + ($new.susfs // {}))}')
 
-          printf '%s' "$merged" > pins.json
-          jq -e . pins.json >/dev/null || { echo "::error::Generated pins.json is not valid JSON"; exit 1; }
-          echo "  ✅ pins.json ready: $(jq -c . pins.json)"
+          # The file name IS the stored artifact name: upload-artifact@v7 with
+          # archive: false names the artifact after the path basename, so the
+          # file must be called exactly like the 'name:' input below.
+          printf '%s' "$merged" > last-success-pins
+          jq -e . last-success-pins >/dev/null || { echo "::error::Generated pin store is not valid JSON"; exit 1; }
+          echo "  ✅ last-success-pins ready: $(jq -c . last-success-pins)"
 
           {
             echo "## 📌 Last-successful pins recorded"
@@ -2440,7 +2463,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: last-success-pins
-          path: pins.json
+          path: last-success-pins
           if-no-files-found: error
           retention-days: 90
           archive: false
@@ -2470,6 +2493,20 @@ jobs:
               echo "::warning::could not delete superseded pin artifact $art_id — 90-day retention will reap it"
             fi
           done < <(gh api "repos/${{ github.repository }}/actions/artifacts?name=${PINS_ARTIFACT}&per_page=100" \
+            --jq '.artifacts[] | select(.expired == false) | .id')
+          # Legacy stores: pre-fix runs uploaded the store under the name
+          # 'pins.json' (the file basename). Remove them now that the
+          # canonical artifact above exists — the merge step already carried
+          # their content into this run's store.
+          while read -r art_id; do
+            if [ -z "$art_id" ]; then continue; fi
+            if gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$art_id" >/dev/null 2>&1; then
+              echo "  🗑️  deleted legacy pin artifact $art_id (name 'pins.json')"
+              deleted=$((deleted + 1))
+            else
+              echo "::warning::could not delete legacy pin artifact $art_id — 90-day retention will reap it"
+            fi
+          done < <(gh api "repos/${{ github.repository }}/actions/artifacts?name=pins.json&per_page=100" \
             --jq '.artifacts[] | select(.expired == false) | .id')
           echo "  ✅ Pin store is singular: kept artifact $keep, pruned $deleted superseded"
           echo "::endgroup::"
