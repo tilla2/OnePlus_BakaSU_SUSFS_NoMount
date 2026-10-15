@@ -1,6 +1,0 @@
-# <patch-name> <kernel-commit-sha>
-# The commit the patch was authored against; used as the 3-way merge base
-# when staging fails at fuzz=0. Get the SHA from the "Set Dir Paths" log line
-# "Kernel tree synced at:" of any recent run.
-bbrv3 d9053b907db4bb5da938e9cf947d0ae32302ceaf
-ipv6-nat d9053b907db4bb5da938e9cf947d0ae32302ceaf
