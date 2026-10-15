@@ -472,18 +472,18 @@ jobs:
           ksu_type="${{ inputs.ksu_type }}"
           ksu_ref="${{ inputs.ksu_branch_or_hash }}"
           
-          # ── Load "last successful run" pin store (repo Actions variable LAST_SUCCESS_PINS) ──
+          # ── Load "last successful run" pin store (branch ci/last-success-pins, file pins.json) ──
           PINS_JSON="{}"
-          pins_raw="$(gh api "repos/${{ github.repository }}/actions/variables/LAST_SUCCESS_PINS" --jq '.value' 2>/dev/null || true)"
+          pins_raw="$(gh api "repos/${{ github.repository }}/contents/pins.json?ref=ci/last-success-pins" --jq '.content' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)"
           if [ -n "$pins_raw" ]; then
             if echo "$pins_raw" | jq -e . >/dev/null 2>&1; then
               PINS_JSON="$pins_raw"
-              echo "📌 LAST_SUCCESS_PINS loaded: $(jq -c . <<<"$pins_raw")"
+              echo "📌 Pin store loaded: $(jq -c . <<<"$pins_raw")"
             else
-              echo "::warning::LAST_SUCCESS_PINS exists but is not valid JSON — ignoring it"
+              echo "::warning::Pin store exists but is not valid JSON — ignoring it"
             fi
           else
-            echo "ℹ️  No LAST_SUCCESS_PINS stored yet — pin toggles fail loudly until a first successful build records one"
+            echo "ℹ️  No pins stored yet (branch ci/last-success-pins absent or empty) — pin toggles fail loudly until a first successful build records one"
           fi
 
           # ── Root manager: "same as last successful run" ──
@@ -491,7 +491,7 @@ jobs:
             stored_ksu_type="$(jq -r '.ksu_type // empty' <<<"$PINS_JSON")"
             stored_ksu_sha="$(jq -r '.ksu_sha // empty' <<<"$PINS_JSON")"
             if [ -z "$stored_ksu_sha" ]; then
-              echo "::error::KSU pin requested but no last-successful Root-manager pin exists yet (LAST_SUCCESS_PINS missing/empty). Run once with explicit refs to seed it."
+              echo "::error::KSU pin requested but no last-successful Root-manager pin exists yet (pin store missing/empty). Run once with explicit refs to seed it."
               exit 1
             fi
             if [ "$stored_ksu_type" != "$ksu_type" ]; then
@@ -602,7 +602,7 @@ jobs:
             if [ "${{ inputs.susfs_pin_last_success }}" = "true" ] && [ -z "${user_inputs[$key]}" ]; then
               stored_susfs="$(jq -r --arg k "$key" '.susfs[$k] // empty' <<<"$PINS_JSON")"
               if [ -z "$stored_susfs" ]; then
-                echo "::error::SUSFS pin requested but no last-successful pin exists for $key (LAST_SUCCESS_PINS empty or this KMI never built successfully). Type a ref for this KMI or seed the store with one successful build."
+                echo "::error::SUSFS pin requested but no last-successful pin exists for $key (pin store empty or this KMI never built successfully). Type a ref for this KMI or seed the store with one successful build."
                 exit 1
               fi
               echo "  📌 SUSFS pin: $key → $stored_susfs (last successful run)"
@@ -895,14 +895,14 @@ jobs:
 
           # ── NoMount: "same as last successful run" ──
           PINS_JSON="{}"
-          pins_raw="$(gh api "repos/${{ github.repository }}/actions/variables/LAST_SUCCESS_PINS" --jq '.value' 2>/dev/null || true)"
+          pins_raw="$(gh api "repos/${{ github.repository }}/contents/pins.json?ref=ci/last-success-pins" --jq '.content' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)"
           if [ -n "$pins_raw" ] && echo "$pins_raw" | jq -e . >/dev/null 2>&1; then
             PINS_JSON="$pins_raw"
           fi
           if [ "${{ inputs.nomount_pin_last_success }}" = "true" ]; then
             stored_nm="$(jq -r '.nomount_commit // empty' <<<"$PINS_JSON")"
             if [ -z "$stored_nm" ]; then
-              echo "::error::NoMount pin requested but no last-successful commit exists yet (LAST_SUCCESS_PINS missing/empty). Seed it with one successful build."
+              echo "::error::NoMount pin requested but no last-successful commit exists yet (pin store missing/empty). Seed it with one successful build."
               exit 1
             fi
             echo "📌 NoMount pin: $stored_nm (last successful run)"
@@ -2229,10 +2229,13 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       GH_TOKEN: ${{ github.token }}
-      PINS_VAR_NAME: LAST_SUCCESS_PINS
+      PINS_BRANCH: ci/last-success-pins
+      PINS_PATH: pins.json
     steps:
       - name: 📌 Store effective refs (Root manager / SUSFS per GKI / NoMount)
         shell: bash
+        env:
+          MATRIX_JSON: ${{ needs.set-op-model.outputs.matrix }}
         run: |
           set -euo pipefail
           echo "::group::Record last-successful pins"
@@ -2270,7 +2273,7 @@ jobs:
           # Merge with previous store so SUSFS pins of GMKIs not built in this
           # run survive; Root manager / NoMount always reflect the latest success.
           old_pins="{}"
-          raw="$(gh api "repos/$REPO/actions/variables/$PINS_VAR_NAME" --jq '.value' 2>/dev/null || true)"
+          raw="$(gh api "repos/$REPO/contents/$PINS_PATH?ref=$PINS_BRANCH" --jq '.content' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)"
           if [ -n "$raw" ] && echo "$raw" | jq -e . >/dev/null 2>&1; then
             old_pins="$raw"
           fi
@@ -2278,13 +2281,29 @@ jobs:
           merged=$(jq -n --argjson new "$new_pins" --argjson old "$old_pins" \
             '$new + {susfs: (($old.susfs // {}) + ($new.susfs // {}))}')
 
-          if gh api -X PATCH "repos/$REPO/actions/variables/$PINS_VAR_NAME" -f value="$merged" >/dev/null 2>&1; then
-            echo "  ✅ Updated variable $PINS_VAR_NAME"
-          elif gh api -X POST "repos/$REPO/actions/variables/$PINS_VAR_NAME" -f name="$PINS_VAR_NAME" -f value="$merged" >/dev/null 2>&1; then
-            echo "  ✅ Created variable $PINS_VAR_NAME"
+          # Store as a single parentless commit force-pinned to the pins branch.
+          # (The Actions *variables* REST API needs a dedicated "Variables" repo
+          # permission that no workflow permissions block can grant to GITHUB_TOKEN
+          # — it 403s — while git-data writes only need contents: write, which this
+          # workflow already runs with.)
+          echo "  Writing pins to branch $PINS_BRANCH…"
+          tree_payload=$(jq -n --arg p "$PINS_PATH" --arg v "$merged" \
+            '{tree: [{path: $p, mode: "100644", type: "blob", content: $v}]}')
+          if ! tree_sha=$(gh api -X POST "repos/$REPO/git/trees" --input - <<<"$tree_payload" --jq '.sha' 2>gh_err.txt); then
+            echo "::error::Creating pins tree failed:"; sed -n '1,5p' gh_err.txt; exit 1
+          fi
+          commit_payload=$(jq -n --arg t "$tree_sha" \
+            '{message: "📌 Last-successful pins (run #${{ github.run_number }})", tree: $t}')
+          if ! commit_sha=$(gh api -X POST "repos/$REPO/git/commits" --input - <<<"$commit_payload" --jq '.sha' 2>gh_err.txt); then
+            echo "::error::Creating pins commit failed:"; sed -n '1,5p' gh_err.txt; exit 1
+          fi
+          ref_payload=$(jq -n --arg s "$commit_sha" '{sha: $s, force: true}')
+          if gh api -X PATCH "repos/$REPO/git/refs/heads/$PINS_BRANCH" --input - <<<"$ref_payload" >/dev/null 2>&1; then
+            echo "  ✅ Updated pins branch $PINS_BRANCH → $commit_sha"
+          elif gh api -X POST "repos/$REPO/git/refs" --input - <<<"$(jq -n --arg r "refs/heads/$PINS_BRANCH" --arg s "$commit_sha" '{ref: $r, sha: $s}')" >/dev/null 2>&1; then
+            echo "  ✅ Created pins branch $PINS_BRANCH → $commit_sha"
           else
-            echo "::error::Could not write variable $PINS_VAR_NAME (workflow needs actions: write permission)"
-            exit 1
+            echo "::error::Could not point refs/heads/$PINS_BRANCH at $commit_sha:"; sed -n '1,5p' gh_err.txt 2>/dev/null || true; exit 1
           fi
 
           {
@@ -2293,7 +2312,7 @@ jobs:
             echo "**Run:** [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
             echo ""
             echo "**Devices covered by this success:**"
-            jq -r '.include[] | "- \(.os_version)/\(.model) (\(.android_version)-\(.kernel_version))"' <<<"${{ needs.set-op-model.outputs.matrix }}"
+            jq -r '(.include // [])[] | "- \(.os_version)/\(.model) (\(.android_version)-\(.kernel_version))"' <<<"$MATRIX_JSON"
             echo ""
             echo "**Root manager:** \`${{ inputs.ksu_type }}\` → \`${{ needs.set-op-model.outputs.ksu_resolved_hash }}\`"
             echo "**NoMount:** → \`${{ needs.resolve-nomount.outputs.nomount_commit }}\`"
@@ -2304,7 +2323,7 @@ jobs:
             echo '```'
             echo ""
             echo "> Next run with a **\"Same as last successful run\"** toggle ON reuses exactly these refs."
-            echo "> Store location: repo Settings → Secrets and variables → Actions → Variables → \`LAST_SUCCESS_PINS\` (auto-maintained; clearing it resets all toggles to first-run behavior)."
+            echo "> Store location: branch \`ci/last-success-pins\` → \`pins.json\` (auto-maintained; deleting the branch resets all toggles to first-run behavior)."
           } >> "$GITHUB_STEP_SUMMARY"
 
           echo "::endgroup::"
