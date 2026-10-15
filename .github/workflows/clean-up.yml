@@ -60,10 +60,17 @@ on:
         type: boolean
         default: false
       run_workflow:
-        description: "Only runs of this workflow file, empty = all"
-        required: false
-        type: string
-        default: ""
+        description: "Only runs of this workflow, or all (runs scope)"
+        required: true
+        type: choice
+        default: all
+        options:
+          - all
+          - build-kernel-release.yml
+          - clean-up.yml
+          - mirror-toolchains.yml
+          - patch-hygiene.yml
+          - sync-sanitize.yml
       run_status:
         description: "Which runs qualify: all | failed | unsuccessful"
         required: true
@@ -85,21 +92,27 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  cleanup:
-    name: Fetch & delete
+
+  # ─────────────────────────── ANALYSE ───────────────────────────
+  # One job per store: fetch the inventory, apply filters + pin/keep
+  # protections, write the match set. Dry runs stop after this stage.
+  analyse:
+    name: 📊 Analyse (${{ matrix.store }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        store: [cache, release, runs, artifacts]
     env:
       GH_TOKEN: ${{ github.token }}
+      STORE: ${{ matrix.store }}
       SCOPE: ${{ inputs.scope }}
       APPLY: ${{ inputs.apply }}
       RELEASE_TAG: ${{ inputs.release_tag }}
       KEY_FILTER: ${{ inputs.key_filter }}
       PREFIX: ${{ inputs.prefix }}
       MIN_AGE_DAYS: ${{ inputs.min_age_days }}
-      OLDEST_FIRST: ${{ inputs.oldest_first }}
-      DELETE_COUNT: ${{ inputs.delete_count }}
-      KEEP_COUNT: ${{ inputs.keep_count }}
       PIN: ${{ inputs.pin }}
       PIN_PURGE: ${{ inputs.pin_purge }}
       RUN_WORKFLOW: ${{ inputs.run_workflow }}
@@ -107,29 +120,26 @@ jobs:
       KEEP_SUCCESSFUL: ${{ inputs.keep_successful }}
     steps:
 
-      # ─────────────────────────── PHASE 1 ───────────────────────────
-      # Build the full inventory, compute matches + protections, print
-      # the analysis table. A dry run (apply=false) stops after this.
-      - name: 📊 Phase 1 — Analyse & match (dry run stops here)
+      - name: 📊 Fetch & match — ${{ matrix.store }}
         shell: bash
         run: |
           set -euo pipefail
-          echo "ℹ️ Phase 1 — analyse & match"
-          : > /tmp/items.tsv
+          echo "ℹ️ analyse — $STORE"
           : > /tmp/matches.tsv
           : > /tmp/protected.txt
 
-          want_cache=false; want_release=false; want_runs=false; want_artifacts=false
-          case "$SCOPE" in
-            all)       want_cache=true; want_release=true; want_runs=true; want_artifacts=true ;;
-            cache)     want_cache=true ;;
-            release)   want_release=true ;;
-            runs)      want_runs=true ;;
-            artifacts) want_artifacts=true ;;
-            *) echo "❌ unknown scope: $SCOPE"; exit 1 ;;
-          esac
+          in_scope=false
+          if [ "$SCOPE" = "all" ] || [ "$SCOPE" = "$STORE" ]; then in_scope=true; fi
+          if ! $in_scope; then
+            echo "MATCHED=0"      > /tmp/meta.tsv
+            echo "BYTES=0"       >> /tmp/meta.tsv
+            echo "PROTECTED=0"   >> /tmp/meta.tsv
+            echo "SCOPE_SKIP=1"  >> /tmp/meta.tsv
+            echo "✅ $STORE not in scope (scope=$SCOPE) — skipped"
+            exit 0
+          fi
 
-          for v in "$MIN_AGE_DAYS" "$DELETE_COUNT" "$KEEP_COUNT" "$KEEP_SUCCESSFUL"; do
+          for v in "$MIN_AGE_DAYS" "$KEEP_SUCCESSFUL"; do
             [[ "$v" =~ ^[0-9]+$ ]] || { echo "❌ numeric inputs must be integers, got: $v"; exit 1; }
           done
 
@@ -137,84 +147,90 @@ jobs:
           if [ "$MIN_AGE_DAYS" != "0" ]; then
             cutoff="$(date -u -d "-${MIN_AGE_DAYS} days" +%Y-%m-%dT%H:%M:%SZ)"
           fi
-          echo "ℹ️ scope: $SCOPE · apply: $APPLY · age gate: ${cutoff:-none}"
+          echo "ℹ️ age gate: ${cutoff:-none}"
 
-          if $want_cache; then
-            page=1
-            while :; do
-              resp="$(gh api "repos/${GITHUB_REPOSITORY}/actions/caches?per_page=100&page=${page}")" || { echo "❌ caches API call failed"; exit 1; }
-              jq -e . >/dev/null 2>&1 <<<"$resp" || { echo "❌ caches API returned invalid JSON"; exit 1; }
-              # NOTE: the caches endpoint returns "actions_caches", not "caches"
-              jq -r '(.actions_caches // .caches // [])[] | ["cache", .id, .key, "", .size_in_bytes, .created_at, ""] | @tsv' <<<"$resp" >> /tmp/items.tsv
-              n="$(jq '(.actions_caches // .caches // []) | length' <<<"$resp")"
-              if [ "$n" -lt 100 ]; then break; fi
-              page=$((page+1))
-            done
-            echo "✅ actions/cache entries: $(grep -c $'^cache\t' /tmp/items.tsv || true)"
-          fi
+          case "$STORE" in
 
-          if $want_release; then
-            rel_id="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" --jq '.id' 2>/dev/null || true)"
-            if [ -z "$rel_id" ]; then
-              echo "ℹ️ release '${RELEASE_TAG}' not found — 0 assets"
-            else
+            cache)
               page=1
               while :; do
-                resp="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${rel_id}/assets?per_page=100&page=${page}")" || { echo "❌ release assets API call failed"; exit 1; }
-                jq -e . >/dev/null 2>&1 <<<"$resp" || { echo "❌ release assets API returned invalid JSON"; exit 1; }
-                jq -r 'if type == "array" then .[] else empty end | ["release", .id, .name, "", .size, .created_at, ""] | @tsv' <<<"$resp" >> /tmp/items.tsv
-                n="$(jq 'if type == "array" then length else 0 end' <<<"$resp")"
+                resp="$(gh api "repos/${GITHUB_REPOSITORY}/actions/caches?per_page=100&page=${page}")" || { echo "❌ caches API call failed"; exit 1; }
+                jq -e . >/dev/null 2>&1 <<<"$resp" || { echo "❌ caches API returned invalid JSON"; exit 1; }
+                # NOTE: the caches endpoint returns "actions_caches", not "caches"
+                jq -r '(.actions_caches // .caches // [])[] | ["cache", .id, .key, "", .size_in_bytes, .created_at, ""] | @tsv' <<<"$resp" >> /tmp/items.tsv
+                n="$(jq '(.actions_caches // .caches // []) | length' <<<"$resp")"
                 if [ "$n" -lt 100 ]; then break; fi
                 page=$((page+1))
               done
-              echo "✅ release ${RELEASE_TAG} assets: $(grep -c $'^release\t' /tmp/items.tsv || true)"
-            fi
-          fi
+              ;;
 
-          if $want_artifacts; then
-            page=1
-            while :; do
-              resp="$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100&page=${page}")" || { echo "❌ artifacts API call failed"; exit 1; }
-              jq -e . >/dev/null 2>&1 <<<"$resp" || { echo "❌ artifacts API returned invalid JSON"; exit 1; }
-              jq -r '(.artifacts // [])[] | select(.expired == false) | ["artifact", .id, .name, "", .size_in_bytes, .created_at, ""] | @tsv' <<<"$resp" >> /tmp/items.tsv
-              n="$(jq '(.artifacts // []) | length' <<<"$resp")"
-              if [ "$n" -lt 100 ]; then break; fi
-              page=$((page+1))
-            done
-            echo "✅ live artifacts: $(grep -c $'^artifact\t' /tmp/items.tsv || true)"
-          fi
+            release)
+              rel_id="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" --jq '.id' 2>/dev/null || true)"
+              if [ -z "$rel_id" ]; then
+                echo "ℹ️ release '${RELEASE_TAG}' not found — 0 assets"
+                : > /tmp/items.tsv
+              else
+                : > /tmp/items.tsv
+                page=1
+                while :; do
+                  resp="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${rel_id}/assets?per_page=100&page=${page}")" || { echo "❌ release assets API call failed"; exit 1; }
+                  jq -e . >/dev/null 2>&1 <<<"$resp" || { echo "❌ release assets API returned invalid JSON"; exit 1; }
+                  jq -r 'if type == "array" then .[] else empty end | ["release", .id, .name, "", .size, .created_at, ""] | @tsv' <<<"$resp" >> /tmp/items.tsv
+                  n="$(jq 'if type == "array" then length else 0 end' <<<"$resp")"
+                  if [ "$n" -lt 100 ]; then break; fi
+                  page=$((page+1))
+                done
+              fi
+              ;;
 
-          if $want_runs; then
-            echo "${GITHUB_RUN_ID}" >> /tmp/protected.txt
-            gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=last-success-pins&per_page=100" \
-              --jq '(.artifacts // [])[] | select(.expired == false) | .workflow_run.id' >> /tmp/protected.txt 2>/dev/null || true
-            wfs="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows?per_page=100")" || { echo "❌ workflows API call failed"; exit 1; }
-            mapfile -t wf_ids < <(jq -r --arg f "$RUN_WORKFLOW" '(.workflows // [])[] | select(.path | contains($f)) | .id' <<<"$wfs")
-            for wfid in "${wf_ids[@]}"; do
+            artifacts)
+              : > /tmp/items.tsv
               page=1
               while :; do
-                resp="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${wfid}/runs?per_page=100&page=${page}")" || { echo "❌ workflow runs API call failed"; exit 1; }
-                jq -r '(.workflow_runs // [])[] | ["run", .id, ("#" + (.run_number | tostring) + " " + (.display_title // "")), (.conclusion // "null"), "0", .created_at, .path] | @tsv' <<<"$resp" >> /tmp/items.tsv
-                n="$(jq '(.workflow_runs // []) | length' <<<"$resp")"
+                resp="$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100&page=${page}")" || { echo "❌ artifacts API call failed"; exit 1; }
+                jq -e . >/dev/null 2>&1 <<<"$resp" || { echo "❌ artifacts API returned invalid JSON"; exit 1; }
+                # cleanup-* artifacts are this workflow's own plumbing — always ignored
+                jq -r '(.artifacts // [])[] | select(.expired == false) | select(.name | startswith("cleanup-") | not) | ["artifact", .id, .name, "", .size_in_bytes, .created_at, ""] | @tsv' <<<"$resp" >> /tmp/items.tsv
+                n="$(jq '(.artifacts // []) | length' <<<"$resp")"
                 if [ "$n" -lt 100 ]; then break; fi
                 page=$((page+1))
               done
-            done
-            echo "✅ runs: $(grep -c $'^run\t' /tmp/items.tsv || true)"
-            if [ "$KEEP_SUCCESSFUL" != "0" ]; then
-              awk -F '\t' -v n="$KEEP_SUCCESSFUL" '$1 == "run" && $4 == "success" { c[$7]++; if (c[$7] <= n) print $2 }' \
-                /tmp/items.tsv >> /tmp/protected.txt
-            fi
-          fi
+              ;;
+
+            runs)
+              echo "${GITHUB_RUN_ID}" >> /tmp/protected.txt
+              gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=last-success-pins&per_page=100" \
+                --jq '(.artifacts // [])[] | select(.expired == false) | .workflow_run.id' >> /tmp/protected.txt 2>/dev/null || true
+              : > /tmp/items.tsv
+              wfs="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows?per_page=100")" || { echo "❌ workflows API call failed"; exit 1; }
+              mapfile -t wf_ids < <(jq -r --arg f "$RUN_WORKFLOW" '(.workflows // [])[] | select(($f == "all") or (.path | endswith($f))) | .id' <<<"$wfs")
+              for wfid in "${wf_ids[@]}"; do
+                page=1
+                while :; do
+                  resp="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${wfid}/runs?per_page=100&page=${page}")" || { echo "❌ workflow runs API call failed"; exit 1; }
+                  jq -r '(.workflow_runs // [])[] | ["run", .id, ("#" + (.run_number | tostring) + " " + (.display_title // "")), (.conclusion // "null"), "0", .created_at, .path] | @tsv' <<<"$resp" >> /tmp/items.tsv
+                  n="$(jq '(.workflow_runs // []) | length' <<<"$resp")"
+                  if [ "$n" -lt 100 ]; then break; fi
+                  page=$((page+1))
+                done
+              done
+              if [ "$KEEP_SUCCESSFUL" != "0" ]; then
+                awk -F '\t' -v n="$KEEP_SUCCESSFUL" '$1 == "run" && $4 == "success" { c[$7]++; if (c[$7] <= n) print $2 }' \
+                  /tmp/items.tsv >> /tmp/protected.txt
+              fi
+              ;;
+
+            *) echo "❌ unknown store: $STORE"; exit 1 ;;
+          esac
 
           purge=0
           if [ "$PIN_PURGE" = "true" ]; then purge=1; fi
 
-          # protections counted: p++ on every protection-driven skip
-          prot="$(awk -F '\t' \
+          # protected.txt holds bare ids (1 field per line); item rows have 7
+          awk -F '\t' \
             -v cutoff="$cutoff" -v keyf="$KEY_FILTER" -v pre="$PREFIX" \
             -v pin="$PIN" -v purge="$purge" -v runstatus="$RUN_STATUS" '
-            FILENAME == ARGV[1] { prot[$1] = 1; next }
+            NF <= 1 { prot[$1] = 1; next }
             {
               store=$1; id=$2; name=$3; conc=$4; created=$6
               if (store == "cache" && keyf != "" && index(name, keyf) == 0) next
@@ -232,63 +248,96 @@ jobs:
               }
               print > "/tmp/matches.tsv"
             }
-            END { print p + 0 }' /tmp/protected.txt /tmp/items.tsv)"
+            END { print p + 0 }' /tmp/protected.txt /tmp/items.tsv > /tmp/protcount.txt
 
-          total_items="$(wc -l < /tmp/matches.tsv)"
-          total_bytes="$(awk -F '\t' '{ s += $5 } END { print s + 0 }' /tmp/matches.tsv)"
-          total_gb="$(awk -v b="$total_bytes" 'BEGIN { printf "%.2f GB", b / 1073741824 }')"
+          matched="$(wc -l < /tmp/matches.tsv)"
+          bytes="$(awk -F '\t' '{ s += $5 } END { print s + 0 }' /tmp/matches.tsv)"
+          protected="$(cat /tmp/protcount.txt)"
+          gb="$(awk -v b="$bytes" 'BEGIN { printf "%.2f GB", b / 1073741824 }')"
 
           {
-            echo "## 📊 Phase 1 — analysis"
+            echo "MATCHED=${matched}"
+            echo "BYTES=${bytes}"
+            echo "PROTECTED=${protected}"
+            echo "SCOPE_SKIP=0"
+          } > /tmp/meta.tsv
+
+          {
+            echo "## 📊 Analyse — ${STORE}"
             echo ""
-            echo "Scope: ${SCOPE} · apply: ${APPLY} · age gate: ${cutoff:-none}"
+            echo "| id | item | size | created |"
+            echo "|---|---|---|---|"
+            awk -F '\t' '{ n = $3; gsub(/\|/, "/", n); item = ($1 == "run") ? n " [" $4 "] " $7 : n; printf "| %s | %s | %.2f MB | %s |\n", $2, item, $5 / 1048576, $6 }' /tmp/matches.tsv
             echo ""
-            echo "| store | id | item | size | created |"
-            echo "|---|---|---|---|---|"
-            awk -F '\t' '{ n = $3; gsub(/\|/, "/", n); item = ($1 == "run") ? n " [" $4 "] " $7 : n; printf "| %s | %s | %s | %.2f MB | %s |\n", $1, $2, item, $5 / 1048576, $6 }' /tmp/matches.tsv
-            echo ""
-            echo "Matched **${total_items}** item(s), ${total_gb}. Protected by pin/keep rules: ${prot}."
+            echo "Matched **${matched}** item(s), ${gb}. Protected: ${protected}."
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "✅ matched ${total_items} item(s), ${total_gb}, protected ${prot}"
+          echo "✅ $STORE matched ${matched} item(s), ${gb}, protected ${protected}"
 
-          {
-            echo "MATCHED_COUNT=${total_items}"
-            echo "MATCHED_BYTES=${total_bytes}"
-            echo "PROTECTED_COUNT=${prot}"
-          } >> "$GITHUB_ENV"
+      - name: ⬆️ Upload match set — ${{ matrix.store }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cleanup-matches-${{ matrix.store }}
+          path: |
+            /tmp/matches.tsv
+            /tmp/meta.tsv
+          retention-days: 1
+          if-no-files-found: error
 
-          if [ "$APPLY" != "true" ]; then
-            echo "✅ dry run (apply=false) — stopping before deletion"
-          fi
+  # ─────────────────────────── DELETE ───────────────────────────
+  # Only with apply=true. Per store: order the plan, apply keep/cap,
+  # delete, record exactly what succeeded and what did not.
+  delete:
+    name: 🗑️ Delete (${{ matrix.store }})
+    needs: analyse
+    if: ${{ inputs.apply }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        store: [cache, release, runs, artifacts]
+    env:
+      GH_TOKEN: ${{ github.token }}
+      STORE: ${{ matrix.store }}
+      OLDEST_FIRST: ${{ inputs.oldest_first }}
+      DELETE_COUNT: ${{ inputs.delete_count }}
+      KEEP_COUNT: ${{ inputs.keep_count }}
+    steps:
 
-      # ─────────────────────────── PHASE 2 ───────────────────────────
-      # Only runs when apply=true. Orders the plan, applies keep/cap,
-      # deletes and records exactly what succeeded and what did not.
-      - name: 🗑️ Phase 2 — Delete matched items
-        if: ${{ inputs.apply }}
+      - name: ⬇️ Download match set — ${{ matrix.store }}
+        uses: actions/download-artifact@v4
+        with:
+          name: cleanup-matches-${{ matrix.store }}
+          path: /tmp/in
+
+      - name: 🗑️ Delete matched — ${{ matrix.store }}
         shell: bash
         run: |
           set -euo pipefail
-          echo "ℹ️ Phase 2 — apply deletions"
-          if [ ! -s /tmp/matches.tsv ]; then
-            echo "✅ nothing matched — nothing to delete"
+          echo "ℹ️ delete — $STORE"
+          src="/tmp/in/matches.tsv"
+
+          if [ ! -s "$src" ]; then
+            echo "✅ $STORE: nothing matched — nothing to delete"
+            printf 'DELETED=0\nFREED=0\nFAILED=0\n' > /tmp/result.tsv
             exit 0
           fi
 
           if [ "$OLDEST_FIRST" = "true" ]; then
-            sort -t $'\t' -k6,6 /tmp/matches.tsv > /tmp/plan.tsv
+            sort -t $'\t' -k6,6 "$src" > /tmp/plan.tsv
           else
-            sort -t $'\t' -k6,6r /tmp/matches.tsv > /tmp/plan.tsv
+            sort -t $'\t' -k6,6r "$src" > /tmp/plan.tsv
           fi
 
           if [ "$KEEP_COUNT" != "0" ]; then
             if [ "$OLDEST_FIRST" = "true" ]; then
+              # FNR == NR: correct file split even when both inputs are the same path
               awk -F '\t' -v n="$KEEP_COUNT" '
-                FILENAME == ARGV[1] { c[$1]++; next }
+                FNR == NR { c[$1]++; next }
                 { i[$1]++; if ($1 == "run" || i[$1] <= c[$1] - n) print }' /tmp/plan.tsv /tmp/plan.tsv > /tmp/plan2.tsv
             else
               awk -F '\t' -v n="$KEEP_COUNT" '
-                FILENAME == ARGV[1] { c[$1]++; next }
+                FNR == NR { c[$1]++; next }
                 { i[$1]++; if ($1 == "run" || i[$1] > n) print }' /tmp/plan.tsv /tmp/plan.tsv > /tmp/plan2.tsv
             fi
           else
@@ -300,6 +349,9 @@ jobs:
           else
             cp /tmp/plan2.tsv /tmp/planF.tsv
           fi
+
+          planned="$(wc -l < /tmp/planF.tsv)"
+          echo "ℹ️ $STORE: plan rows to delete: ${planned}"
 
           : > /tmp/deleted.tsv
           : > /tmp/failed.tsv
@@ -326,69 +378,113 @@ jobs:
           done < /tmp/planF.tsv
 
           gb="$(awk -v b="$freed" 'BEGIN { printf "%.2f GB", b / 1073741824 }')"
+          printf 'DELETED=%s\nFREED=%s\nFAILED=%s\n' "$deleted" "$freed" "$failed" > /tmp/result.tsv
+
           if [ "$failed" -gt 0 ]; then
-            echo "❌ ${failed} deletion(s) failed — deleted ${deleted}, freed ${gb}"
+            echo "❌ $STORE: ${failed} deletion(s) failed — deleted ${deleted}, freed ${gb}"
             exit 1
           fi
-          echo "✅ deleted ${deleted} item(s), freed ${gb}"
+          echo "✅ $STORE: deleted ${deleted} item(s), freed ${gb}"
 
-      # ─────────────────────────── PHASE 3 ───────────────────────────
-      # Final report: what got deleted, what did not, and why.
-      - name: 📋 Phase 3 — Final report
+      - name: ⬆️ Upload result — ${{ matrix.store }}
         if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cleanup-result-${{ matrix.store }}
+          path: |
+            /tmp/result.tsv
+            /tmp/deleted.tsv
+            /tmp/failed.tsv
+          retention-days: 1
+          if-no-files-found: error
+
+  # ─────────────────────────── REPORT ───────────────────────────
+  # Per-store outcome matrix: matched vs deleted vs failed vs protected.
+  # Runs even when the delete stage failed, and fails if any did.
+  report:
+    name: 📋 Report (${{ matrix.store }})
+    needs: [analyse, delete]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        store: [cache, release, runs, artifacts]
+    env:
+      GH_TOKEN: ${{ github.token }}
+      STORE: ${{ matrix.store }}
+      APPLY: ${{ inputs.apply }}
+    steps:
+
+      - name: ⬇️ Download stage data — ${{ matrix.store }}
+        uses: actions/download-artifact@v4
+        with:
+          pattern: cleanup-*-${{ matrix.store }}
+          path: /tmp/in
+          merge-multiple: true
+
+      - name: 📋 Report — ${{ matrix.store }}
         shell: bash
         run: |
           set -uo pipefail
-          echo "ℹ️ Phase 3 — final report"
-          if [ ! -f /tmp/matches.tsv ]; then
-            echo "❌ phase 1 did not complete — no report data"
+          echo "ℹ️ report — $STORE"
+
+          if [ ! -f /tmp/in/meta.tsv ]; then
+            {
+              echo "## 📋 Report — ${STORE}"
+              echo ""
+              echo "❌ analysis stage did not produce data for this store"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "❌ $STORE: analysis stage produced no data"
             exit 1
           fi
 
-          matched="${MATCHED_COUNT:-$(wc -l < /tmp/matches.tsv)}"
-          mbytes="${MATCHED_BYTES:-0}"
-          mgb="$(awk -v b="$mbytes" 'BEGIN { printf "%.2f GB", b / 1073741824 }')"
-          protected="${PROTECTED_COUNT:-0}"
-          mode="apply"
-          [ "${APPLY:-false}" != "true" ] && mode="dry run"
+          matched="$(awk -F= '$1 == "MATCHED" { print $2 }' /tmp/in/meta.tsv)"
+          bytes="$(awk -F= '$1 == "BYTES" { print $2 }' /tmp/in/meta.tsv)"
+          protected="$(awk -F= '$1 == "PROTECTED" { print $2 }' /tmp/in/meta.tsv)"
+          skip="$(awk -F= '$1 == "SCOPE_SKIP" { print $2 }' /tmp/in/meta.tsv)"
+          mgb="$(awk -v b="$bytes" 'BEGIN { printf "%.2f GB", b / 1073741824 }')"
 
-          deleted=0; freed=0; failed=0
-          [ -f /tmp/deleted.tsv ] && deleted="$(wc -l < /tmp/deleted.tsv)"
-          [ -f /tmp/deleted.tsv ] && freed="$(awk -F '\t' '{ s += $3 } END { print s + 0 }' /tmp/deleted.tsv)"
-          [ -f /tmp/failed.tsv ] && failed="$(wc -l < /tmp/failed.tsv)"
+          deleted=0; freed=0; failed=0; have_result=false
+          [ "$APPLY" = "true" ] && [ -f /tmp/in/result.tsv ] && have_result=true
+          if $have_result; then
+            deleted="$(awk -F= '$1 == "DELETED" { print $2 }' /tmp/in/result.tsv)"
+            freed="$(awk -F= '$1 == "FREED" { print $2 }' /tmp/in/result.tsv)"
+            failed="$(awk -F= '$1 == "FAILED" { print $2 }' /tmp/in/result.tsv)"
+          fi
           dgb="$(awk -v b="$freed" 'BEGIN { printf "%.2f GB", b / 1073741824 }')"
 
           {
-            echo "## 📋 Phase 3 — final report"
+            echo "## 📋 Report — ${STORE}"
             echo ""
-            echo "Mode: **${mode}**"
-            echo ""
-            echo "| outcome | count | size |"
-            echo "|---|---|---|"
-            echo "| matched | ${matched} | ${mgb} |"
-            echo "| deleted | ${deleted} | ${dgb} |"
-            echo "| failed | ${failed} | — |"
-            echo "| protected (pin/keep rules) | ${protected} | — |"
+            if [ "$skip" = "1" ]; then
+              echo "Not in scope — nothing analysed, nothing deleted."
+            else
+              echo "| matched | matched size | protected | deleted | freed | failed |"
+              echo "|---|---|---|---|---|---|"
+              echo "| ${matched} | ${mgb} | ${protected} | ${deleted} | ${dgb} | ${failed} |"
+            fi
             if [ "$failed" -gt 0 ]; then
               echo ""
               echo "**Not deleted (failed):**"
               echo ""
               echo "| id | item | store |"
               echo "|---|---|---|"
-              awk -F '\t' '{ printf "| %s | %s | %s |\n", $1, $2, $3 }' /tmp/failed.tsv
+              awk -F '\t' '{ printf "| %s | %s | %s |\n", $1, $2, $3 }' /tmp/in/failed.tsv
             fi
-            if [ "$mode" = "dry run" ]; then
+            if [ "$APPLY" != "true" ] && [ "$skip" != "1" ]; then
               echo ""
-              echo "Dry run — the ${matched} matched item(s) above were left untouched."
+              echo "Dry run — nothing was deleted."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ "$failed" -gt 0 ]; then
-            echo "❌ final report: ${deleted} deleted, ${dgb} freed, ${failed} failed, ${protected} protected"
+            echo "❌ $STORE report: matched ${matched}, deleted ${deleted}, ${failed} failed, ${protected} protected"
             exit 1
           fi
-          if [ "$mode" = "dry run" ]; then
-            echo "✅ final report: dry run — ${matched} matched, ${mgb}, nothing deleted"
+          if [ "$APPLY" != "true" ]; then
+            echo "✅ $STORE report: dry run — ${matched} matched, ${mgb}, nothing deleted"
           else
-            echo "✅ final report: ${deleted} deleted, ${dgb} freed, ${failed} failed, ${protected} protected"
+            echo "✅ $STORE report: matched ${matched}, deleted ${deleted}, freed ${dgb}, ${failed} failed, ${protected} protected"
           fi
