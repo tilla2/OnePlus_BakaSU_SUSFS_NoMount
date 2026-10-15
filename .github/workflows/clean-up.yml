@@ -31,6 +31,7 @@ on:
           - OP15T
           - OP15r
           - OP15
+          - Myron
           - OP13
           - OP13-CPH
           - OP13-PJZ
