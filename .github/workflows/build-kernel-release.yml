@@ -11,15 +11,16 @@ concurrency:
 on:
   workflow_dispatch:
     inputs:
-      release:
-        description: 'Create a release? "release + bump increment" also bumps the -r increment (otherwise the previous increment is reused)'
+      run_mode:
+        description: 'Run mode: "build" compiles and uploads artifacts; "build + release" also publishes a release; "build + release + bump increment" also bumps the -r tag increment; "patch dry run" applies every patch, uploads a verdict per device and skips compilation (never releases)'
         required: true
         type: choice
         options:
-          - none
-          - release
-          - release + bump increment
-        default: none
+          - build
+          - build + release
+          - build + release + bump increment
+          - patch dry run
+        default: build
       op_model:
         description: 'Select the OnePlus kernels to build'
         required: true
@@ -254,15 +255,16 @@ on:
         type: choice
         options: [O2, O3]
         default: O2
-      clean_build:
-        description: 'Clean build (no ccache)'
-        type: boolean
-        default: false
-      debug:
-        description: 'Enable debug mode: dumping debug related artifacts and show some debug logs'
-        required: false
-        type: boolean
-        default: false
+      build_profile:
+        description: 'Build profile: "standard" keeps ccache and quiet logs, "clean" disables ccache, "debug" dumps debug artifacts and verbose logs, "clean + debug" does both'
+        required: true
+        type: choice
+        options:
+          - standard
+          - clean
+          - debug
+          - clean + debug
+        default: standard
       mirror_toolchains:
         description: 'Do you want to sync toolchains before build? [99% runs not required]'
         required: false
@@ -270,21 +272,6 @@ on:
         default: false
       build_timestamp:
         description: 'Custom kernel build timestamp for uname -a (e.g. "Tue Feb 10 10:01:02 UTC 2026"). Leave empty for current time.'
-        type: string
-        default: ''
-      custom_uname_a14:
-        description: 'Optional uname suffix override applied to every A14 device in this run (max 44 chars). Leave empty to use per-config uname, falling back to an OEM-like generated suffix.'
-        required: false
-        type: string
-        default: ''
-      custom_uname_a15:
-        description: 'Optional uname suffix override applied to every A15 device in this run (max 44 chars). Leave empty to use per-config uname, falling back to an OEM-like generated suffix.'
-        required: false
-        type: string
-        default: ''
-      custom_uname_a16:
-        description: 'Optional uname suffix override applied to every A16 device in this run (max 44 chars). Leave empty to use per-config uname, falling back to an OEM-like generated suffix.'
-        required: false
         type: string
         default: ''
       android12-5_10_susfs_branch_or_commit:
@@ -307,6 +294,31 @@ on:
         description: 'Enter SusFS Branch or commit hash for android16-6.12'
         type: string
         default: ''
+      android12-5_10_custom_uname:
+        description: 'Optional uname suffix override for every device on android12-5.10 in this run (max 44 chars). Leave empty to use per-config uname, falling back to an OEM-like generated suffix.'
+        required: false
+        type: string
+        default: ''
+      android13-5_15_custom_uname:
+        description: 'Optional uname suffix override for every device on android13-5.15 in this run (max 44 chars). Leave empty to use per-config uname, falling back to an OEM-like generated suffix.'
+        required: false
+        type: string
+        default: ''
+      android14-6_1_custom_uname:
+        description: 'Optional uname suffix override for every device on android14-6.1 in this run (max 44 chars). Leave empty to use per-config uname, falling back to an OEM-like generated suffix.'
+        required: false
+        type: string
+        default: ''
+      android15-6_6_custom_uname:
+        description: 'Optional uname suffix override for every device on android15-6.6 in this run (max 44 chars). Leave empty to use per-config uname, falling back to an OEM-like generated suffix.'
+        required: false
+        type: string
+        default: ''
+      android16-6_12_custom_uname:
+        description: 'Optional uname suffix override for every device on android16-6.12 in this run (max 44 chars). Leave empty to use per-config uname, falling back to an OEM-like generated suffix.'
+        required: false
+        type: string
+        default: ''
       nomount_branch:
         description: 'NoMount branch to track for auto resolution (used when no commit is given)'
         type: string
@@ -315,11 +327,6 @@ on:
         description: 'NoMount commit SHA to pin (empty = auto: latest commit whose own CI built a module)'
         type: string
         default: ''
-      patch_dry_run:
-        description: 'Patch verification mode: apply every patch, upload a verdict per device, skip compilation'
-        required: false
-        type: boolean
-        default: false
 
 jobs:
   set-op-model:
@@ -638,7 +645,7 @@ jobs:
             HASH_QUERY="{ project(fullPath: \"${GITLAB_PROJECT_PATH}\") { repository { ch: commit(ref: \"${user_val}\") { sha } } } }"
             RELEASE_QUERY="{ project(fullPath: \"${GITLAB_PROJECT_PATH}\") { repository { ch: commit(ref: \"${user_val}\") { sha } blobs(paths: [\"kernel_patches/include/linux/susfs.h\"], ref: \"${user_val}\") { nodes { rawBlob } } } } }"
             
-            if [ "${{ (inputs.release != 'none') }}" = "true" ]; then
+            if [ "${{ contains(inputs.run_mode, 'release') }}" = "true" ]; then
               GL_QUERY="$RELEASE_QUERY"
             else
               GL_QUERY="$HASH_QUERY"
@@ -658,7 +665,7 @@ jobs:
                 if [ -n "$resolved" ] && [ "$resolved" != "null" ]; then
                   echo "  ✅ Query for $key Success"
                   
-                  if [ "${{ (inputs.release != 'none') }}" = "true" ]; then
+                  if [ "${{ contains(inputs.run_mode, 'release') }}" = "true" ]; then
                     extracted=$(echo "$RESPONSE" | jq -r '.data.project.repository.blobs.nodes[0].rawBlob // empty' | grep '#define SUSFS_VERSION' | awk -F'"' '{print $2}')
                     susfs_versions_per_key[$key]="${extracted:-unknown}"
                     echo "  ✅ $key → SUSFS_VERSION = ${extracted:-unknown}"
@@ -688,7 +695,7 @@ jobs:
               FALLBACK_SHA=""
               if [ -n "$SUSFS_CLONE_REPO" ] && git -C "$SUSFS_CLONE_REPO" checkout -q --detach "$user_val"; then
                 FALLBACK_SHA="$(git -C "$SUSFS_CLONE_REPO" rev-parse HEAD)"
-                if [ "${{ (inputs.release != 'none') }}" = "true" ]; then
+                if [ "${{ contains(inputs.run_mode, 'release') }}" = "true" ]; then
                   SUSFS_VER_FALLBACK="$(git -C "$SUSFS_CLONE_REPO" show "HEAD:kernel_patches/include/linux/susfs.h" 2>/dev/null | grep '#define SUSFS_VERSION' | awk -F'"' '{print $2}' || true)"
                   if [ -n "$SUSFS_VER_FALLBACK" ]; then
                     susfs_versions_per_key["$key"]="$SUSFS_VER_FALLBACK"
@@ -708,7 +715,7 @@ jobs:
             fi
             
             # Final Validation — SUSFS version
-            if [ "${{ (inputs.release != 'none') }}" = "true" ] && [ "${susfs_versions_per_key[$key]:-unknown}" = "unknown" ]; then
+            if [ "${{ contains(inputs.run_mode, 'release') }}" = "true" ] && [ "${susfs_versions_per_key[$key]:-unknown}" = "unknown" ]; then
               echo "::error::Could not extract SUSFS_VERSION from susfs.h for '$key' after $MAX_RETRIES attempts. Cannot proceed with release."
               exit 1
             fi
@@ -729,7 +736,7 @@ jobs:
           echo "susfs_hash_android16_6_12=${susfs_hashes[android16-6.12]:-unknown}" >> "$GITHUB_OUTPUT"
           
           # SUSFS_VERSION — only when releasing
-          if [ "${{ (inputs.release != 'none') }}" = "true" ]; then
+          if [ "${{ contains(inputs.run_mode, 'release') }}" = "true" ]; then
             susfs_base_version="unknown"
             for key in "${active_keys[@]}"; do
               ver="${susfs_versions_per_key[$key]:-unknown}"
@@ -788,20 +795,25 @@ jobs:
             )
           ')
 
-          # ── uname resolution: per-A1x dispatch override > config uname > generated (one per kernel line) ──
+          # ── uname resolution: per-KMI dispatch override > config uname > generated (one per kernel line) ──
+          # The override axis is the KMI (android_version-kernel_version) — the same key the SUSFS refs use.
+          # A config folder can host devices on different KMIs (e.g. OP13-6.6.30 lives in a16 but runs android15-6.6),
+          # so the dispatch override follows the kernel, not the config tree.
           declare -A uname_override=(
-            ["A14"]="${{ inputs.custom_uname_a14 }}"
-            ["A15"]="${{ inputs.custom_uname_a15 }}"
-            ["A16"]="${{ inputs.custom_uname_a16 }}"
+            ["android12-5.10"]="${{ inputs.android12-5_10_custom_uname }}"
+            ["android13-5.15"]="${{ inputs.android13-5_15_custom_uname }}"
+            ["android14-6.1"]="${{ inputs.android14-6_1_custom_uname }}"
+            ["android15-6.6"]="${{ inputs.android15-6_6_custom_uname }}"
+            ["android16-6.12"]="${{ inputs.android16-6_12_custom_uname }}"
           )
-          for osv in A14 A15 A16; do
-            ov="${uname_override[$osv]}"
-            if [ -n "$ov" ] && jq -e --arg o "$osv" 'any(.[]; .os_version == $o)' <<<"$merged_matrix" >/dev/null; then
+          for kmi in android12-5.10 android13-5.15 android14-6.1 android15-6.6 android16-6.12; do
+            ov="${uname_override[$kmi]}"
+            if [ -n "$ov" ] && jq -e --arg k "$kmi" 'any(.[]; "\(.android_version)-\(.kernel_version)" == $k)' <<<"$merged_matrix" >/dev/null; then
               if [[ ! "$ov" =~ ^[A-Za-z0-9._+-]{1,44}$ ]]; then
-                echo "❌ custom_uname_${osv,,} '$ov' is invalid (charset A-Za-z0-9._+- , max 44 chars)"
+                echo "❌ custom_uname_$kmi '$ov' is invalid (charset A-Za-z0-9._+- , max 44 chars)"
                 exit 1
               fi
-              echo "✅ custom_uname_${osv,,} accepted: $ov"
+              echo "✅ custom_uname_$kmi accepted: $ov"
             fi
           done
           # Generation key: KMI + kernel line. The config only records major.minor; a trailing -X.Y.Z in the
@@ -810,7 +822,7 @@ jobs:
           uname_rows=()
           resolved_json="[]"
           while IFS=$'\t' read -r idx model osv av kv cfg_uname; do
-            ov="${uname_override[$osv]:-}"
+            ov="${uname_override[${av}-${kv}]:-}"
             if [ -n "$ov" ]; then
               val="$ov"; src="override"
             elif [ -n "$cfg_uname" ]; then
@@ -898,9 +910,9 @@ jobs:
           
             cat << 'EOF'
           - Optimization: ${{ inputs.optimize_level }}
-          - Clean Build/No Ccache: ${{ inputs.clean_build && '✅ Yes' || '❌ No' }}
-          - Create Release: ${{ (inputs.release != 'none') && '✅ Yes' || '❌ No' }}
-          - Create Debug Artifacts: ${{ inputs.debug && '✅ Yes' || '❌ No' }}
+          - Run mode: ${{ inputs.run_mode }}
+          - Build profile: ${{ inputs.build_profile }}
+          - Create Release: ${{ contains(inputs.run_mode, 'release') && '✅ Yes' || '❌ No' }}
           - Sync toolchains: ${{ inputs.mirror_toolchains && '✅ Yes' || '❌ No' }}
           
           **SUSFS Configuration:**
@@ -1374,9 +1386,9 @@ jobs:
           optimize_level: ${{ inputs.optimize_level }}
           build_timestamp: ${{ inputs.build_timestamp }}
           resolved_uname: ${{ matrix.resolved_uname }}
-          clean: ${{ inputs.clean_build }}
-          debug: ${{ inputs.debug }}
-          patch_dry_run: ${{ inputs.patch_dry_run }}
+          clean: ${{ contains(inputs.build_profile, 'clean') }}
+          debug: ${{ contains(inputs.build_profile, 'debug') }}
+          patch_dry_run: ${{ contains(inputs.run_mode, 'patch') }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload patch failure forensics
@@ -1428,7 +1440,7 @@ jobs:
             echo "  - NoMount dev: ${{ steps.build.outputs.nomount_commit }}"
             echo "  - Build time: ${{ steps.build.outputs.build_time }}s"
             
-            if [ "${{ inputs.clean_build }}" != "true" ]; then
+            if [ "${{ contains(inputs.build_profile, 'clean') }}" != "true" ]; then
               echo "  - ccache hit rate: ${{ steps.build.outputs.ccache_hit_rate }}"
               echo "  - ccache direct rate: ${{ steps.build.outputs.ccache_direct_rate }}"
             else
@@ -1490,7 +1502,7 @@ jobs:
           | **Build Time** | ${{ steps.build.outputs.build_time }}s |
           EOF
             
-            if [ "${{ inputs.clean_build }}" != "true" ]; then
+            if [ "${{ contains(inputs.build_profile, 'clean') }}" != "true" ]; then
               cat >> $GITHUB_STEP_SUMMARY << EOF
           | **ccache Hit Rate** | ${{ steps.build.outputs.ccache_hit_rate }} |
           | **ccache Direct Rate** | ${{ steps.build.outputs.ccache_direct_rate }} |
@@ -1555,7 +1567,7 @@ jobs:
     needs: [set-op-model]
     if: |
       !cancelled() &&
-      (inputs.release != 'none') != true &&
+      !contains(inputs.run_mode, 'release') &&
       needs.set-op-model.result == 'success'
     runs-on: ubuntu-24.04
     env:
@@ -1693,7 +1705,7 @@ jobs:
     needs: [fetch-manager-apks]
     if: |
       !cancelled() &&
-      (inputs.release != 'none') != true &&
+      !contains(inputs.run_mode, 'release') &&
       needs.fetch-manager-apks.result == 'success'
     runs-on: ubuntu-24.04
     env:
@@ -1748,7 +1760,7 @@ jobs:
     runs-on: ubuntu-24.04
     if: |
       !cancelled() &&
-      (inputs.release != 'none') == true &&
+      contains(inputs.run_mode, 'release') &&
       needs.set-op-model.result == 'success' &&
       needs.resolve-nomount.result == 'success' &&
       needs.build-nomount-module.result == 'success'
@@ -1799,7 +1811,7 @@ jobs:
             | sort -n | tail -n 1 || true)
           if [ -z "$PREV_R" ]; then
             NEXT_R=1
-          elif [ "${{ (inputs.release == 'release + bump increment') }}" = "true" ]; then
+          elif [ "${{ contains(inputs.run_mode, 'bump increment') }}" = "true" ]; then
             NEXT_R=$((PREV_R + 1))
           else
             NEXT_R="$PREV_R"
@@ -1967,7 +1979,7 @@ jobs:
           ksu_resolved_hash="${{ needs.set-op-model.outputs.ksu_resolved_hash }}"
           
           OPTIMIZE_LEVEL="${{ inputs.optimize_level }}"
-          CLEAN_BUILD="${{ inputs.clean_build }}"
+          CLEAN_BUILD="${{ contains(inputs.build_profile, 'clean') }}"
           
           # Hash map for GKI version
           declare -A susfs_map=(
@@ -2324,7 +2336,7 @@ jobs:
       needs.set-op-model.result == 'success' &&
       needs.resolve-nomount.result == 'success' &&
       needs.build.result == 'success' &&
-      inputs.patch_dry_run != true
+      !contains(inputs.run_mode, 'patch')
     runs-on: ubuntu-24.04
     env:
       GH_TOKEN: ${{ github.token }}
