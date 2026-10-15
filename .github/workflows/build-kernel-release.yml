@@ -288,21 +288,21 @@ on:
         type: string
         default: ''
       android12-5_10_susfs_branch_or_commit:
-        description: 'Enter SusFS Branch or commit hash for android12-5.10'
+        description: 'Enter SusFS Branch or commit hash for android12-5.10. Default = gki-android12-5.10 counterpart of the verified 6.12 commit (same upstream SUS_KSTAT integration, 2026-09-26); clear it to track gki-android12-5.10'
         type: string
-        default: ''
+        default: '9892175b4acec7ee844e113b8d02c0f4d12cdfac'
       android13-5_15_susfs_branch_or_commit:
-        description: 'Enter SusFS Branch or commit hash for android13-5.15'
+        description: 'Enter SusFS Branch or commit hash for android13-5.15. Default = gki-android13-5.15 counterpart of the verified 6.12 commit (same upstream SUS_KSTAT integration, 2026-09-26); clear it to track gki-android13-5.15'
         type: string
-        default: ''
+        default: '687d2d18d94cb2e3e72d1074778d58384d58e379'
       android14-6_1_susfs_branch_or_commit:
-        description: 'Enter SusFS Branch or commit hash for android14-6.1'
+        description: 'Enter SusFS Branch or commit hash for android14-6.1. Default = gki-android14-6.1 counterpart of the verified 6.12 commit (same upstream SUS_KSTAT integration, 2026-09-26); clear it to track gki-android14-6.1'
         type: string
-        default: ''
+        default: '24743360ea08d98f6ad72b856851abed8de5854f'
       android15-6_6_susfs_branch_or_commit:
-        description: 'Enter SusFS Branch or commit hash for android15-6.6'
+        description: 'Enter SusFS Branch or commit hash for android15-6.6. Default = gki-android15-6.6 counterpart of the verified 6.12 commit (same upstream SUS_KSTAT integration, 2026-09-26); clear it to track gki-android15-6.6'
         type: string
-        default: ''
+        default: 'a0f9c59e2243f8a5db955f4ad1686d5e0ad26e1a'
       android16-6_12_susfs_branch_or_commit:
         description: 'Enter SusFS Branch or commit hash for android16-6.12. Default = last verified-good SUSFS commit for the pinned BakaSU; clear it to track gki-android16-6.12 (or to let pin_last_success=susfs apply)'
         type: string
