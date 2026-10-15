@@ -1419,11 +1419,11 @@ jobs:
               --jq '.artifacts[] | select(.expired == false) | select(.name | test("release"; "i")) | "\(.id) \(.name)"' || true)
             while read -r aid aname; do
               [ -z "$aid" ] && continue
-              ls -1 ./*.apk 2>/dev/null | sort > /tmp/apks-before.txt || true
+              ls -1 *.apk 2>/dev/null | sort > /tmp/apks-before.txt || true
               gh api "repos/${MANAGER_REPO}/actions/artifacts/${aid}/zip" > "${aname}.zip"
               unzip -o -j "${aname}.zip" '*.apk' -d ./ >/dev/null || true
               rm -f "${aname}.zip"
-              ls -1 ./*.apk 2>/dev/null | sort > /tmp/apks-after.txt || true
+              ls -1 *.apk 2>/dev/null | sort > /tmp/apks-after.txt || true
               comm -13 /tmp/apks-before.txt /tmp/apks-after.txt | while read -r new_apk; do
                 [ -z "$new_apk" ] && continue
                 printf '%s\tartifact\t%s\n' "$new_apk" "$aid" >> apk-map.tsv
@@ -1468,6 +1468,12 @@ jobs:
           set -euo pipefail
           MAP=./manager-apks/apk-map.tsv
           touch "$MAP"
+          # Normalize legacy path-prefixed entries (e.g. ./) to bare basenames
+          if [ -s "$MAP" ]; then
+            sed -i 's|^\./||' "$MAP"
+            awk -F'\t' '!seen[$1]++' "$MAP" > "${MAP}.tmp" && mv "${MAP}.tmp" "$MAP"
+            echo "✅ APK manifest normalized to bare basenames"
+          fi
           while IFS=$'\t' read -r apk kind ref; do
             [ -z "$apk" ] && continue
             case "$apk" in
@@ -1560,6 +1566,7 @@ jobs:
       - name: ⬆️ Upload ${{ matrix.apk }} as unzipped artifact
         uses: actions/upload-artifact@v7
         with:
+          name: ${{ matrix.apk }}
           path: apk-out/${{ matrix.apk }}
           archive: false
           if-no-files-found: error
