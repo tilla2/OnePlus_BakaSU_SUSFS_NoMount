@@ -16,7 +16,8 @@ Fork transforms applied:
      ``OP-<WORD>`` value, e.g. OP-BAKASU, OP-WILD, OP-KSUN) are replaced by the
      device's genuine stock suffix from ``scripts/sync/stock_unames.json``,
      or by an empty string when no genuine suffix is known.
-  4. configs: ``root_tag`` is forced to ``ChimeraKernel``.
+  4. configs: ``root_tag`` is forced to ``ChimeraKernel`` and ``bore`` to
+     ``false`` (BoRE is experimental and disabled fleet-wide by owner decision).
   5. manifests: AnyKernel3 is fetched from huangdihd/AnyKernel3 @ gki-2.0.
   6. build-kernel action: AnyKernel3 URL -> huangdihd, KernelSU-Next "Add
      KernelSU-Next"/"Add KSUN" steps removed (upstream-only steps).
@@ -56,6 +57,7 @@ BRANDED_UNAME = re.compile(r"^OP-[A-Za-z0-9]+$")
 RE_OS_VERSION = re.compile(r'("os_version"\s*:\s*")OOS(1[0-9])(")')
 RE_UNAME = re.compile(r'("uname"\s*:\s*")([^"]*)(")')
 RE_ROOT_TAG = re.compile(r'("root_tag"\s*:\s*")([^"]*)(")')
+RE_BORE_TRUE = re.compile(r'("bore"\s*:\s*)true\b')
 
 MANIFEST_RULES = (
     (re.compile(r"github\.com/WildKernels/AnyKernel3"), "github.com/huangdihd/AnyKernel3"),
@@ -77,6 +79,7 @@ class Sanitizer:
             "os_versions_changed": 0,
             "unames_stripped": 0,
             "root_tags_set": 0,
+            "bore_disabled": 0,
             "manifests_rewritten": 0,
             "action_rewritten": 0,
             "files_deleted": 0,
@@ -176,6 +179,12 @@ class Sanitizer:
                 self.counts["root_tags_set"] += 1
                 return f"{m.group(1)}{ROOT_TAG}{m.group(3)}"
             new = RE_ROOT_TAG.sub(tag_sub, new)
+
+            def bore_sub(m: re.Match) -> str:
+                changes.append("bore true -> false")
+                self.counts["bore_disabled"] += 1
+                return f"{m.group(1)}false"
+            new = RE_BORE_TRUE.sub(bore_sub, new)
 
             if new != old:
                 json.loads(new)  # never emit broken JSON
