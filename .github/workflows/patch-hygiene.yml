@@ -11,15 +11,15 @@ on:
         required: true
         type: choice
         options:
-          - OOS14+15+16
-          - OOS15+16
-          - OOS14+15
-          - OOS16
-          - OOS15
-          - OOS14
-        default: OOS16
+          - A14+A15+A16
+          - A15+A16
+          - A14+A15
+          - A16
+          - A15
+          - A14
+        default: A16
       config_path:
-        description: 'Optional exact config path for a single-device check (for example configs/oos16/OP15.json)'
+        description: 'Optional exact config path for a single-device check (for example configs/a16/OP15.json)'
         required: false
         type: string
         default: ''
@@ -54,12 +54,12 @@ jobs:
           op = os.environ["OP_MODEL"]
           cfg = os.environ["CONFIG_PATH"].strip()
           wanted = {
-              "OOS14+15+16": {"OOS14", "OOS15", "OOS16"},
-              "OOS15+16": {"OOS15", "OOS16"},
-              "OOS14+15": {"OOS14", "OOS15"},
-              "OOS16": {"OOS16"},
-              "OOS15": {"OOS15"},
-              "OOS14": {"OOS14"},
+              "A14+A15+A16": {"A14", "A15", "A16"},
+              "A15+A16": {"A15", "A16"},
+              "A14+A15": {"A14", "A15"},
+              "A16": {"A16"},
+              "A15": {"A15"},
+              "A14": {"A14"},
           }[op]
           entries = []
           for path in sorted(glob.glob("configs/*/*.json")):
@@ -82,6 +82,7 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write("matrix=" + json.dumps({"include": entries}) + "\n")
           PY
+          echo "✅ Check matrix built for ${OP_MODEL}"
 
   hygiene:
     needs: discover
