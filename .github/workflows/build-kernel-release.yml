@@ -537,10 +537,9 @@ jobs:
               fi
               pins_raw="$(cat pins_store/last-success-pins 2>/dev/null || true)"
               [ -n "$pins_raw" ] || pins_raw="$(cat pins_store/pins.json 2>/dev/null || true)"
-                if [ -n "$pins_raw" ] && echo "$pins_raw" | jq -e . >/dev/null 2>&1; then
-                  PINS_JSON="$pins_raw"
-                  echo "📌 Pin store loaded from artifact $pins_art: $(jq -c . <<<"$pins_raw")"
-                fi
+              if [ -n "$pins_raw" ] && echo "$pins_raw" | jq -e . >/dev/null 2>&1; then
+                PINS_JSON="$pins_raw"
+                echo "📌 Pin store loaded from artifact $pins_art: $(jq -c . <<<"$pins_raw")"
               fi
               rm -rf pins_store
             else
@@ -1023,10 +1022,9 @@ jobs:
               fi
               pins_raw="$(cat pins_store/last-success-pins 2>/dev/null || true)"
               [ -n "$pins_raw" ] || pins_raw="$(cat pins_store/pins.json 2>/dev/null || true)"
-                if [ -n "$pins_raw" ] && echo "$pins_raw" | jq -e . >/dev/null 2>&1; then
-                  PINS_JSON="$pins_raw"
-                  echo "📌 NoMount pin store loaded from artifact $pins_art"
-                fi
+              if [ -n "$pins_raw" ] && echo "$pins_raw" | jq -e . >/dev/null 2>&1; then
+                PINS_JSON="$pins_raw"
+                echo "📌 NoMount pin store loaded from artifact $pins_art"
               fi
               rm -rf pins_store
             fi
