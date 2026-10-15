@@ -2220,7 +2220,12 @@ jobs:
   record-last-successful-pins:
     name: 📌 Record refs as "last successful run" pins
     needs: [set-op-model, resolve-nomount, build]
-    if: needs.build.result == 'success' && inputs.patch_dry_run != true
+    if: |
+      !cancelled() &&
+      needs.set-op-model.result == 'success' &&
+      needs.resolve-nomount.result == 'success' &&
+      needs.build.result == 'success' &&
+      inputs.patch_dry_run != true
     runs-on: ubuntu-24.04
     env:
       GH_TOKEN: ${{ github.token }}
