@@ -113,7 +113,9 @@ Caches are collected first and deleted afterwards, never inline while listing. A
 
 Workflow runs are filtered by `workflow_filter` and `status_filter` (all, failed only, or unsuccessful only — failure, cancelled and skipped). `days_to_keep: 0` means no age gate at all, so everything that passes the filters is eligible; any positive value keeps runs younger than that many days. The newest `keep_last_successful` successful runs of each workflow are protected regardless of age, which makes "delete everything except the last three successful runs" a single invocation: `days_to_keep=0, keep_last_successful=3`.
 
-Artifact clean-up is off unless `artifact_cleanup` is true; it deletes artifacts older than `artifact_days_to_keep`. The `last-success-pins` artifact is exempt from every clean-up path unless `pin_policy` is `delete_pin`, which is the supported pin reset described in section 7.
+Artifact clean-up is off unless `artifact_cleanup` is true; it deletes artifacts older than `artifact_days_to_keep` (`0` = no age gate). The `last-success-pins` artifact is exempt from every clean-up path unless `pin_policy` is `delete_pin`, which is the supported pin reset described in section 7: with `delete_pin` the pins artifact is removed regardless of its age. Because deleting a run also deletes its artifacts, the run that owns the live pins artifact is protected from run deletion under `keep_pin`. Runs that are still queued or in progress, the clean-up run itself, and artifacts belonging to active runs are never touched.
+
+All selection logic lives in one planner shared by the analyze preview and the deleting jobs, so the preview and the real run always agree.
 
 ---
 
