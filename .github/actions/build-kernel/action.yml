@@ -132,7 +132,9 @@ runs:
         jq -r 'to_entries[] | "OP_\(.key | ascii_upcase)=\(.value)"' /tmp/config.json >> "$GITHUB_ENV"
         P_MODEL="$(jq -r '.model // "unknown"' /tmp/config.json)"
         P_OSVER="$(jq -r '.os_version // "unknown"' /tmp/config.json)"
-        PS_BASE="$(echo "$P_MODEL" | sed 's/-[0-9]\+\.[0-9]\+\.[0-9]\+$//')_${P_OSVER}"
+        # Keep the full model string (including any -X.Y.Z kernel-version suffix):
+        # versioned configs must not share patch-status artifacts with base configs.
+        PS_BASE="${P_MODEL}_${P_OSVER}"
         echo "PS_BASE=$PS_BASE" >> "$GITHUB_ENV"
         echo "PS_FILE=$GITHUB_WORKSPACE/patch-status-$PS_BASE.txt" >> "$GITHUB_ENV"
         # Default only when the config omits the key. Do NOT test ${OP_BORE:-} here:
@@ -424,14 +426,20 @@ runs:
         DEBUG_ZIP_NAME="debug_${OP_MODEL}_${OP_OS_VERSION}.zip"
         echo "DEBUG_ZIP_NAME=$DEBUG_ZIP_NAME" >> "$GITHUB_ENV"
 
-        KERNEL_SYNC_SHA="$(git -C "$COMMON_KERNEL_DIR" rev-parse HEAD 2>/dev/null || echo unavailable)"
+        SYNC_INFO_FILE="$COMMON_KERNEL_DIR/.sync-info.json"
+        [ -f "$SYNC_INFO_FILE" ] || { echo "::error::.sync-info.json sidecar missing in $COMMON_KERNEL_DIR — kernel-source-sync did not record sync provenance"; exit 1; }
+        SYNC_REPO="$(python3 -c "import json;print(json.load(open('$SYNC_INFO_FILE')).get('repo',''))")"
+        SYNC_REV="$(python3 -c "import json;print(json.load(open('$SYNC_INFO_FILE')).get('rev',''))")"
+        SYNC_COMMIT="$(python3 -c "import json;print(json.load(open('$SYNC_INFO_FILE')).get('commit','') or '')")"
+        [ -n "$SYNC_REV" ] || { echo "::error::.sync-info.json carries no rev — refusing to guess kernel provenance"; exit 1; }
+        KERNEL_SYNC_SHA="${SYNC_COMMIT:-$SYNC_REV}"
         echo "KERNEL_SYNC_SHA=$KERNEL_SYNC_SHA" >> "$GITHUB_ENV"
-        echo "Kernel tree synced at: $KERNEL_SYNC_SHA (patch staging runs against this tree)"
+        echo "KERNEL_SYNC_REPO=$SYNC_REPO" >> "$GITHUB_ENV"
+        echo "Kernel tree: $SYNC_REPO @ $SYNC_REV (resolved commit: ${SYNC_COMMIT:-unavailable in archive header; using manifest rev})"
         for d in "$CONFIG_DIR" "$ARTIFACTS_DIR" "$DEBUG_ARTIFACTS_DIR"; do
           [ -d "$d" ] || { echo "::error::required directory missing: $d"; exit 1; }
         done
-        [ -n "$KERNEL_SYNC_SHA" ] && [ "$KERNEL_SYNC_SHA" != "unavailable" ] || { echo "::error::common kernel tree not synced (no git HEAD)"; exit 1; }
-        echo "✅ Directory layout prepared (kernel tree synced at $KERNEL_SYNC_SHA)"
+        echo "✅ Directory layout prepared (kernel tree $SYNC_REPO @ $KERNEL_SYNC_SHA)"
 
     - name: Prepare patch generation harness
       shell: bash
