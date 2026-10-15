@@ -231,9 +231,9 @@ on:
           - KSU
         default: BakaSU
       ksu_branch_or_hash:
-        description: 'KSU branch or commit hash. Default = last verified-good BakaSU commit (BakaSU main currently breaks SUSFS compat). For KSUN/KSU the verified BakaSU default is swapped for main automatically'
+        description: 'KSU branch or commit hash'
         type: string
-        default: '5b76b884c75f729a220bb317aa4a4fc78f0e0e9c'
+        default: 'main'
       pin_last_success:
         description: 'Same as last successful run — uses the refs recorded by the last fully successful build and fails loudly if none exist yet. ksu = root manager commit; susfs = per-KMI SUSFS commit for every KMI whose ref field is empty (a typed ref still wins); nomount = NoMount commit'
         required: false
@@ -304,9 +304,9 @@ on:
         type: string
         default: ''
       android16-6_12_susfs_branch_or_commit:
-        description: 'Enter SusFS Branch or commit hash for android16-6.12. Default = last verified-good SUSFS commit for the pinned BakaSU; clear it to track gki-android16-6.12 (or to let pin_last_success=susfs apply)'
+        description: 'Enter SusFS Branch or commit hash for android16-6.12'
         type: string
-        default: 'b213c54126fb243595ce7876e91d84d6e0861fec'
+        default: ''
       nomount_branch:
         description: 'NoMount branch to track for auto resolution (used when no commit is given)'
         type: string
@@ -486,11 +486,6 @@ jobs:
           
           ksu_type="${{ inputs.ksu_type }}"
           ksu_ref="${{ inputs.ksu_branch_or_hash }}"
-          # The dispatch default is a verified BakaSU commit; it does not exist in KSUN/KSU repos
-          if [ "$ksu_type" != "BakaSU" ] && [ "$ksu_ref" = "5b76b884c75f729a220bb317aa4a4fc78f0e0e9c" ]; then
-            echo "ℹ️  Verified BakaSU default commit is BakaSU-only — using main for $ksu_type"
-            ksu_ref="main"
-          fi
           
           # ── Load "last successful run" pin store (artifact 'last-success-pins', file pins.json) ──
           PINS_JSON="{}"
