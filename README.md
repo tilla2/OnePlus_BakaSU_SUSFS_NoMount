@@ -222,4 +222,6 @@ TBD — to be determined.
 
 ## 💖 Donations
 
+<div align="center">
+
 TBD — to be determined.
