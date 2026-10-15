@@ -6,7 +6,7 @@ The script is standalone and idempotent; a second run on a clean tree reports
 "no changes needed".
 
 Naming direction is strictly one-way: oos -> a.  Leftover ``oos1x`` trees become
-``a1x`` and ``"os_version": "OOS1x"`` becomes ``"A1x"``.  Nothing in this file
+``a1x`` and an OOS1x ``os_version`` value becomes ``"A1x"``.  Nothing in this file
 ever maps a -> oos.
 
 Fork transforms applied:
