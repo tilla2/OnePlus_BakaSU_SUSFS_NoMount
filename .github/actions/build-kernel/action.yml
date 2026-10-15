@@ -146,8 +146,10 @@ runs:
         # the to_entries export above only lands in LATER steps, so OP_BORE is always
         # unset in this same step and an unconditional default would clobber a parsed
         # bore:false (last GITHUB_ENV write wins).
+        # BoRE is experimental: by owner decision it defaults to OFF when the key is missing
+        # (explicit exception to the default-on rule). Re-enable per config with "bore": true.
         if ! jq -e 'has("bore")' /tmp/config.json >/dev/null; then
-          echo "OP_BORE=true" >> "$GITHUB_ENV"
+          echo "OP_BORE=false" >> "$GITHUB_ENV"
         fi
         # Same defaulting rule for the WildKernels' optimisations bundle: when the
         # config omits "opt", keep the historical always-apply behaviour.
@@ -2882,10 +2884,10 @@ runs:
       run: |
         set -euo pipefail
         echo "::group::Apply BoRE scheduler"
-        if [ "${OP_BORE:-true}" != true ]; then
+        if [ "${OP_BORE:-false}" != true ]; then
           echo "bore|skipped" >> "$PS_FILE"
           echo "BORE_SKIPPED=disabled-by-config" >> "$GITHUB_ENV"
-          echo "BoRE disabled by config (bore: false); skipping"
+          echo "✅ BoRE skipped: disabled by config (experimental, default off)"
           echo "::endgroup::"
           exit 0
         fi

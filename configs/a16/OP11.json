@@ -20,7 +20,7 @@
   "bbg": true,
   "bbr": true,
   "bbr3": true,
-  "bore": true,
+  "bore": false,
   "lz4_upgrade": true,
   "zstd_upgrade": true,
   "rtmutex_cve": true,
