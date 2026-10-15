@@ -75,7 +75,8 @@ jobs:
                   "model": c.get("model", os.path.basename(path)[:-5]),
                   "os_version": c.get("os_version", ""),
                   "config": path,
-                  "manifest": c.get("manifest", ""),
+                  # Same resolution as kernel-source-sync: manifests/<lowercased os_version>/<manifest>
+                  "manifest": os.path.join("manifests", c.get("os_version", "").lower(), c.get("manifest", "")),
               })
           if not entries:
               raise SystemExit("no configs matched the selected scope")
