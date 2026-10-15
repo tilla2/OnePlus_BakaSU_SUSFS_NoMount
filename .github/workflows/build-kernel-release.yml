@@ -236,7 +236,7 @@ on:
         type: string
         default: 'main'
       pin_last_success:
-        description: 'Same as last successful run — uses the refs recorded by the last fully successful build and fails loudly if none exist yet. ksu = root manager commit; susfs = per-KMI SUSFS commit for every KMI whose ref field is empty (a typed ref still wins); nomount = NoMount commit'
+        description: 'Same as last successful run — uses the refs recorded by the last fully successful build and fails loudly if none exist yet. Precedence: dispatch ref > pin > auto (HEAD). ksu = root manager commit (clear ksu_branch_or_hash to let the pin apply); susfs = per-KMI SUSFS commit for every KMI whose ref field is empty; nomount = NoMount commit (leave nomount_commit empty to let the pin apply)'
         required: false
         type: choice
         options:
@@ -526,50 +526,64 @@ jobs:
           ksu_ref="${{ inputs.ksu_branch_or_hash }}"
           
           # ── Load "last successful run" pin store (artifact 'last-success-pins') ──
+          # Only hits the API when a pin toggle is actually requested — with
+          # pin_last_success=none the store is never read (no chatter, no warnings).
           PINS_JSON="{}"
-          pins_art="$(gh api "repos/${{ github.repository }}/actions/artifacts?name=last-success-pins&per_page=100" \
-            --jq '[.artifacts[] | select(.expired == false)] | sort_by(.id) | last | .id // empty' 2>/dev/null || true)"
-          if [ -z "$pins_art" ]; then
-            # upload-artifact@v7 (archive: false) stores under the path basename:
-            # pre-fix stores live under the legacy name 'pins.json' — try it too
-            pins_art="$(gh api "repos/${{ github.repository }}/actions/artifacts?name=pins.json&per_page=100" \
+          if [ "${{ inputs.pin_last_success }}" != "none" ]; then
+            pins_art="$(gh api "repos/${{ github.repository }}/actions/artifacts?name=last-success-pins&per_page=100" \
               --jq '[.artifacts[] | select(.expired == false)] | sort_by(.id) | last | .id // empty' 2>/dev/null || true)"
-          fi
-          if [ -n "$pins_art" ]; then
-            rm -rf pins_store && mkdir -p pins_store
-            if gh api "repos/${{ github.repository }}/actions/artifacts/$pins_art/zip" > pins_store/pins.zip 2>/dev/null \
-               && unzip -oq pins_store/pins.zip -d pins_store \
-               && { [ -f pins_store/last-success-pins ] || [ -f pins_store/pins.json ]; }; then
-              pins_raw="$(cat pins_store/last-success-pins 2>/dev/null || true)"
-              [ -n "$pins_raw" ] || pins_raw="$(cat pins_store/pins.json 2>/dev/null || true)"
-              if [ -n "$pins_raw" ] && echo "$pins_raw" | jq -e . >/dev/null 2>&1; then
-                PINS_JSON="$pins_raw"
-                echo "📌 Pin store loaded from artifact $pins_art: $(jq -c . <<<"$pins_raw")"
-              else
-                echo "::warning::Pin store artifact exists but is not valid JSON — ignoring it"
-              fi
-            else
-              echo "::warning::Could not download/extract pin store artifact $pins_art — treating store as empty"
+            if [ -z "$pins_art" ]; then
+              # upload-artifact@v7 (archive: false) stores under the path basename:
+              # pre-fix stores live under the legacy name 'pins.json' — try it too
+              pins_art="$(gh api "repos/${{ github.repository }}/actions/artifacts?name=pins.json&per_page=100" \
+                --jq '[.artifacts[] | select(.expired == false)] | sort_by(.id) | last | .id // empty' 2>/dev/null || true)"
             fi
-            rm -rf pins_store
+            if [ -n "$pins_art" ]; then
+              rm -rf pins_store && mkdir -p pins_store
+              if gh api "repos/${{ github.repository }}/actions/artifacts/$pins_art/zip" > pins_store/pins.zip 2>/dev/null \
+                 && unzip -oq pins_store/pins.zip -d pins_store \
+                 && { [ -f pins_store/last-success-pins ] || [ -f pins_store/pins.json ]; }; then
+                pins_raw="$(cat pins_store/last-success-pins 2>/dev/null || true)"
+                [ -n "$pins_raw" ] || pins_raw="$(cat pins_store/pins.json 2>/dev/null || true)"
+                if [ -n "$pins_raw" ] && echo "$pins_raw" | jq -e . >/dev/null 2>&1; then
+                  PINS_JSON="$pins_raw"
+                  echo "📌 Pin store loaded from artifact $pins_art: $(jq -c . <<<"$pins_raw")"
+                else
+                  echo "::warning::Pin store artifact exists but is not valid JSON — ignoring it"
+                fi
+              else
+                echo "::warning::Could not download/extract pin store artifact $pins_art — treating store as empty"
+              fi
+              rm -rf pins_store
+            else
+              echo "ℹ️  No pins stored yet (no live 'last-success-pins' artifact) — pin toggles fail loudly until a first successful build records one"
+            fi
           else
-            echo "ℹ️  No pins stored yet (no live 'last-success-pins' artifact) — pin toggles fail loudly until a first successful build records one"
+            echo "ℹ️  pin_last_success=none — pin store not read"
           fi
 
-          # ── Root manager: "same as last successful run" ──
+          # ── Root manager: dispatch ref > pin > auto (HEAD of the type default branch) ──
           if [ "${{ (inputs.pin_last_success == 'all' || contains(inputs.pin_last_success, 'ksu')) }}" = "true" ]; then
-            stored_ksu_type="$(jq -r '.ksu_type // empty' <<<"$PINS_JSON")"
-            stored_ksu_sha="$(jq -r '.ksu_sha // empty' <<<"$PINS_JSON")"
-            if [ -z "$stored_ksu_sha" ]; then
-              echo "::error::KSU pin requested but no last-successful Root-manager pin exists yet (pin store missing/empty). Run once with explicit refs to seed it."
-              exit 1
+            if [ -n "$ksu_ref" ]; then
+              echo "ℹ️  KSU ref '$ksu_ref' set at dispatch — pin moot for this run"
+            else
+              stored_ksu_type="$(jq -r '.ksu_type // empty' <<<"$PINS_JSON")"
+              stored_ksu_sha="$(jq -r '.ksu_sha // empty' <<<"$PINS_JSON")"
+              if [ -z "$stored_ksu_sha" ]; then
+                echo "::error::KSU pin requested but no last-successful Root-manager pin exists yet (pin store missing/empty). Run once with explicit refs to seed it."
+                exit 1
+              fi
+              if [ "$stored_ksu_type" != "$ksu_type" ]; then
+                echo "::error::KSU pin requested but the stored pin is for $stored_ksu_type while this run selects $ksu_type — seed the store with a successful $ksu_type build first."
+                exit 1
+              fi
+              echo "📌 KSU pin: $ksu_type → $stored_ksu_sha (last successful run)"
+              ksu_ref="$stored_ksu_sha"
             fi
-            if [ "$stored_ksu_type" != "$ksu_type" ]; then
-              echo "::error::KSU pin requested but the stored pin is for $stored_ksu_type while this run selects $ksu_type — seed the store with a successful $ksu_type build first."
-              exit 1
-            fi
-            echo "📌 KSU pin: $ksu_type → $stored_ksu_sha (last successful run)"
-            ksu_ref="$stored_ksu_sha"
+          fi
+          if [ -z "$ksu_ref" ]; then
+            ksu_ref="main"
+            echo "ℹ️  No KSU ref at dispatch and no pin selected — auto: HEAD of 'main' for $ksu_type"
           fi
 
           if [ "$ksu_type" == "BakaSU" ]; then
@@ -668,7 +682,7 @@ jobs:
             default_val="${default_branches[$key]}"
             user_val="${user_inputs[$key]:-$default_val}"
             # ── SUSFS: "same as last successful run" for this GKI/KMI ──
-            # An explicitly typed ref for this KMI always wins over the pin.
+            # Order: dispatch ref > pin > auto (GKI default branch) — same as KSU/NoMount.
             if [ "${{ (inputs.pin_last_success == 'all' || contains(inputs.pin_last_success, 'susfs')) }}" = "true" ] && [ -z "${user_inputs[$key]}" ]; then
               stored_susfs="$(jq -r --arg k "$key" '.susfs[$k] // empty' <<<"$PINS_JSON")"
               if [ -z "$stored_susfs" ]; then
@@ -1028,41 +1042,52 @@ jobs:
           commit="${{ inputs.nomount_commit }}"
 
           # ── NoMount: "same as last successful run" ──
+          # Only hits the API when a pin toggle is actually requested — with
+          # pin_last_success=none the store is never read (no chatter, no warnings).
           PINS_JSON="{}"
-          pins_art="$(gh api "repos/${{ github.repository }}/actions/artifacts?name=last-success-pins&per_page=100" \
-            --jq '[.artifacts[] | select(.expired == false)] | sort_by(.id) | last | .id // empty' 2>/dev/null || true)"
-          if [ -z "$pins_art" ]; then
-            # upload-artifact@v7 (archive: false) stores under the path basename:
-            # pre-fix stores live under the legacy name 'pins.json' — try it too
-            pins_art="$(gh api "repos/${{ github.repository }}/actions/artifacts?name=pins.json&per_page=100" \
+          if [ "${{ inputs.pin_last_success }}" != "none" ]; then
+            pins_art="$(gh api "repos/${{ github.repository }}/actions/artifacts?name=last-success-pins&per_page=100" \
               --jq '[.artifacts[] | select(.expired == false)] | sort_by(.id) | last | .id // empty' 2>/dev/null || true)"
-          fi
-          if [ -n "$pins_art" ]; then
-            rm -rf pins_store && mkdir -p pins_store
-            if gh api "repos/${{ github.repository }}/actions/artifacts/$pins_art/zip" > pins_store/pins.zip 2>/dev/null \
-               && unzip -oq pins_store/pins.zip -d pins_store \
-               && { [ -f pins_store/last-success-pins ] || [ -f pins_store/pins.json ]; }; then
-              pins_raw="$(cat pins_store/last-success-pins 2>/dev/null || true)"
-              [ -n "$pins_raw" ] || pins_raw="$(cat pins_store/pins.json 2>/dev/null || true)"
-              if [ -n "$pins_raw" ] && echo "$pins_raw" | jq -e . >/dev/null 2>&1; then
-                PINS_JSON="$pins_raw"
-                echo "📌 NoMount pin store loaded from artifact $pins_art"
+            if [ -z "$pins_art" ]; then
+              # upload-artifact@v7 (archive: false) stores under the path basename:
+              # pre-fix stores live under the legacy name 'pins.json' — try it too
+              pins_art="$(gh api "repos/${{ github.repository }}/actions/artifacts?name=pins.json&per_page=100" \
+                --jq '[.artifacts[] | select(.expired == false)] | sort_by(.id) | last | .id // empty' 2>/dev/null || true)"
+            fi
+            if [ -n "$pins_art" ]; then
+              rm -rf pins_store && mkdir -p pins_store
+              if gh api "repos/${{ github.repository }}/actions/artifacts/$pins_art/zip" > pins_store/pins.zip 2>/dev/null \
+                 && unzip -oq pins_store/pins.zip -d pins_store \
+                 && { [ -f pins_store/last-success-pins ] || [ -f pins_store/pins.json ]; }; then
+                pins_raw="$(cat pins_store/last-success-pins 2>/dev/null || true)"
+                [ -n "$pins_raw" ] || pins_raw="$(cat pins_store/pins.json 2>/dev/null || true)"
+                if [ -n "$pins_raw" ] && echo "$pins_raw" | jq -e . >/dev/null 2>&1; then
+                  PINS_JSON="$pins_raw"
+                  echo "📌 NoMount pin store loaded from artifact $pins_art"
+                else
+                  echo "::warning::Pin store artifact exists but is not valid JSON — ignoring it"
+                fi
               else
-                echo "::warning::Pin store artifact exists but is not valid JSON — ignoring it"
+                echo "::warning::Could not download/extract pin store artifact $pins_art — treating store as empty"
               fi
-            else
-              echo "::warning::Could not download/extract pin store artifact $pins_art — treating store as empty"
+              rm -rf pins_store
             fi
-            rm -rf pins_store
+          else
+            echo "ℹ️  pin_last_success=none — pin store not read"
           fi
+          # ── NoMount: dispatch commit > pin > auto (HEAD of <branch>) ──
           if [ "${{ (inputs.pin_last_success == 'all' || contains(inputs.pin_last_success, 'nomount')) }}" = "true" ]; then
-            stored_nm="$(jq -r '.nomount_commit // empty' <<<"$PINS_JSON")"
-            if [ -z "$stored_nm" ]; then
-              echo "::error::NoMount pin requested but no last-successful commit exists yet (pin store missing/empty). Seed it with one successful build."
-              exit 1
+            if [ -n "$commit" ]; then
+              echo "ℹ️  NoMount commit set at dispatch — pin moot for this run"
+            else
+              stored_nm="$(jq -r '.nomount_commit // empty' <<<"$PINS_JSON")"
+              if [ -z "$stored_nm" ]; then
+                echo "::error::NoMount pin requested but no last-successful commit exists yet (pin store missing/empty). Seed it with one successful build."
+                exit 1
+              fi
+              echo "📌 NoMount pin: $stored_nm (last successful run)"
+              commit="$stored_nm"
             fi
-            echo "📌 NoMount pin: $stored_nm (last successful run)"
-            commit="$stored_nm"
           fi
 
           # find_module_for <sha>: locate the successful "build module" CI run for
