@@ -11,11 +11,15 @@ concurrency:
 on:
   workflow_dispatch:
     inputs:
-      make_release:
-        description: 'Do you want to create a release?'
+      release:
+        description: 'Create a release? "release + bump increment" also bumps the -r increment (otherwise the previous increment is reused)'
         required: true
-        type: boolean
-        default: false
+        type: choice
+        options:
+          - none
+          - release
+          - release + bump increment
+        default: none
       op_model:
         description: 'Select the OnePlus kernels to build'
         required: true
@@ -230,11 +234,20 @@ on:
         description: 'KSU branch or commit hash. Default = last verified-good BakaSU commit (BakaSU main currently breaks SUSFS compat). For KSUN/KSU the verified BakaSU default is swapped for main automatically'
         type: string
         default: '5b76b884c75f729a220bb317aa4a4fc78f0e0e9c'
-      ksu_pin_last_success:
-        description: 'Root manager: same as last successful run (uses the commit recorded by the last fully successful build; fails loudly if none exists yet)'
+      pin_last_success:
+        description: 'Same as last successful run — uses the refs recorded by the last fully successful build and fails loudly if none exist yet. ksu = root manager commit; susfs = per-KMI SUSFS commit for every KMI whose ref field is empty (a typed ref still wins); nomount = NoMount commit'
         required: false
-        type: boolean
-        default: false
+        type: choice
+        options:
+          - none
+          - ksu
+          - susfs
+          - nomount
+          - ksu+susfs
+          - ksu+nomount
+          - susfs+nomount
+          - all
+        default: none
       optimize_level:
         description: "Compiler optimization level"
         required: true
@@ -259,6 +272,21 @@ on:
         description: 'Custom kernel build timestamp for uname -a (e.g. "Tue Feb 10 10:01:02 UTC 2026"). Leave empty for current time.'
         type: string
         default: ''
+      custom_uname_a14:
+        description: 'Optional uname suffix override applied to every A14 device in this run (max 44 chars). Leave empty to use per-config uname, falling back to an OEM-like generated suffix.'
+        required: false
+        type: string
+        default: ''
+      custom_uname_a15:
+        description: 'Optional uname suffix override applied to every A15 device in this run (max 44 chars). Leave empty to use per-config uname, falling back to an OEM-like generated suffix.'
+        required: false
+        type: string
+        default: ''
+      custom_uname_a16:
+        description: 'Optional uname suffix override applied to every A16 device in this run (max 44 chars). Leave empty to use per-config uname, falling back to an OEM-like generated suffix.'
+        required: false
+        type: string
+        default: ''
       android12-5_10_susfs_branch_or_commit:
         description: 'Enter SusFS Branch or commit hash for android12-5.10'
         type: string
@@ -276,14 +304,9 @@ on:
         type: string
         default: ''
       android16-6_12_susfs_branch_or_commit:
-        description: 'Enter SusFS Branch or commit hash for android16-6.12. Default = last verified-good SUSFS commit for the pinned BakaSU; clear it to track gki-android16-6.12 (or to let susfs_pin_last_success apply)'
+        description: 'Enter SusFS Branch or commit hash for android16-6.12. Default = last verified-good SUSFS commit for the pinned BakaSU; clear it to track gki-android16-6.12 (or to let pin_last_success=susfs apply)'
         type: string
         default: 'b213c54126fb243595ce7876e91d84d6e0861fec'
-      susfs_pin_last_success:
-        description: 'SUSFS (per GKI/KMI): same as last successful run for every KMI left empty below — a typed ref for a specific KMI still overrides the pin for that KMI'
-        required: false
-        type: boolean
-        default: false
       nomount_branch:
         description: 'NoMount branch to track for auto resolution (used when no commit is given)'
         type: string
@@ -292,18 +315,8 @@ on:
         description: 'NoMount commit SHA to pin (empty = auto: latest commit whose own CI built a module)'
         type: string
         default: ''
-      nomount_pin_last_success:
-        description: 'NoMount: same as last successful run (uses the commit recorded by the last fully successful build; fails loudly if none exists yet)'
-        required: false
-        type: boolean
-        default: false
       patch_dry_run:
         description: 'Patch verification mode: apply every patch, upload a verdict per device, skip compilation'
-        required: false
-        type: boolean
-        default: false
-      bump_release_increment:
-        description: 'Bump the release -r increment (otherwise the previous increment is reused)'
         required: false
         type: boolean
         default: false
@@ -331,6 +344,7 @@ jobs:
         with:
           sparse-checkout: |
             configs/
+            scripts/uname/
           sparse-checkout-cone-mode: false
 
       - name: 🔍 Generate build matrix
@@ -503,7 +517,7 @@ jobs:
           fi
 
           # ── Root manager: "same as last successful run" ──
-          if [ "${{ inputs.ksu_pin_last_success }}" = "true" ]; then
+          if [ "${{ (inputs.pin_last_success == 'all' || contains(inputs.pin_last_success, 'ksu')) }}" = "true" ]; then
             stored_ksu_type="$(jq -r '.ksu_type // empty' <<<"$PINS_JSON")"
             stored_ksu_sha="$(jq -r '.ksu_sha // empty' <<<"$PINS_JSON")"
             if [ -z "$stored_ksu_sha" ]; then
@@ -615,7 +629,7 @@ jobs:
             user_val="${user_inputs[$key]:-$default_val}"
             # ── SUSFS: "same as last successful run" for this GKI/KMI ──
             # An explicitly typed ref for this KMI always wins over the pin.
-            if [ "${{ inputs.susfs_pin_last_success }}" = "true" ] && [ -z "${user_inputs[$key]}" ]; then
+            if [ "${{ (inputs.pin_last_success == 'all' || contains(inputs.pin_last_success, 'susfs')) }}" = "true" ] && [ -z "${user_inputs[$key]}" ]; then
               stored_susfs="$(jq -r --arg k "$key" '.susfs[$k] // empty' <<<"$PINS_JSON")"
               if [ -z "$stored_susfs" ]; then
                 echo "::error::SUSFS pin requested but no last-successful pin exists for $key (pin store empty or this KMI never built successfully). Type a ref for this KMI or seed the store with one successful build."
@@ -629,7 +643,7 @@ jobs:
             HASH_QUERY="{ project(fullPath: \"${GITLAB_PROJECT_PATH}\") { repository { ch: commit(ref: \"${user_val}\") { sha } } } }"
             RELEASE_QUERY="{ project(fullPath: \"${GITLAB_PROJECT_PATH}\") { repository { ch: commit(ref: \"${user_val}\") { sha } blobs(paths: [\"kernel_patches/include/linux/susfs.h\"], ref: \"${user_val}\") { nodes { rawBlob } } } } }"
             
-            if [ "${{ inputs.make_release }}" = "true" ]; then
+            if [ "${{ (inputs.release != 'none') }}" = "true" ]; then
               GL_QUERY="$RELEASE_QUERY"
             else
               GL_QUERY="$HASH_QUERY"
@@ -649,7 +663,7 @@ jobs:
                 if [ -n "$resolved" ] && [ "$resolved" != "null" ]; then
                   echo "  ✅ Query for $key Success"
                   
-                  if [ "${{ inputs.make_release }}" = "true" ]; then
+                  if [ "${{ (inputs.release != 'none') }}" = "true" ]; then
                     extracted=$(echo "$RESPONSE" | jq -r '.data.project.repository.blobs.nodes[0].rawBlob // empty' | grep '#define SUSFS_VERSION' | awk -F'"' '{print $2}')
                     susfs_versions_per_key[$key]="${extracted:-unknown}"
                     echo "  ✅ $key → SUSFS_VERSION = ${extracted:-unknown}"
@@ -679,7 +693,7 @@ jobs:
               FALLBACK_SHA=""
               if [ -n "$SUSFS_CLONE_REPO" ] && git -C "$SUSFS_CLONE_REPO" checkout -q --detach "$user_val"; then
                 FALLBACK_SHA="$(git -C "$SUSFS_CLONE_REPO" rev-parse HEAD)"
-                if [ "${{ inputs.make_release }}" = "true" ]; then
+                if [ "${{ (inputs.release != 'none') }}" = "true" ]; then
                   SUSFS_VER_FALLBACK="$(git -C "$SUSFS_CLONE_REPO" show "HEAD:kernel_patches/include/linux/susfs.h" 2>/dev/null | grep '#define SUSFS_VERSION' | awk -F'"' '{print $2}' || true)"
                   if [ -n "$SUSFS_VER_FALLBACK" ]; then
                     susfs_versions_per_key["$key"]="$SUSFS_VER_FALLBACK"
@@ -699,7 +713,7 @@ jobs:
             fi
             
             # Final Validation — SUSFS version
-            if [ "${{ inputs.make_release }}" = "true" ] && [ "${susfs_versions_per_key[$key]:-unknown}" = "unknown" ]; then
+            if [ "${{ (inputs.release != 'none') }}" = "true" ] && [ "${susfs_versions_per_key[$key]:-unknown}" = "unknown" ]; then
               echo "::error::Could not extract SUSFS_VERSION from susfs.h for '$key' after $MAX_RETRIES attempts. Cannot proceed with release."
               exit 1
             fi
@@ -720,7 +734,7 @@ jobs:
           echo "susfs_hash_android16_6_12=${susfs_hashes[android16-6.12]:-unknown}" >> "$GITHUB_OUTPUT"
           
           # SUSFS_VERSION — only when releasing
-          if [ "${{ inputs.make_release }}" = "true" ]; then
+          if [ "${{ (inputs.release != 'none') }}" = "true" ]; then
             susfs_base_version="unknown"
             for key in "${active_keys[@]}"; do
               ver="${susfs_versions_per_key[$key]:-unknown}"
@@ -779,6 +793,61 @@ jobs:
             )
           ')
 
+          # ── uname resolution: per-A1x dispatch override > config uname > generated (one per kernel line) ──
+          declare -A uname_override=(
+            ["A14"]="${{ inputs.custom_uname_a14 }}"
+            ["A15"]="${{ inputs.custom_uname_a15 }}"
+            ["A16"]="${{ inputs.custom_uname_a16 }}"
+          )
+          for osv in A14 A15 A16; do
+            ov="${uname_override[$osv]}"
+            if [ -n "$ov" ] && jq -e --arg o "$osv" 'any(.[]; .os_version == $o)' <<<"$merged_matrix" >/dev/null; then
+              if [[ ! "$ov" =~ ^[A-Za-z0-9._+-]{1,44}$ ]]; then
+                echo "❌ custom_uname_${osv,,} '$ov' is invalid (charset A-Za-z0-9._+- , max 44 chars)"
+                exit 1
+              fi
+              echo "✅ custom_uname_${osv,,} accepted: $ov"
+            fi
+          done
+          # Generation key: KMI + kernel line. The config only records major.minor; a trailing -X.Y.Z in the
+          # model name (e.g. OP15-6.12.58) pins the sublevel, so such devices get their own suffix.
+          declare -A gen_cache=()
+          uname_rows=()
+          resolved_json="[]"
+          while IFS=$'\t' read -r idx model osv av kv cfg_uname; do
+            ov="${uname_override[$osv]:-}"
+            if [ -n "$ov" ]; then
+              val="$ov"; src="override"
+            elif [ -n "$cfg_uname" ]; then
+              val="$cfg_uname"; src="config"
+            else
+              gkv="$kv"
+              [[ "$model" =~ -([0-9]+\.[0-9]+\.[0-9]+)$ ]] && gkv="${BASH_REMATCH[1]}"
+              gkey="${av}-${kv}|${gkv}"
+              if [ -z "${gen_cache[$gkey]:-}" ]; then
+                seed="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|${gkv}"
+                gen_cache[$gkey]="$(bash scripts/uname/gen-oem-uname.sh --kernel-version "$gkv" --kmi "${av}-${kv}" --seed "$seed")" \
+                  || { echo "❌ uname generation failed for ${av}-${kv} ($gkv)"; exit 1; }
+              fi
+              val="${gen_cache[$gkey]}"; src="generated"; kv="$gkv"
+            fi
+            [ -n "$val" ] || { echo "❌ uname resolution produced an empty value for $model"; exit 1; }
+            resolved_json="$(jq -c --argjson i "$idx" --arg u "$val" '. + [{i: $i, u: $u}]' <<<"$resolved_json")"
+            uname_rows+=("| $model | $osv | ${av}-$(cut -d. -f1-2 <<<"$kv") | $kv | $src | \`$val\` |")
+          done < <(jq -r 'to_entries[] | [.key, .value.model, .value.os_version, .value.android_version, .value.kernel_version, (.value.uname // "")] | @tsv' <<<"$merged_matrix")
+          merged_matrix="$(jq --argjson r "$resolved_json" '[to_entries[] | .key as $k | .value + {resolved_uname: (first($r[] | select(.i == $k) | .u) // "")}]' <<<"$merged_matrix")"
+          if jq -e 'any(.[]; (.resolved_uname // "") == "")' <<<"$merged_matrix" >/dev/null; then
+            echo "❌ at least one matrix entry has no resolved_uname"; exit 1
+          fi
+          {
+            echo "### 🏷️ uname resolution"
+            echo ""
+            echo "| Device | OS | KMI | Kernel line | Source | Value |"
+            echo "|---|---|---|---|---|---|"
+            printf '%s\n' "${uname_rows[@]}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "${uname_rows[@]}"
+          echo "✅ uname resolved for $(jq length <<<"$merged_matrix") device(s) (override > config > generated)"
           echo "$merged_matrix" > final_matrix_temp.json
           
           # Recalculate wrapped with updated matrix and write output
@@ -830,12 +899,12 @@ jobs:
           
             echo "- KSU Config: $ksu_display"
             echo "- Build Timestamp: $build_ts_display"
-          echo "- Pin mode (same as last successful run): KSU ${{ inputs.ksu_pin_last_success && 'ON' || 'off' }} · SUSFS ${{ inputs.susfs_pin_last_success && 'ON' || 'off' }} · NoMount ${{ inputs.nomount_pin_last_success && 'ON' || 'off' }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Pin mode (same as last successful run): KSU ${{ (inputs.pin_last_success == 'all' || contains(inputs.pin_last_success, 'ksu')) && 'ON' || 'off' }} · SUSFS ${{ (inputs.pin_last_success == 'all' || contains(inputs.pin_last_success, 'susfs')) && 'ON' || 'off' }} · NoMount ${{ (inputs.pin_last_success == 'all' || contains(inputs.pin_last_success, 'nomount')) && 'ON' || 'off' }}" >> "$GITHUB_STEP_SUMMARY"
           
             cat << 'EOF'
           - Optimization: ${{ inputs.optimize_level }}
           - Clean Build/No Ccache: ${{ inputs.clean_build && '✅ Yes' || '❌ No' }}
-          - Create Release: ${{ inputs.make_release && '✅ Yes' || '❌ No' }}
+          - Create Release: ${{ (inputs.release != 'none') && '✅ Yes' || '❌ No' }}
           - Create Debug Artifacts: ${{ inputs.debug && '✅ Yes' || '❌ No' }}
           - Sync toolchains: ${{ inputs.mirror_toolchains && '✅ Yes' || '❌ No' }}
           
@@ -932,7 +1001,7 @@ jobs:
             fi
             rm -rf pins_store
           fi
-          if [ "${{ inputs.nomount_pin_last_success }}" = "true" ]; then
+          if [ "${{ (inputs.pin_last_success == 'all' || contains(inputs.pin_last_success, 'nomount')) }}" = "true" ]; then
             stored_nm="$(jq -r '.nomount_commit // empty' <<<"$PINS_JSON")"
             if [ -z "$stored_nm" ]; then
               echo "::error::NoMount pin requested but no last-successful commit exists yet (pin store missing/empty). Seed it with one successful build."
@@ -1296,7 +1365,7 @@ jobs:
         id: prepare_config
         shell: bash
         run: |
-          echo "config_json=$(jq -nc --argjson m '${{ toJSON(matrix) }}' '$m | del(.ksu_type, .ksu_hash, .ksu_resolved_hash)')" >> "$GITHUB_OUTPUT"
+          echo "config_json=$(jq -nc --argjson m '${{ toJSON(matrix) }}' '$m | del(.ksu_type, .ksu_hash, .ksu_resolved_hash, .resolved_uname)')" >> "$GITHUB_OUTPUT"
 
       - name: 🔨 Build Kernel
         id: build
@@ -1309,6 +1378,7 @@ jobs:
           nomount_commit: ${{ needs.resolve-nomount.outputs.nomount_commit }}
           optimize_level: ${{ inputs.optimize_level }}
           build_timestamp: ${{ inputs.build_timestamp }}
+          resolved_uname: ${{ matrix.resolved_uname }}
           clean: ${{ inputs.clean_build }}
           debug: ${{ inputs.debug }}
           patch_dry_run: ${{ inputs.patch_dry_run }}
@@ -1490,7 +1560,7 @@ jobs:
     needs: [set-op-model]
     if: |
       !cancelled() &&
-      inputs.make_release != true &&
+      (inputs.release != 'none') != true &&
       needs.set-op-model.result == 'success'
     runs-on: ubuntu-24.04
     env:
@@ -1628,7 +1698,7 @@ jobs:
     needs: [fetch-manager-apks]
     if: |
       !cancelled() &&
-      inputs.make_release != true &&
+      (inputs.release != 'none') != true &&
       needs.fetch-manager-apks.result == 'success'
     runs-on: ubuntu-24.04
     env:
@@ -1683,7 +1753,7 @@ jobs:
     runs-on: ubuntu-24.04
     if: |
       !cancelled() &&
-      inputs.make_release == true &&
+      (inputs.release != 'none') == true &&
       needs.set-op-model.result == 'success' &&
       needs.resolve-nomount.result == 'success' &&
       needs.build-nomount-module.result == 'success'
@@ -1734,7 +1804,7 @@ jobs:
             | sort -n | tail -n 1 || true)
           if [ -z "$PREV_R" ]; then
             NEXT_R=1
-          elif [ "${{ inputs.bump_release_increment }}" = "true" ]; then
+          elif [ "${{ (inputs.release == 'release + bump increment') }}" = "true" ]; then
             NEXT_R=$((PREV_R + 1))
           else
             NEXT_R="$PREV_R"

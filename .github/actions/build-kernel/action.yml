@@ -28,6 +28,11 @@ inputs:
     required: false
     type: string
     default: ""
+  resolved_uname:
+    description: 'uname suffix resolved by the workflow (dispatch override > config uname > generated). Empty = resolve here: config uname, else scripts/uname/gen-oem-uname.sh. Never compiles without a suffix'
+    required: false
+    type: string
+    default: ''
   build_timestamp:
     description: 'Custom kernel build timestamp shown in uname -a (e.g. "Tue Feb 10 10:01:02 UTC 2026"). Leave empty to use the current build time.'
     required: false
@@ -184,7 +189,8 @@ runs:
         ip_set="$OP_IP_SET"
         rust_build="$OP_RUST_BUILD"
         lto="$OP_LTO"
-        uname="${OP_UNAME:-}"
+        uname="${{ inputs.resolved_uname }}"
+        uname="${uname:-${OP_UNAME:-}}"
         unicode="$OP_UNICODE"
         c_compiler="$OP_C_COMPILER"
         rust_compiler="$OP_RUST_COMPILER"
@@ -298,9 +304,11 @@ runs:
           errors+=("Input 'lto' contains invalid characters. Allowed: 'thin', 'full' or 'none'. Got: '$lto'")
         fi
         
-        # Empty uname is allowed: no stock suffix is appended (LOCALVERSION = -<android_version>).
+        # Empty uname here means "generate at the branding step" (gen-oem-uname.sh) — never "compile bare".
         if [[ -n "$uname" && ${#uname} -gt 44 ]]; then
           errors+=("Input 'uname' too long. Maximum length: 44. Got: '$uname'")
+        elif [[ -n "$uname" && ! "$uname" =~ ^[A-Za-z0-9._+-]+$ ]]; then
+          errors+=("Input 'uname' contains invalid characters. Allowed: A-Z a-z 0-9 . _ + -. Got: '$uname'")
         fi
         
         if [[ -z "$unicode" ]]; then
@@ -3207,15 +3215,25 @@ runs:
         echo "Customize Kernel Branding"
         cd "$COMMON_KERNEL_FOLDER"
         mkdir -p out
-        # Genuine stock suffix when the config carries one; otherwise no branding suffix at all.
-        if [ -n "${OP_UNAME:-}" ]; then
-          CUSTOM_LOCALVERSION="-${ANDROID_VER}-${OP_UNAME}"
-        else
-          CUSTOM_LOCALVERSION="-${ANDROID_VER}"
+        # uname chain: workflow-resolved (override > config > generated) > config > generated here.
+        UNAME_SOURCE="workflow"
+        RESOLVED="${{ inputs.resolved_uname }}"
+        if [ -z "$RESOLVED" ] && [ -n "${OP_UNAME:-}" ]; then
+          RESOLVED="$OP_UNAME"; UNAME_SOURCE="config"
         fi
+        if [ -z "$RESOLVED" ]; then
+          GEN="${{ github.action_path }}/../../../scripts/uname/gen-oem-uname.sh"
+          [ -x "$GEN" ] || GEN="$GITHUB_WORKSPACE/action-source/scripts/uname/gen-oem-uname.sh"
+          RESOLVED="$(bash "$GEN" --kernel-version "$TKERNEL_VER" --kmi "${ANDROID_VER}-${KERNEL_VER}")" \
+            || { echo "❌ uname resolution failed (generator error)"; exit 1; }
+          UNAME_SOURCE="generated (action fallback)"
+        fi
+        [ -n "$RESOLVED" ] || { echo "❌ uname resolution failed"; exit 1; }
+        [[ ${#RESOLVED} -le 44 && "$RESOLVED" =~ ^[A-Za-z0-9._+-]+$ ]] || { echo "❌ resolved uname '$RESOLVED' violates the 44-char/charset rule"; exit 1; }
+        CUSTOM_LOCALVERSION="-${ANDROID_VER}-${RESOLVED}"
+        echo "OP_UNAME=$RESOLVED" >> "$GITHUB_ENV"
         echo "CUSTOM_LOCALVERSION=$CUSTOM_LOCALVERSION" >> "$GITHUB_ENV"
-        [ -n "$CUSTOM_LOCALVERSION" ] || { echo "::error::CUSTOM_LOCALVERSION is empty"; exit 1; }
-        echo "✅ Kernel branding customized (LOCALVERSION suffix: $CUSTOM_LOCALVERSION)"
+        echo "✅ Kernel branding customized (LOCALVERSION suffix: $CUSTOM_LOCALVERSION, uname source: $UNAME_SOURCE)"
 
     - name: Disable GPUEB
       shell: bash
@@ -3507,8 +3525,12 @@ runs:
         
         make LD="$COMMON_KERNEL_FOLDER/ld-wrapper" HOSTLD="$COMMON_KERNEL_FOLDER/ld-wrapper" O="$OUT" gki_defconfig
         
-        # Neutral fallback: never a brand string, only the Android version.
-        LOCAL_LOCALVERSION="${CUSTOM_LOCALVERSION:--${ANDROID_VER}}"
+        # Compiling without an OEM-like release suffix is forbidden (see the branding step).
+        LOCAL_LOCALVERSION="${CUSTOM_LOCALVERSION:-}"
+        if [ -z "$LOCAL_LOCALVERSION" ] || [ "$LOCAL_LOCALVERSION" = "-${ANDROID_VER}" ]; then
+          echo "❌ LOCALVERSION has no uname suffix ('$LOCAL_LOCALVERSION') — refusing to compile bare"
+          exit 1
+        fi
         if [ -n "${LOCAL_LOCALVERSION:-}" ]; then
           scripts/config --file "$OUT/.config" --set-str LOCALVERSION "${LOCAL_LOCALVERSION}"
           scripts/config --file "$OUT/.config" -d LOCALVERSION_AUTO || true
@@ -3741,7 +3763,7 @@ runs:
         BUILD_TIME="${BUILD_TIME:-0}"
         
         KERNEL_UNAME_BANNER=$(strings "$IMG" | grep -E 'Linux version.*#' | tail -n1)
-        # Keep only the release string (e.g. 6.12.58-android16-5-g16e473de48a3-abogki462654244-4k) for
+        # Keep only the release string (e.g. 6.12.58-android16-6-g925a103d123c-ab15898589-4k) for
         # the summary; the full banner (compiler, build user@host, SMP PREEMPT + timestamp) stays in
         # this log group only, mirroring a clean uname like BP's build reports.
         KERNEL_UNAME=$(printf '%s' "$KERNEL_UNAME_BANNER" | sed -e 's/^Linux version //' -e 's/ .*//')
