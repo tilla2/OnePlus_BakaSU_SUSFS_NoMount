@@ -236,7 +236,7 @@ on:
         type: string
         default: 'main'
       pin_last_success:
-        description: 'Same as last successful run — uses the refs recorded by the last fully successful build and fails loudly if none exist yet. Precedence: dispatch ref > pin > auto (HEAD). ksu = root manager commit (clear ksu_branch_or_hash to let the pin apply); susfs = per-KMI SUSFS commit for every KMI whose ref field is empty; nomount = NoMount commit (leave nomount_commit empty to let the pin apply)'
+        description: 'Same as last successful run — uses the refs recorded by the last fully successful build and fails loudly if none exist yet. KSU: pin wins over ksu_branch_or_hash, but only when the stored pin was recorded for the same KSU type; susfs: per-KMI SUSFS commit for every KMI whose ref field is empty; nomount: NoMount commit when nomount_commit is empty'
         required: false
         type: choice
         options:
@@ -549,28 +549,25 @@ jobs:
             echo "ℹ️  pin_last_success=none — pin store not read"
           fi
 
-          # ── Root manager: dispatch ref > pin > auto (HEAD of the type default branch) ──
+          # ── Root manager: pin (type-locked to the stored KSU type) > dispatch ref > auto (HEAD of the type default branch) ──
           if [ "${{ (inputs.pin_last_success == 'all' || contains(inputs.pin_last_success, 'ksu')) }}" = "true" ]; then
-            if [ -n "$ksu_ref" ]; then
-              echo "ℹ️  KSU ref '$ksu_ref' set at dispatch — pin moot for this run"
+            stored_ksu_type="$(jq -r '.ksu_type // empty' <<<"$PINS_JSON")"
+            stored_ksu_sha="$(jq -r '.ksu_sha // empty' <<<"$PINS_JSON")"
+            if [ -z "$stored_ksu_sha" ]; then
+              echo "::error::KSU pin requested but no last-successful Root-manager pin exists yet (pin store missing/empty). Run once with explicit refs to seed it."
+              exit 1
+            fi
+            if [ "$stored_ksu_type" != "$ksu_type" ]; then
+              echo "⚠️  KSU pin ignored: stored pin is for $stored_ksu_type, this run selects $ksu_type — pin is type-locked, falling back to dispatch/auto"
             else
-              stored_ksu_type="$(jq -r '.ksu_type // empty' <<<"$PINS_JSON")"
-              stored_ksu_sha="$(jq -r '.ksu_sha // empty' <<<"$PINS_JSON")"
-              if [ -z "$stored_ksu_sha" ]; then
-                echo "::error::KSU pin requested but no last-successful Root-manager pin exists yet (pin store missing/empty). Run once with explicit refs to seed it."
-                exit 1
-              fi
-              if [ "$stored_ksu_type" != "$ksu_type" ]; then
-                echo "::error::KSU pin requested but the stored pin is for $stored_ksu_type while this run selects $ksu_type — seed the store with a successful $ksu_type build first."
-                exit 1
-              fi
               echo "📌 KSU pin: $ksu_type → $stored_ksu_sha (last successful run)"
+              [ -z "$ksu_ref" ] || echo "   ksu_branch_or_hash '$ksu_ref' is moot while the pin applies"
               ksu_ref="$stored_ksu_sha"
             fi
           fi
           if [ -z "$ksu_ref" ]; then
             ksu_ref="main"
-            echo "ℹ️  No KSU ref at dispatch and no pin selected — auto: HEAD of 'main' for $ksu_type"
+            echo "ℹ️  No KSU ref at dispatch and no applicable pin — auto: HEAD of 'main' for $ksu_type"
           fi
 
           if [ "$ksu_type" == "BakaSU" ]; then
