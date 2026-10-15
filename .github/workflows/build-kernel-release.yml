@@ -332,16 +332,16 @@ jobs:
   set-op-model:
     runs-on: ubuntu-24.04
     outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
-      device_count: ${{ steps.set-matrix.outputs.count }}
-      active_gki_keys: ${{ steps.set-matrix.outputs.active_gki_keys }}
-      susfs_hash_android12_5_10: ${{ steps.set-matrix.outputs.susfs_hash_android12_5_10 }}
-      susfs_hash_android13_5_15: ${{ steps.set-matrix.outputs.susfs_hash_android13_5_15 }}
-      susfs_hash_android14_6_1:  ${{ steps.set-matrix.outputs.susfs_hash_android14_6_1 }}
-      susfs_hash_android15_6_6:  ${{ steps.set-matrix.outputs.susfs_hash_android15_6_6 }}
-      susfs_hash_android16_6_12: ${{ steps.set-matrix.outputs.susfs_hash_android16_6_12 }}
-      ksu_resolved_hash:    ${{ steps.set-matrix.outputs.ksu_resolved_hash }}
-      susfs_base_version: ${{ steps.set-matrix.outputs.susfs_base_version }}
+      matrix: ${{ steps.set-matrix-final.outputs.matrix }}
+      device_count: ${{ steps.set-matrix-final.outputs.count }}
+      active_gki_keys: ${{ steps.set-matrix-final.outputs.active_gki_keys }}
+      susfs_hash_android12_5_10: ${{ steps.set-matrix-final.outputs.susfs_hash_android12_5_10 }}
+      susfs_hash_android13_5_15: ${{ steps.set-matrix-final.outputs.susfs_hash_android13_5_15 }}
+      susfs_hash_android14_6_1:  ${{ steps.set-matrix-final.outputs.susfs_hash_android14_6_1 }}
+      susfs_hash_android15_6_6:  ${{ steps.set-matrix-final.outputs.susfs_hash_android15_6_6 }}
+      susfs_hash_android16_6_12: ${{ steps.set-matrix-final.outputs.susfs_hash_android16_6_12 }}
+      ksu_resolved_hash:    ${{ steps.set-matrix-final.outputs.ksu_resolved_hash }}
+      susfs_base_version: ${{ steps.set-matrix-final.outputs.susfs_base_version }}
     env:
       GH_TOKEN: ${{ github.token }}
       GH_HTTP_TIMEOUT: 600
@@ -354,12 +354,22 @@ jobs:
             scripts/uname/
           sparse-checkout-cone-mode: false
 
-      - name: 🔍 Generate build matrix
-        id: set-matrix
+      - name: 🔍 Select devices & filter configs
+        id: select-devices
         shell: bash
         run: |
           set -euo pipefail
+          echo "skip_build=false" >> "$GITHUB_ENV"
           echo "::group::Matrix generation"
+
+          # Dispatch-only workflow: push events get a valid-but-empty matrix so
+          # every downstream job skips cleanly instead of failing on empty inputs.
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "✅ Push event — build-kernel-release is dispatch-only, skipping with an empty matrix"
+            echo "skip_build=true" >> "$GITHUB_ENV"
+            echo "::endgroup::"
+            exit 0
+          fi
           
           input="${{ inputs.op_model }}"
           device_a14="${{ inputs.device_a14 }}"
@@ -490,7 +500,28 @@ jobs:
           jq -r '.[] | "  - \(.model) (\(.os_version), \(.android_version)-\(.kernel_version), \(.ksu_type) - \(.ksu_hash))"' <<<"$merged_matrix"
           
           echo "count=$count" >> "$GITHUB_OUTPUT"
-          
+          echo "$merged_matrix" > filtered_matrix.json
+          echo "::endgroup::"
+          echo "✅ Device selection complete: $final_count device(s) saved to filtered_matrix.json"
+
+      - name: 📌 Resolve pins, SUSFS & unames → final matrix
+        id: set-matrix-final
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::Pin store, SUSFS & uname resolution"
+
+          if [ "${{ env.skip_build }}" = "true" ]; then
+            echo 'matrix={"include":[]}' >> "$GITHUB_OUTPUT"
+            echo 'count=0' >> "$GITHUB_OUTPUT"
+            echo "::endgroup::"
+            echo "✅ Push event — empty matrix emitted, downstream jobs will skip"
+            exit 0
+          fi
+
+          merged_matrix="$(cat filtered_matrix.json)"
+          echo "count=$(jq length <<<"$merged_matrix")" >> "$GITHUB_OUTPUT"
+
           ksu_type="${{ inputs.ksu_type }}"
           ksu_ref="${{ inputs.ksu_branch_or_hash }}"
           
@@ -867,12 +898,13 @@ jobs:
           # Recalculate wrapped with updated matrix and write output
           wrapped=$(jq --slurp '{ include: .[] }' final_matrix_temp.json)
           echo "matrix=$(echo "$wrapped" | jq -c .)" >> "$GITHUB_OUTPUT"
-          rm final_matrix_temp.json
+          rm -f final_matrix_temp.json filtered_matrix.json
           
           echo "::endgroup::"
           echo "✅ Build matrix generated"
 
       - name: Upload build matrix
+        if: ${{ env.skip_build != 'true' }}
         uses: actions/upload-artifact@v7
         with:
           name: build-matrix
@@ -881,6 +913,7 @@ jobs:
           retention-days: 7
 
       - name: 📊 Build plan summary
+        if: ${{ env.skip_build != 'true' }}
         run: |
           ksu_type="${{ inputs.ksu_type }}"
           ksu_ref="${{ inputs.ksu_branch_or_hash }}"
@@ -890,7 +923,7 @@ jobs:
             if [[ "$ksu_ref" =~ ^[0-9a-f]{40}$ ]]; then
               ksu_display+="📌 \`$ksu_type\`, \`$ksu_ref\`"
             else
-              ksu_display+="🔀 \`$ksu_type\`, \`$ksu_ref\` (\`${{ steps.set-matrix.outputs.ksu_resolved_hash }}\`)"
+              ksu_display+="🔀 \`$ksu_type\`, \`$ksu_ref\` (\`${{ steps.set-matrix-final.outputs.ksu_resolved_hash }}\`)"
             fi
           fi
           
@@ -906,7 +939,7 @@ jobs:
           ## 🎯 Build Plan
           
           **Target:** ${{ inputs.op_model }}  
-          **Devices:** ${{ steps.set-matrix.outputs.count }}  
+          **Devices:** ${{ steps.set-matrix-final.outputs.count }}  
           
           **Configuration:**
           EOF
@@ -936,16 +969,16 @@ jobs:
           )
           
           declare -A step_hashes=(
-            ["android12-5.10"]="${{ steps.set-matrix.outputs.susfs_hash_android12_5_10 }}"
-            ["android13-5.15"]="${{ steps.set-matrix.outputs.susfs_hash_android13_5_15 }}"
-            ["android14-6.1"]="${{ steps.set-matrix.outputs.susfs_hash_android14_6_1 }}"
-            ["android15-6.6"]="${{ steps.set-matrix.outputs.susfs_hash_android15_6_6 }}"
-            ["android16-6.12"]="${{ steps.set-matrix.outputs.susfs_hash_android16_6_12 }}"
+            ["android12-5.10"]="${{ steps.set-matrix-final.outputs.susfs_hash_android12_5_10 }}"
+            ["android13-5.15"]="${{ steps.set-matrix-final.outputs.susfs_hash_android13_5_15 }}"
+            ["android14-6.1"]="${{ steps.set-matrix-final.outputs.susfs_hash_android14_6_1 }}"
+            ["android15-6.6"]="${{ steps.set-matrix-final.outputs.susfs_hash_android15_6_6 }}"
+            ["android16-6.12"]="${{ steps.set-matrix-final.outputs.susfs_hash_android16_6_12 }}"
           )
           
           # Iterate only on the GKI versions present in this run
           IFS=',' read -ra active_keys_display \
-            <<< "${{ steps.set-matrix.outputs.active_gki_keys }}"
+            <<< "${{ steps.set-matrix-final.outputs.active_gki_keys }}"
           
           for key in "${active_keys_display[@]}"; do
             value="${susfs_inputs[$key]:-}"
@@ -2350,7 +2383,8 @@ jobs:
       needs.set-op-model.result == 'success' &&
       needs.resolve-nomount.result == 'success' &&
       needs.build.result == 'success' &&
-      !contains(inputs.run_mode, 'patch')
+      !contains(inputs.run_mode, 'patch') &&
+      needs.set-op-model.outputs.device_count != '0'
     runs-on: ubuntu-24.04
     env:
       GH_TOKEN: ${{ github.token }}
