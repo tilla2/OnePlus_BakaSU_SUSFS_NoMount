@@ -236,18 +236,14 @@ on:
         type: string
         default: 'main'
       pin_last_success:
-        description: 'Same as last successful run — uses the refs recorded by the last fully successful build and fails loudly if none exist yet. KSU: pin wins over ksu_branch_or_hash, but only when the stored pin was recorded for the same KSU type; susfs: per-KMI SUSFS commit for every KMI whose ref field is empty; nomount: NoMount commit when nomount_commit is empty'
+        description: 'Same as last successful run — uses the refs recorded by the last fully successful build and fails loudly if none exist yet. KSU: pin wins over ksu_branch_or_hash, but only when the stored pin was recorded for the same KSU type; susfs: per-KMI SUSFS commit for every KMI whose ref field is empty. NoMount is pinned via nomount_source=pin, not here (both = ksu+susfs)'
         required: false
         type: choice
         options:
           - none
           - ksu
           - susfs
-          - nomount
-          - ksu+susfs
-          - ksu+nomount
-          - susfs+nomount
-          - all
+          - both
         default: none
       optimize_level:
         description: "Compiler optimization level"
@@ -319,12 +315,16 @@ on:
         required: false
         type: string
         default: ''
-      nomount_branch:
-        description: 'NoMount branch to track for auto resolution (used when no commit is given)'
-        type: string
+      nomount_source:
+        description: 'NoMount source: HEAD of dev, HEAD of master, or the last-successful-run pin (ignored when nomount_commit is set)'
+        type: choice
+        options:
+          - dev
+          - master
+          - pin
         default: 'dev'
       nomount_commit:
-        description: 'NoMount commit SHA to pin (empty = auto: latest commit whose own CI built a module)'
+        description: 'Optional explicit NoMount commit SHA — wins over nomount_source, including pin'
         type: string
         default: ''
 
@@ -550,7 +550,7 @@ jobs:
           fi
 
           # ── Root manager: pin (type-locked to the stored KSU type) > dispatch ref > auto (HEAD of the type default branch) ──
-          if [ "${{ (inputs.pin_last_success == 'all' || contains(inputs.pin_last_success, 'ksu')) }}" = "true" ]; then
+          if [ "${{ (inputs.pin_last_success == 'both' || inputs.pin_last_success == 'ksu') }}" = "true" ]; then
             stored_ksu_type="$(jq -r '.ksu_type // empty' <<<"$PINS_JSON")"
             stored_ksu_sha="$(jq -r '.ksu_sha // empty' <<<"$PINS_JSON")"
             if [ -z "$stored_ksu_sha" ]; then
@@ -664,7 +664,7 @@ jobs:
             default_val="${default_branches[$key]}"
             user_val="${user_inputs[$key]:-$default_val}"
             # ── SUSFS: "same as last successful run" for this GKI/KMI ──
-            if [ "${{ (inputs.pin_last_success == 'all' || contains(inputs.pin_last_success, 'susfs')) }}" = "true" ] && [ -z "${user_inputs[$key]}" ]; then
+            if [ "${{ (inputs.pin_last_success == 'both' || inputs.pin_last_success == 'susfs') }}" = "true" ] && [ -z "${user_inputs[$key]}" ]; then
               stored_susfs="$(jq -r --arg k "$key" '.susfs[$k] // empty' <<<"$PINS_JSON")"
               if [ -z "$stored_susfs" ]; then
                 echo "::error::SUSFS pin requested but no last-successful pin exists for $key (pin store empty or this KMI never built successfully). Type a ref for this KMI or seed the store with one successful build."
@@ -925,7 +925,7 @@ jobs:
 
             echo "- KSU Config: $ksu_display"
             echo "- Build Timestamp: $build_ts_display"
-          echo "- Pin mode (same as last successful run): KSU ${{ (inputs.pin_last_success == 'all' || contains(inputs.pin_last_success, 'ksu')) && 'ON' || 'off' }} · SUSFS ${{ (inputs.pin_last_success == 'all' || contains(inputs.pin_last_success, 'susfs')) && 'ON' || 'off' }} · NoMount ${{ (inputs.pin_last_success == 'all' || contains(inputs.pin_last_success, 'nomount')) && 'ON' || 'off' }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Pin mode (same as last successful run): KSU ${{ (inputs.pin_last_success == 'both' || inputs.pin_last_success == 'ksu') && 'ON' || 'off' }} · SUSFS ${{ (inputs.pin_last_success == 'both' || inputs.pin_last_success == 'susfs') && 'ON' || 'off' }} · NoMount pin ${{ inputs.nomount_source == 'pin' && 'ON' || 'off' }}" >> "$GITHUB_STEP_SUMMARY"
 
             cat << 'EOF'
           - Optimization: ${{ inputs.optimize_level }}
@@ -997,12 +997,16 @@ jobs:
         run: |
           set -euo pipefail
           echo "::group::Resolve NoMount commit"
-          branch="${{ inputs.nomount_branch }}"
           commit="${{ inputs.nomount_commit }}"
+          nm_source="${{ inputs.nomount_source }}"
+          case "$nm_source" in
+            master) branch="master" ;;
+            *)      branch="dev" ;;   # dev, or pin (branch only used for the informational HEAD probe)
+          esac
 
           # ── NoMount: "same as last successful run" ──
           PINS_JSON="{}"
-          if [ "${{ inputs.pin_last_success }}" != "none" ]; then
+          if [ "${{ inputs.pin_last_success }}" != "none" ] || [ "$nm_source" = "pin" ]; then
             pins_art="$(gh api "repos/${{ github.repository }}/actions/artifacts?name=last-success-pins&per_page=100" \
               --jq '[.artifacts[] | select(.expired == false)] | sort_by(.id) | last | .id // empty' 2>/dev/null || true)"
             if [ -z "$pins_art" ]; then
@@ -1026,21 +1030,22 @@ jobs:
               rm -rf pins_store
             fi
           else
-            echo "ℹ️  pin_last_success=none — pin store not read"
+            echo "ℹ️  pin_last_success=none and nomount_source!=pin — pin store not read"
           fi
-          # ── NoMount: dispatch commit > pin > auto (HEAD of <branch>) ──
-          if [ "${{ (inputs.pin_last_success == 'all' || contains(inputs.pin_last_success, 'nomount')) }}" = "true" ]; then
-            if [ -n "$commit" ]; then
-              echo "ℹ️  NoMount commit set at dispatch — pin moot for this run"
-            else
-              stored_nm="$(jq -r '.nomount_commit // empty' <<<"$PINS_JSON")"
-              if [ -z "$stored_nm" ]; then
-                echo "::error::NoMount pin requested but no last-successful commit exists yet (pin store missing/empty). Seed it with one successful build."
-                exit 1
-              fi
-              echo "📌 NoMount pin: $stored_nm (last successful run)"
-              commit="$stored_nm"
+          # ── NoMount: explicit commit > pin (nomount_source=pin) > auto (HEAD of chosen branch) ──
+          if [ -n "$commit" ]; then
+            if [ "$nm_source" = "pin" ]; then
+              echo "ℹ️  nomount_commit set at dispatch — nomount_source=pin is moot for this run"
             fi
+          elif [ "$nm_source" = "pin" ]; then
+            stored_nm="$(jq -r '.nomount_commit // empty' <<<"$PINS_JSON")"
+            if [ -z "$stored_nm" ]; then
+              echo "::error::NoMount pin requested (nomount_source=pin) but no last-successful commit exists yet (pin store missing/empty). Seed it with one successful build."
+              exit 1
+            fi
+            echo "📌 NoMount pin: $stored_nm (last successful run)"
+            commit="$stored_nm"
+            src="pin"
           fi
 
           # find_module_for <sha>: upstream CI run + live module artifact for this SHA
@@ -1072,14 +1077,18 @@ jobs:
               echo "::error::nomount_commit '$commit' does not exist in maxsteeel/nomount"
               exit 1
             fi
-            echo "📌 Explicit NoMount commit: $commit"
-            src="explicit-commit"
-            head_now="$(gh api "repos/maxsteeel/nomount/branches/$branch" --jq '.commit.sha' 2>/dev/null || true)"
-            if [ -z "$head_now" ]; then
-              head_now="$(git ls-remote "https://github.com/maxsteeel/nomount.git" "refs/heads/$branch" 2>/dev/null | cut -f1 || true)"
-            fi
-            if [ -n "$head_now" ] && [ "$commit" != "$head_now" ]; then
-              echo "::warning::Pinned NoMount commit ${commit:0:7} is not HEAD (${head_now:0:7}) of branch '$branch'. If you did not intend a rollback, clear the pre-filled nomount_commit field in the dispatch form and re-run."
+            if [ "${src:-}" != "pin" ]; then
+              echo "📌 Explicit NoMount commit: $commit"
+              src="explicit-commit"
+              head_now="$(gh api "repos/maxsteeel/nomount/branches/$branch" --jq '.commit.sha' 2>/dev/null || true)"
+              if [ -z "$head_now" ]; then
+                head_now="$(git ls-remote "https://github.com/maxsteeel/nomount.git" "refs/heads/$branch" 2>/dev/null | cut -f1 || true)"
+              fi
+              if [ -n "$head_now" ] && [ "$commit" != "$head_now" ]; then
+                echo "::warning::Pinned NoMount commit ${commit:0:7} is not HEAD (${head_now:0:7}) of branch '$branch'. If you did not intend a rollback, clear the pre-filled nomount_commit field in the dispatch form and re-run."
+              fi
+            else
+              echo "📌 NoMount commit from pin: $commit"
             fi
             if find_module_for "$commit"; then
               module_name="$MODULE_NAME"; module_id="$MODULE_ID"; run_url="$NM_RUN_URL"
@@ -1171,7 +1180,12 @@ jobs:
 
           NM_COMMIT_COUNT="$(git -C "$source_dir" rev-list --count HEAD)"
           NM_UP_BRANCH="$(gh api "repos/maxsteeel/nomount/commits/${actual_commit}/branches-where-head" --jq '.[0].name' 2>/dev/null || true)"
-          [ -n "$NM_UP_BRANCH" ] || NM_UP_BRANCH="${{ inputs.nomount_branch }}"
+          if [ -z "$NM_UP_BRANCH" ]; then
+            case "${{ inputs.nomount_source }}" in
+              master) NM_UP_BRANCH="master" ;;
+              *)      NM_UP_BRANCH="dev" ;;
+            esac
+          fi
           if [ "$NM_UP_BRANCH" = "master" ]; then NM_TAG="release"; else NM_TAG="dev"; fi
 
           mkdir -p "$source_dir/bin"
