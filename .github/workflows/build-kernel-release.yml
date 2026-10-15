@@ -1150,8 +1150,97 @@ jobs:
           echo "💽 Final disk usage:"
           df -h /
           
+          
+          # Verification: removed build trees must be gone; ccache stays untouched
+          cleanup_failed=0
+          for p in "$GITHUB_WORKSPACE/out" "$GITHUB_WORKSPACE/build" "$GITHUB_WORKSPACE/kernel/out" "$GITHUB_WORKSPACE/.repo"; do
+            if [ -e "$p" ]; then
+              echo "::error::cleanup verification failed: $p still exists"
+              cleanup_failed=1
+            fi
+          done
+          if [ "$cleanup_failed" -ne 0 ]; then
+            echo "::endgroup::"
+            exit 1
+          fi
+          echo "✅ Final cleanup verified — removed build trees gone, ccache untouched, disk reported"
           echo "::endgroup::"
 
+
+  fetch-manager-apks:
+    name: Fetch manager APKs (artifact, no release)
+    needs: [set-op-model]
+    if: |
+      !cancelled() &&
+      inputs.make_release != true &&
+      needs.set-op-model.result == 'success'
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      KSU_SHA: ${{ needs.set-op-model.outputs.ksu_resolved_hash }}
+    steps:
+      - name: 📦 Fetch commit-matched manager apps
+        run: |
+          set -euo pipefail
+          mkdir -p ./manager-apks
+          cd ./manager-apks
+          case "${{ inputs.ksu_type }}" in
+            KSUN)      MANAGER_REPO="KernelSU-Next/KernelSU-Next" ;;
+            BakaSU)  MANAGER_REPO="Baka-SU/BakaSU" ;;
+            KSU)       MANAGER_REPO="tiann/KernelSU" ;;
+          esac
+          echo "Manager repo: $MANAGER_REPO — resolving commit-exact build for ${KSU_SHA}"
+
+          MANAGER_RUN_ID=""
+          MANAGER_RUN_ID=$(gh api "repos/${MANAGER_REPO}/actions/runs?head_sha=${KSU_SHA}&status=success&per_page=50" \
+            --jq '[.workflow_runs[] | select(.path | test("build-manager(-ci)?\\.yml$"))][0].id // empty' || true)
+
+          if [ -n "$MANAGER_RUN_ID" ]; then
+            echo "✅ Commit-exact manager CI run found: ${MANAGER_RUN_ID}"
+            echo "MANAGER_RUN_URL=https://github.com/${MANAGER_REPO}/actions/runs/${MANAGER_RUN_ID}" >> "$GITHUB_ENV"
+            ART_ROWS=$(gh api "repos/${MANAGER_REPO}/actions/runs/${MANAGER_RUN_ID}/artifacts?per_page=100" \
+              --jq '.artifacts[] | select(.expired == false) | select(.name | test("release"; "i")) | "\(.id) \(.name)"' || true)
+            while read -r aid aname; do
+              [ -z "$aid" ] && continue
+              gh api "repos/${MANAGER_REPO}/actions/artifacts/${aid}/zip" > "${aname}.zip"
+              unzip -o -j "${aname}.zip" '*.apk' -d ./ >/dev/null || true
+              rm -f "${aname}.zip"
+            done <<< "$ART_ROWS"
+          fi
+
+          if ! ls ./*.apk >/dev/null 2>&1; then
+            echo "::warning::No live commit-exact manager build for ${KSU_SHA} (artifact expired or CI absent) — falling back to the latest upstream release"
+            LATEST_TAG="$(gh api "repos/${MANAGER_REPO}/releases/latest" --jq '.tag_name' 2>/dev/null || true)"
+            if [ -z "$LATEST_TAG" ]; then
+              echo "::error::No manager APK could be fetched from ${MANAGER_REPO} for ${KSU_SHA}"
+              exit 1
+            fi
+            echo "MANAGER_RUN_URL=https://github.com/${MANAGER_REPO}/releases/tag/${LATEST_TAG}" >> "$GITHUB_ENV"
+            for asset_url in $(gh api "repos/${MANAGER_REPO}/releases/latest" \
+              --jq '.assets[] | select(.name | endswith(".apk")) | .browser_download_url'); do
+              case "$asset_url" in
+                *release*.apk|*release-*.apk) curl --fail --location --retry 3 --retry-delay 5 -O "$asset_url" || true ;;
+              esac
+            done
+          fi
+
+          if ! ls ./*.apk >/dev/null 2>&1; then
+            echo "::error::No manager APK could be fetched from ${MANAGER_REPO} for ${KSU_SHA}"
+            exit 1
+          fi
+
+          echo "Manager APKs fetched:"
+          ls -l ./*.apk
+          echo "✅ Manager APKs fetched (${MANAGER_REPO} @ ${KSU_SHA:0:12})"
+
+      - name: ⬆️ Upload manager APKs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: manager-apks
+          path: manager-apks/*.apk
+          if-no-files-found: error
+          retention-days: 7
   trigger-release:
     needs: [set-op-model, resolve-nomount, build-nomount-module, build]
     runs-on: ubuntu-24.04
@@ -1415,6 +1504,9 @@ jobs:
             status_file="./downloaded-artifacts/patch-status-${model}_${os_ver}.txt"
             if [[ ! -f "$status_file" ]]; then
               status_file="$(find ./downloaded-artifacts -maxdepth 2 -name "patch-status-${model}_${os_ver}.txt" 2>/dev/null | head -n1 || true)"
+            fi
+            if [[ ! -f "$status_file" ]]; then
+              status_file="./downloaded-artifacts/patch-status-${model}-${kernel_ver}_${os_ver}.txt"
             fi
             if [[ ! -f "$status_file" && -f "./downloaded-artifacts/patch-status-${model}_${os_ver}.zip" ]]; then
               echo "::warning::patch-status-${model}_${os_ver} arrived as a zip container; unwrapping"
