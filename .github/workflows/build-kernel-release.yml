@@ -472,18 +472,28 @@ jobs:
           ksu_type="${{ inputs.ksu_type }}"
           ksu_ref="${{ inputs.ksu_branch_or_hash }}"
           
-          # ── Load "last successful run" pin store (branch ci/last-success-pins, file pins.json) ──
+          # ── Load "last successful run" pin store (artifact 'last-success-pins', file pins.json) ──
           PINS_JSON="{}"
-          pins_raw="$(gh api "repos/${{ github.repository }}/contents/pins.json?ref=ci/last-success-pins" --jq '.content' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)"
-          if [ -n "$pins_raw" ]; then
-            if echo "$pins_raw" | jq -e . >/dev/null 2>&1; then
-              PINS_JSON="$pins_raw"
-              echo "📌 Pin store loaded: $(jq -c . <<<"$pins_raw")"
+          pins_art="$(gh api "repos/${{ github.repository }}/actions/artifacts?name=last-success-pins&per_page=100" \
+            --jq '[.artifacts[] | select(.expired == false)] | sort_by(.id) | last | .id // empty' 2>/dev/null || true)"
+          if [ -n "$pins_art" ]; then
+            rm -rf pins_store && mkdir -p pins_store
+            if gh api "repos/${{ github.repository }}/actions/artifacts/$pins_art/zip" > pins_store/pins.zip 2>/dev/null \
+               && unzip -oq pins_store/pins.zip -d pins_store \
+               && [ -f pins_store/pins.json ]; then
+              pins_raw="$(cat pins_store/pins.json)"
+              if [ -n "$pins_raw" ] && echo "$pins_raw" | jq -e . >/dev/null 2>&1; then
+                PINS_JSON="$pins_raw"
+                echo "📌 Pin store loaded from artifact $pins_art: $(jq -c . <<<"$pins_raw")"
+              else
+                echo "::warning::Pin store artifact exists but is not valid JSON — ignoring it"
+              fi
             else
-              echo "::warning::Pin store exists but is not valid JSON — ignoring it"
+              echo "::warning::Could not download/extract pin store artifact $pins_art — treating store as empty"
             fi
+            rm -rf pins_store
           else
-            echo "ℹ️  No pins stored yet (branch ci/last-success-pins absent or empty) — pin toggles fail loudly until a first successful build records one"
+            echo "ℹ️  No pins stored yet (no live 'last-success-pins' artifact) — pin toggles fail loudly until a first successful build records one"
           fi
 
           # ── Root manager: "same as last successful run" ──
@@ -895,9 +905,24 @@ jobs:
 
           # ── NoMount: "same as last successful run" ──
           PINS_JSON="{}"
-          pins_raw="$(gh api "repos/${{ github.repository }}/contents/pins.json?ref=ci/last-success-pins" --jq '.content' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)"
-          if [ -n "$pins_raw" ] && echo "$pins_raw" | jq -e . >/dev/null 2>&1; then
-            PINS_JSON="$pins_raw"
+          pins_art="$(gh api "repos/${{ github.repository }}/actions/artifacts?name=last-success-pins&per_page=100" \
+            --jq '[.artifacts[] | select(.expired == false)] | sort_by(.id) | last | .id // empty' 2>/dev/null || true)"
+          if [ -n "$pins_art" ]; then
+            rm -rf pins_store && mkdir -p pins_store
+            if gh api "repos/${{ github.repository }}/actions/artifacts/$pins_art/zip" > pins_store/pins.zip 2>/dev/null \
+               && unzip -oq pins_store/pins.zip -d pins_store \
+               && [ -f pins_store/pins.json ]; then
+              pins_raw="$(cat pins_store/pins.json)"
+              if [ -n "$pins_raw" ] && echo "$pins_raw" | jq -e . >/dev/null 2>&1; then
+                PINS_JSON="$pins_raw"
+                echo "📌 NoMount pin store loaded from artifact $pins_art"
+              else
+                echo "::warning::Pin store artifact exists but is not valid JSON — ignoring it"
+              fi
+            else
+              echo "::warning::Could not download/extract pin store artifact $pins_art — treating store as empty"
+            fi
+            rm -rf pins_store
           fi
           if [ "${{ inputs.nomount_pin_last_success }}" = "true" ]; then
             stored_nm="$(jq -r '.nomount_commit // empty' <<<"$PINS_JSON")"
@@ -2229,8 +2254,7 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       GH_TOKEN: ${{ github.token }}
-      PINS_BRANCH: ci/last-success-pins
-      PINS_PATH: pins.json
+      PINS_ARTIFACT: last-success-pins
     steps:
       - name: 📌 Store effective refs (Root manager / SUSFS per GKI / NoMount)
         shell: bash
@@ -2239,7 +2263,6 @@ jobs:
         run: |
           set -euo pipefail
           echo "::group::Record last-successful pins"
-          REPO="${{ github.repository }}"
 
           new_pins=$(jq -n \
             --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -2270,41 +2293,38 @@ jobs:
               )
             }')
 
-          # Merge with previous store so SUSFS pins of GMKIs not built in this
-          # run survive; Root manager / NoMount always reflect the latest success.
+          # Merge with the previous pin artifact so SUSFS pins of GMKIs not
+          # built in this run survive; Root manager / NoMount always reflect
+          # the latest success. (Pin store = ONE rolling artifact, never a
+          # git branch: zero history buildup, zero ref writes, nothing to
+          # delete before a rename, immune to push-trigger loops.)
           old_pins="{}"
-          raw="$(gh api "repos/$REPO/contents/$PINS_PATH?ref=$PINS_BRANCH" --jq '.content' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)"
-          if [ -n "$raw" ] && echo "$raw" | jq -e . >/dev/null 2>&1; then
-            old_pins="$raw"
+          old_art="$(gh api "repos/${{ github.repository }}/actions/artifacts?name=${PINS_ARTIFACT}&per_page=100" \
+            --jq '[.artifacts[] | select(.expired == false)] | sort_by(.id) | last | .id // empty' 2>/dev/null || true)"
+          if [ -n "$old_art" ]; then
+            rm -rf pins_prev && mkdir -p pins_prev
+            if gh api "repos/${{ github.repository }}/actions/artifacts/$old_art/zip" > pins_prev/store.zip 2>/dev/null \
+               && unzip -oq pins_prev/store.zip -d pins_prev \
+               && [ -f pins_prev/pins.json ]; then
+              raw="$(cat pins_prev/pins.json)"
+              if [ -n "$raw" ] && echo "$raw" | jq -e . >/dev/null 2>&1; then
+                old_pins="$raw"
+                echo "  📥 Previous pin artifact $old_art loaded"
+              else
+                echo "::warning::Previous pin artifact exists but is not valid JSON — starting a fresh store"
+              fi
+            else
+              echo "::warning::Could not download previous pin artifact $old_art — starting a fresh store"
+            fi
+            rm -rf pins_prev
           fi
 
           merged=$(jq -n --argjson new "$new_pins" --argjson old "$old_pins" \
             '$new + {susfs: (($old.susfs // {}) + ($new.susfs // {}))}')
 
-          # Store as a single parentless commit force-pinned to the pins branch.
-          # (The Actions *variables* REST API needs a dedicated "Variables" repo
-          # permission that no workflow permissions block can grant to GITHUB_TOKEN
-          # — it 403s — while git-data writes only need contents: write, which this
-          # workflow already runs with.)
-          echo "  Writing pins to branch $PINS_BRANCH…"
-          tree_payload=$(jq -n --arg p "$PINS_PATH" --arg v "$merged" \
-            '{tree: [{path: $p, mode: "100644", type: "blob", content: $v}]}')
-          if ! tree_sha=$(gh api -X POST "repos/$REPO/git/trees" --input - <<<"$tree_payload" --jq '.sha' 2>gh_err.txt); then
-            echo "::error::Creating pins tree failed:"; sed -n '1,5p' gh_err.txt; exit 1
-          fi
-          commit_payload=$(jq -n --arg t "$tree_sha" \
-            '{message: "📌 Last-successful pins (run #${{ github.run_number }})", tree: $t}')
-          if ! commit_sha=$(gh api -X POST "repos/$REPO/git/commits" --input - <<<"$commit_payload" --jq '.sha' 2>gh_err.txt); then
-            echo "::error::Creating pins commit failed:"; sed -n '1,5p' gh_err.txt; exit 1
-          fi
-          ref_payload=$(jq -n --arg s "$commit_sha" '{sha: $s, force: true}')
-          if gh api -X PATCH "repos/$REPO/git/refs/heads/$PINS_BRANCH" --input - <<<"$ref_payload" >/dev/null 2>&1; then
-            echo "  ✅ Updated pins branch $PINS_BRANCH → $commit_sha"
-          elif gh api -X POST "repos/$REPO/git/refs" --input - <<<"$(jq -n --arg r "refs/heads/$PINS_BRANCH" --arg s "$commit_sha" '{ref: $r, sha: $s}')" >/dev/null 2>&1; then
-            echo "  ✅ Created pins branch $PINS_BRANCH → $commit_sha"
-          else
-            echo "::error::Could not point refs/heads/$PINS_BRANCH at $commit_sha:"; sed -n '1,5p' gh_err.txt 2>/dev/null || true; exit 1
-          fi
+          printf '%s' "$merged" > pins.json
+          jq -e . pins.json >/dev/null || { echo "::error::Generated pins.json is not valid JSON"; exit 1; }
+          echo "  ✅ pins.json ready: $(jq -c . pins.json)"
 
           {
             echo "## 📌 Last-successful pins recorded"
@@ -2318,13 +2338,52 @@ jobs:
             echo "**NoMount:** → \`${{ needs.resolve-nomount.outputs.nomount_commit }}\`"
             echo ""
             echo "**SUSFS pins in store (per GKI/KMI):**"
-            echo '```'
+            echo '\`\`\`'
             jq -r '.susfs | to_entries[] | "\(.key) → \(.value)"' <<<"$merged"
-            echo '```'
+            echo '\`\`\`'
             echo ""
             echo "> Next run with a **\"Same as last successful run\"** toggle ON reuses exactly these refs."
-            echo "> Store location: branch \`ci/last-success-pins\` → \`pins.json\` (auto-maintained; deleting the branch resets all toggles to first-run behavior)."
+            echo "> Store location: single rolling artifact \`${PINS_ARTIFACT}\` (always overwritten, 90-day retention — no git history, no branches)."
           } >> "$GITHUB_STEP_SUMMARY"
 
           echo "::endgroup::"
           echo "✅ Pins recorded"
+
+      - name: ⬆️ Publish pin store (single rolling artifact, 90-day retention)
+        id: upload-pins
+        uses: actions/upload-artifact@v7
+        with:
+          name: last-success-pins
+          path: pins.json
+          if-no-files-found: error
+          retention-days: 90
+          archive: false
+
+      - name: 🧹 Prune superseded pin artifacts (keep only the latest)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::Prune old pin artifacts"
+          keep="${{ steps.upload-pins.outputs.artifact-id }}"
+          if [ -z "$keep" ]; then
+            keep="$(gh api "repos/${{ github.repository }}/actions/artifacts?name=${PINS_ARTIFACT}&per_page=100" \
+              --jq '[.artifacts[] | select(.expired == false)] | sort_by(.id) | last | .id // empty')"
+          fi
+          if [ -z "$keep" ]; then
+            echo "::error::No live ${PINS_ARTIFACT} artifact found after upload"
+            exit 1
+          fi
+          deleted=0
+          while read -r art_id; do
+            if [ -z "$art_id" ]; then continue; fi
+            if [ "$art_id" = "$keep" ]; then continue; fi
+            if gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$art_id" >/dev/null 2>&1; then
+              echo "  🗑️  deleted superseded pin artifact $art_id"
+              deleted=$((deleted + 1))
+            else
+              echo "::warning::could not delete superseded pin artifact $art_id — 90-day retention will reap it"
+            fi
+          done < <(gh api "repos/${{ github.repository }}/actions/artifacts?name=${PINS_ARTIFACT}&per_page=100" \
+            --jq '.artifacts[] | select(.expired == false) | .id')
+          echo "  ✅ Pin store is singular: kept artifact $keep, pruned $deleted superseded"
+          echo "::endgroup::"
