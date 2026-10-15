@@ -91,7 +91,7 @@ jobs:
         run: |
           set -euo pipefail
           c() { jq -r --arg k "$1" '.[$k] // 0' sanitize-report.json; }
-          total=$(jq '[.[]] | add // 0' sanitize-report.json)
+          total=$(jq '.change_entries // 0' sanitize-report.json)
           {
             echo "## 🧽 Sync sanitizer"
             echo

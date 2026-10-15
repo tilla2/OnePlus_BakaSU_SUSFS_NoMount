@@ -12,8 +12,8 @@ ever maps a -> oos.
 Fork transforms applied:
   1. configs/ and manifests/: ``oos1x`` directories -> ``a1x`` (merge-safe).
   2. configs: ``os_version`` OOS1x -> A1x.
-  3. configs: fork/upstream-branded ``uname`` placeholders (OP-RESUKISU,
-     OP-BAKASU, OP-WILD, OP-KSUN, any ``OP-<WORD>``) are replaced by the
+  3. configs: fork/upstream-branded ``uname`` placeholders (any
+     ``OP-<WORD>`` value, e.g. OP-BAKASU, OP-WILD, OP-KSUN) are replaced by the
      device's genuine stock suffix from ``scripts/sync/stock_unames.json``,
      or by an empty string when no genuine suffix is known.
   4. configs: ``root_tag`` is forced to ``ChimeraKernel``.
@@ -50,8 +50,8 @@ UNAME_TABLE = "scripts/sync/stock_unames.json"
 
 # A genuine stock suffix starts with a digit (e.g. "8-g97a9aaefab9a-ab14519050-4k").
 # Any "OP-<WORD>" value is a branding placeholder, never data.
+# Any OP-<WORD> uname is a brand placeholder (OP-BAKASU, OP-WILD, OP-KSUN, the retired fork brand, ...).
 BRANDED_UNAME = re.compile(r"^OP-[A-Za-z0-9]+$")
-KNOWN_BRANDS = ("OP-RESUKISU", "OP-BAKASU", "OP-WILD", "OP-KSUN")
 
 RE_OS_VERSION = re.compile(r'("os_version"\s*:\s*")OOS(1[0-9])(")')
 RE_UNAME = re.compile(r'("uname"\s*:\s*")([^"]*)(")')
@@ -159,7 +159,7 @@ class Sanitizer:
 
             def uname_sub(m: re.Match) -> str:
                 val = m.group(2)
-                if not (val in KNOWN_BRANDS or BRANDED_UNAME.match(val)):
+                if not BRANDED_UNAME.match(val):
                     return m.group(0)
                 stock = self.uname_table.get(key, "")
                 if BRANDED_UNAME.match(stock):
@@ -241,7 +241,7 @@ class Sanitizer:
 
     def report(self) -> str:
         mode = "DRY-RUN (nothing written)" if self.dry_run else "APPLY"
-        total = sum(self.counts.values())
+        total = len(self.log)  # one entry per touched file/path; counters can overlap
         lines = [
             "ChimeraKernel sync sanitizer report",
             f"Mode: {mode}",
@@ -303,7 +303,7 @@ def main() -> int:
     elif diff_path.exists():
         diff_path.unlink()
     # Machine-readable counts for the workflow summary.
-    Path(args.report).with_suffix(".json").write_text(json.dumps(s.counts, indent=2) + "\n", encoding="utf-8")
+    Path(args.report).with_suffix(".json").write_text(json.dumps({**s.counts, "change_entries": len(s.log)}, indent=2) + "\n", encoding="utf-8")
     print("✅ Sanitizer finished")
     return 0
 
