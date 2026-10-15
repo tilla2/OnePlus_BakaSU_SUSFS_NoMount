@@ -1929,7 +1929,7 @@ runs:
           fi
           
           if grep -qF 'if (vma->vm_end > last_vma_end)' ./fs/proc/task_mmu.c && ! grep -qxF 'SUSFS_IS_INODE_SUS_MAP' ./fs/proc/task_mmu.c; then
-            echo "Temporarily expand the `last_vma_end` `if` block to fix a matching issue."
+            echo 'Temporarily expand the `last_vma_end` `if` block to fix a matching issue.'
             perl -i -0pe 's/\t\t\tif \(vma->vm_end > last_vma_end\)\n\t\t\t\tsmap_gather_stats\(vma, &mss, last_vma_end\);/\t\t\tif (vma->vm_end > last_vma_end) {\n\t\t\t\tsmap_gather_stats(vma, \&mss, last_vma_end);\n\t\t\t\tlast_vma_end = vma->vm_end;\n\t\t\t}/' ./fs/proc/task_mmu.c
             fake_patched_expand=1
           fi
@@ -2860,7 +2860,11 @@ runs:
           echo "::endgroup::"
           exit 0
         fi
-        if fetch_patch "$BBR3_BASE/$DEBUGFS_PATCH" /tmp/bbr3_debugfs.patch; then
+        # The debugfs diagnostics patch targets 6.12 only; other KMIs skip it silently.
+        if [ "$KERNEL_VER" != "6.12" ]; then
+          echo "bbrv3-debugfs|skipped" >> "$PS_FILE"
+          echo "✅ BBRv3 debugfs skipped: 6.12-only patch, this kernel is ${KERNEL_VER}"
+        elif fetch_patch "$BBR3_BASE/$DEBUGFS_PATCH" /tmp/bbr3_debugfs.patch; then
           gen_patch bbrv3-debugfs /tmp/bbr3_debugfs.patch
         else
           echo "::warning::BBRv3 debugfs patch unavailable; continuing without it"
