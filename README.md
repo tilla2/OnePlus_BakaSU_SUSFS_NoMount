@@ -10,7 +10,6 @@
 [![OnePlusOSS Tracking Status](https://img.shields.io/badge/OnePlusOSS--Tracker-active-green)](https://github.com/WildKernels/OnePlus_KernelSU_SUSFS/blob/status-page/README.md)
 
 [![Download Releases](https://img.shields.io/badge/Download_Releases-0969da?style=for-the-badge&logo=github&logoColor=white)](https://github.com/tilla2/OnePlus_BakaSU_SUSFS_NoMount/releases)
-[![Deployment Status](https://img.shields.io/github/actions/workflow/status/tilla2/OnePlus_BakaSU_SUSFS_NoMount/deploy-download-page.yml?branch=The-Big-One&style=for-the-badge&label=Deployment%20Status&logo=githubactions&logoColor=white)](https://github.com/tilla2/OnePlus_BakaSU_SUSFS_NoMount/actions/workflows/deploy-download-page.yml)
 
 </div>
 

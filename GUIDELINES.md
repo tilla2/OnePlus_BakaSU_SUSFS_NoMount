@@ -20,7 +20,7 @@ The phrase "Stock ROM (OOS/COS)" in the issue templates refers to the user's act
 
 Every device config carries `"root_tag": "ChimeraKernel"`. The build action's root-tag step keys off this value, so every kernel banner reads `ChimeraKernel@<repository>`. Do not leave a config with an empty root tag and do not introduce a different tag.
 
-The `uname` field carries no fork branding of any kind. It holds either the device's genuine stock kernel suffix (for example `5-g16e473de48a3-abogki462654244-4k`), copied verbatim from a trustworthy source for the same SoC, the same kernel version and the same Android generation, or the empty string when no genuine suffix is known. Placeholders such as `OP-RESUKISU`, `OP-BAKASU`, `OP-WILD`, `OP-KSUN` or any other `OP-<WORD>` value are branding, not data, and are never valid. Never invent a plausible-looking build suffix: an empty uname is honest, a fake one is not. When `uname` is empty the build action appends no branding suffix at all and the local version becomes just `-<android_version>`; non-empty values are capped at 44 characters.
+The `uname` field carries no fork branding of any kind. It holds either the device's genuine stock kernel suffix (for example `5-g16e473de48a3-abogki462654244-4k`), copied verbatim from a trustworthy source for the same SoC, the same kernel version and the same Android generation, or the empty string when no genuine suffix is known. Placeholders such as `OP-BAKASU`, `OP-WILD`, `OP-KSUN`, the retired fork brand or any other `OP-<WORD>` value are branding, not data, and are never valid. Never invent a plausible-looking build suffix: an empty uname is honest, a fake one is not. When `uname` is empty the build action appends no branding suffix at all and the local version becomes just `-<android_version>`; non-empty values are capped at 44 characters.
 
 Genuine suffixes are OS-specific build strings. An A16 suffix is never reused for an A15 or A14 config of the same device. Known-good suffixes are recorded in `scripts/sync/stock_unames.json`, which the sanitizer uses to restore a genuine suffix if an upstream merge reintroduces a placeholder. When a config gains a genuine uname, refresh that table with `python3 scripts/sync/sanitize.py --refresh-uname-table` in the same commit.
 
@@ -87,8 +87,10 @@ Credits are sacred. Every developer and module credit in the README and in the c
 The repository has no Telegram channel of its own and contains no Telegram bot plumbing, no Telegram secrets and no announcement workflows. The only `t.me` links allowed to exist are third-party credits and community references:
 
 - `t.me/RealS3S`, `t.me/maxsteeel`, `t.me/huangdihd` — contributor credits in the README;
+- `t.me/fatalcoder524`, `t.me/TheWildJames` — the remaining entries of the same README contributor row (credits are never trimmed to fit a list);
 - `t.me/danmgk` — module credit badge in the README;
 - `t.me/huangdihd_wildkernel` — the upstream WildKernels community group, referenced in the compatibility notes and in the sync section below.
+- `t.me/WildKernelsTG` — the upstream WildKernels support group, linked as a contact option in the issue-template chooser.
 
 ## 12. Documentation
 

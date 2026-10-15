@@ -1,4 +1,4 @@
-# Complete Guide: Building OnePlus 13R Custom Kernel with ReSukiSU + NoMount
+# Complete Guide: Building OnePlus 13R Custom Kernel with BakaSU + NoMount
 
 This comprehensive guide covers:
 1. **Fetching OnePlus 13R kernel source** (`/get_oki` alternative)
@@ -47,14 +47,14 @@ cd kernel_op13r
 # List all branches to find the right one
 echo ""
 echo "Available branches:"
-git branch -a | grep -i "oos15\|android15\|15\|6.1"
+git branch -a | grep -i "a15\|android15\|15\|6.1"
 
 # Checkout the correct branch
 echo ""
-echo "Attempting to checkout OOS15 branch..."
-git checkout OOS15 2>/dev/null || \
+echo "Attempting to checkout A15 branch..."
+git checkout A15 2>/dev/null || \
 git checkout android-15 2>/dev/null || \
-git checkout oneplus13r-oos15 2>/dev/null || \
+git checkout oneplus13r-a15 2>/dev/null || \
 echo "⚠️  Branch not found. Use 'git branch -a' to see available options and checkout manually."
 
 # Verify kernel version
@@ -78,7 +78,7 @@ echo "📍 Next: Apply NoMount patches"
 # Use OnePlus 12 kernel as base (closest match)
 git clone https://github.com/OnePlusOSS/android_kernel_oneplus_sm8650.git
 cd android_kernel_oneplus_sm8650
-git checkout android15  # or OOS15
+git checkout android15  # or A15
 ```
 
 ### Verification
@@ -160,16 +160,16 @@ make menuconfig
 # Navigate to: Filesystems → NoMount Path Redirection Subsystem → Enable
 ```
 
-### Step 6: Apply ReSukiSU Patches
+### Step 6: Apply BakaSU Patches
 ```bash
 cd kernel_op13r
 
-# Clone ReSukiSU
-git clone https://github.com/ReSukiSU/ReSukiSU.git resukisu_patches
+# Clone BakaSU
+git clone https://github.com/Baka-SU/BakaSU.git bakasu_patches
 
-# Apply KernelSU integration (ReSukiSU is based on KernelSU)
-if [ -f resukisu_patches/kernel/patches/*.patch ]; then
-  for patch in resukisu_patches/kernel/patches/*.patch; do
+# Apply KernelSU integration (BakaSU is based on KernelSU)
+if [ -f bakasu_patches/kernel/patches/*.patch ]; then
+  for patch in bakasu_patches/kernel/patches/*.patch; do
     echo "Applying: $patch"
     patch -p1 < "$patch" || echo "⚠️  Patch conflict detected. Manual review needed."
   done
@@ -236,15 +236,15 @@ mkdir -p custom-kernel && cd custom-kernel
 
 # 2. Fetch kernel
 git clone https://github.com/OnePlusOSS/android_kernel_oneplus_sm8550.git kernel_source
-cd kernel_source && git checkout OOS15 && cd ..
+cd kernel_source && git checkout A15 && cd ..
 
 # 3. Get patches
 git clone --branch dev https://github.com/maxsteeel/nomount.git nomount_patch
-git clone https://github.com/ReSukiSU/ReSukiSU.git resukisu_patches
+git clone https://github.com/Baka-SU/BakaSU.git bakasu_patches
 
 # 4. Run build script
-chmod +x resukisu_patches/scripts/build_kernel.sh
-./resukisu_patches/scripts/build_kernel.sh
+chmod +x bakasu_patches/scripts/build_kernel.sh
+./bakasu_patches/scripts/build_kernel.sh
 
 # 5. Find output
 ls -lh build_output/
@@ -266,6 +266,6 @@ ls -lh build_output/
 
 ## References
 - [NoMount GitHub](https://github.com/maxsteeel/nomount)
-- [ReSukiSU GitHub](https://github.com/ReSukiSU/ReSukiSU)
+- [BakaSU GitHub](https://github.com/Baka-SU/BakaSU)
 - [OnePlus OSS](https://github.com/OnePlusOSS)
 - [KernelSU Documentation](https://kernelsu.org)

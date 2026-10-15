@@ -10,7 +10,7 @@ NC='\033[0m'
 # Configuration
 KERNEL_DIR="kernel_op13r"
 NOMOUNT_PATCH_DIR="nomount_patch"
-RESUKISU_DIR="resukisu_patches"
+BAKASU_DIR="bakasu_patches"
 BUILD_OUTPUT="build_output"
 DEVICE="OnePlus13R"
 KERNEL_VERSION="6.1.118"
@@ -68,10 +68,10 @@ step_apply_patches() {
     cp -v "../$NOMOUNT_PATCH_DIR/kernel/src"/* fs/ 2>/dev/null || true
   fi
   
-  # Apply ReSukiSU patches
-  if [ -d "../$RESUKISU_DIR/kernel/patches" ]; then
-    log_info "Applying ReSukiSU patches..."
-    for patch in "../$RESUKISU_DIR/kernel/patches"/*.patch; do
+  # Apply BakaSU patches
+  if [ -d "../$BAKASU_DIR/kernel/patches" ]; then
+    log_info "Applying BakaSU patches..."
+    for patch in "../$BAKASU_DIR/kernel/patches"/*.patch; do
       if [ -f "$patch" ]; then
         log_info "Applying: $(basename $patch)"
         patch -p1 < "$patch" || log_warn "Failed to apply $(basename $patch)"
@@ -166,7 +166,7 @@ step_collect_output() {
 main() {
   log_info "======================================"
   log_info "OnePlus 13R Custom Kernel Build"
-  log_info "ReSukiSU + NoMount Integration"
+  log_info "BakaSU + NoMount Integration"
   log_info "======================================"
   log_info "Device: $DEVICE"
   log_info "Target Kernel: $KERNEL_VERSION"
