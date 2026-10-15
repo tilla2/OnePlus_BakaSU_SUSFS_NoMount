@@ -33,8 +33,186 @@ on:
           - android13-5.15
           - android12-5.10
         default: OOS14+15+16
-      config_path:
-        description: 'Optional exact config path for a single-device validation build (for example configs/oos16/OP-ACE-2.json)'
+      device_oos14:
+        description: 'Device menu (optional): pick ONE config from configs/oos14/; "none" = unused. Any explicit device selection (menus and/or config_paths) overrides the op_model tree filter'
+        required: false
+        type: choice
+        default: none
+        options:
+          - none
+          - OP-ACE
+          - OP-ACE-2V
+          - OP-ACE-3-PRO
+          - OP-ACE-RACE
+          - OP-NORD-3
+          - OP-PAD-GO
+          - OP-PAD-MT6983
+          - OP-PAD-PRO
+          - OP10pro
+          - OP10r
+          - OP11
+          - OP11r
+          - OP12
+      device_oos15:
+        description: 'Device menu (optional): pick ONE config from configs/oos15/; "none" = unused. Any explicit device selection (menus and/or config_paths) overrides the op_model tree filter'
+        required: false
+        type: choice
+        default: none
+        options:
+          - none
+          - OP-ACE
+          - OP-ACE-2
+          - OP-ACE-2-5.10.209
+          - OP-ACE-2-PRO
+          - OP-ACE-2-PRO-5.15.149
+          - OP-ACE-2V
+          - OP-ACE-2V-5.10.209
+          - OP-ACE-3
+          - OP-ACE-3-5.15.149
+          - OP-ACE-3-PRO
+          - OP-ACE-3-PRO-6.1.75
+          - OP-ACE-3V
+          - OP-ACE-3V-6.1.75
+          - OP-ACE-5
+          - OP-ACE-5-6.1.75
+          - OP-ACE-5-PRO
+          - OP-ACE-5-PRO-6.6.30
+          - OP-ACE-5-RACE
+          - OP-ACE-5-ULTRA
+          - OP-ACE-5-ULTRA-6.6.50
+          - OP-ACE-5.10.209
+          - OP-ACE-5.10.226
+          - OP-ACE-RACE
+          - OP-ACE-RACE-5.10.209
+          - OP-ACE-RACE-5.10.226
+          - OP-NORD-3
+          - OP-NORD-3-5.10.209
+          - OP-NORD-4
+          - OP-NORD-4-6.1.75
+          - OP-NORD-4-CE
+          - OP-NORD-4-CE-5.15.149
+          - OP-NORD-4-CE-5.15.167
+          - OP-NORD-5
+          - OP-NORD-CE-5
+          - OP-NORD-CE4-LITE
+          - OP-NORD-N30-SE
+          - OP-OPEN
+          - OP-OPEN-5.15.149
+          - OP-PAD-2-PRO
+          - OP-PAD-2-PRO-6.6.30
+          - OP-PAD-2-SM8650
+          - OP-PAD-2-SM8650-6.1.75
+          - OP-PAD-3-MT6897
+          - OP-PAD-3-MT6897-6.1.75
+          - OP-PAD-3-SM8750
+          - OP-PAD-3-SM8750-6.6.30
+          - OP-PAD-LITE
+          - OP-PAD-MT6983
+          - OP-PAD-MT6983-5.10.209
+          - OP-PAD-PRO
+          - OP-PAD-PRO-6.1.75
+          - OP10pro
+          - OP10pro-5.10.209
+          - OP10r
+          - OP10t
+          - OP10t-5.10.209
+          - OP10t-5.10.226
+          - OP11
+          - OP11-5.15.149
+          - OP11r
+          - OP11r-5.10.209
+          - OP12
+          - OP12-6.1.75
+          - OP12r
+          - OP12r-5.15.149
+          - OP13-6.6.30
+          - OP13-CPH
+          - OP13-CPH-6.6.56
+          - OP13-PJZ
+          - OP13S
+          - OP13T
+          - OP13T-6.6.56
+          - OP13r
+          - OP13r-6.1.75
+      device_oos16:
+        description: 'Device menu (optional): pick ONE config from configs/oos16/; "none" = unused. Any explicit device selection (menus and/or config_paths) overrides the op_model tree filter'
+        required: false
+        type: choice
+        default: none
+        options:
+          - none
+          - OP-ACE-2
+          - OP-ACE-2-PRO
+          - OP-ACE-2V
+          - OP-ACE-3
+          - OP-ACE-3-5.15.167
+          - OP-ACE-3-PRO
+          - OP-ACE-3-PRO-6.1.118
+          - OP-ACE-3V
+          - OP-ACE-3V-6.1.118
+          - OP-ACE-5
+          - OP-ACE-5-6.1.118
+          - OP-ACE-5-PRO
+          - OP-ACE-5-PRO-6.6.89
+          - OP-ACE-5-RACE
+          - OP-ACE-5-ULTRA
+          - OP-ACE-5-ULTRA-6.6.89
+          - OP-ACE-6
+          - OP-ACE-6-6.6.89
+          - OP-ACE-6-ULTRA
+          - OP-ACE-6T
+          - OP-N6
+          - OP-NORD-3
+          - OP-NORD-4
+          - OP-NORD-4-6.1.118
+          - OP-NORD-4-CE
+          - OP-NORD-5
+          - OP-NORD-5-6.1.118
+          - OP-NORD-6
+          - OP-NORD-CE-5
+          - OP-NORD-CE4-LITE
+          - OP-NORD-CE4-LITE-6.1.118
+          - OP-NORD-CE6-LITE
+          - OP-OPEN
+          - OP-OPEN-5.15.167
+          - OP-PAD-2-MT6991
+          - OP-PAD-2-PRO
+          - OP-PAD-2-PRO-6.6.89
+          - OP-PAD-2-SM8650
+          - OP-PAD-3-MT6897
+          - OP-PAD-3-PRO
+          - OP-PAD-3-SM8750
+          - OP-PAD-3-SM8750-6.6.89
+          - OP-PAD-4
+          - OP-PAD-GO-2
+          - OP-PAD-LITE
+          - OP-PAD-MT6983
+          - OP-PAD-PRO
+          - OP-TURBO-6
+          - OP-TURBO-6V
+          - OP-TURBO-6V-6.1.118
+          - OP-TURBO-6X
+          - OP10pro
+          - OP11
+          - OP11-5.15.167
+          - OP11r
+          - OP12
+          - OP12-6.1.118
+          - OP12r
+          - OP12r-5.15.167
+          - OP13
+          - OP13-6.6.89
+          - OP13S
+          - OP13T
+          - OP13T-6.6.89
+          - OP13r
+          - OP13r-6.1.118
+          - OP15
+          - OP15-6.12.58
+          - OP15T
+          - OP15r
+      config_paths:
+        description: 'Optional extra device config path(s) for multi-device builds — comma, semicolon or space separated, e.g. oos16/OP15.json, oos15/OP13.json (full configs/… paths also accepted, .json optional). Deduplicated and combined with the device menus'
         required: false
         type: string
         default: ''
@@ -147,18 +325,49 @@ jobs:
           echo "::group::Matrix generation"
           
           input="${{ inputs.op_model }}"
-          config_path="${{ inputs.config_path }}"
+          device_oos14="${{ inputs.device_oos14 }}"
+          device_oos15="${{ inputs.device_oos15 }}"
+          device_oos16="${{ inputs.device_oos16 }}"
+          config_paths="${{ inputs.config_paths }}"
           ksu_type="${{ inputs.ksu_type }}"
           ksu_hash="${{ inputs.ksu_branch_or_hash }}"
-          
+
           echo "[" > matrix.json
-          if [ -n "$config_path" ]; then
-            if [[ "$config_path" != configs/*.json || "$config_path" == *".."* || ! -f "$config_path" ]]; then
-              echo "::error::Invalid config_path '$config_path'; expected an existing configs/*.json file"
-              exit 1
+
+          # Explicit device selection: device menus + extra config path(s)
+          declare -a selected=()
+          for spec in "oos14|${device_oos14}" "oos15|${device_oos15}" "oos16|${device_oos16}"; do
+            tree="${spec%%|*}"
+            dev="${spec#*|}"
+            if [ -z "$dev" ]; then dev="none"; fi
+            if [ "$dev" != "none" ]; then
+              selected+=("configs/${tree}/${dev}.json")
             fi
-            all_json_files=("$config_path")
-            echo "Single-device validation config: $config_path"
+          done
+          if [ -n "$config_paths" ]; then
+            config_paths="${config_paths//$'\r'/ }"
+            config_paths="${config_paths//$'\n'/ }"
+            IFS=$',; \t' read -r -a extra_paths <<< "$config_paths"
+            for p in "${extra_paths[@]}"; do
+              if [ -z "$p" ]; then continue; fi
+              p="${p#configs/}"
+              if [[ "$p" != *.json ]]; then p="${p}.json"; fi
+              selected+=("configs/${p}")
+            done
+          fi
+          if [ "${#selected[@]}" -gt 0 ]; then
+            mapfile -t selected < <(printf '%s\n' "${selected[@]}" | awk '!seen[$0]++')
+            for f in "${selected[@]}"; do
+              if [[ "$f" == *".."* || ! -f "$f" ]]; then
+                echo "::error::Unknown device config '$f' — pick from the device menus or use an existing configs/oos<NN>/<device>.json path. Valid configs:"
+                find configs/ -name "*.json" | sort
+                exit 1
+              fi
+            done
+            all_json_files=("${selected[@]}")
+            input="EXPLICIT_SELECTION"
+            echo "✅ Explicit device selection: ${#selected[@]} device(s), op_model filter skipped"
+            printf '  - %s\n' "${all_json_files[@]}"
           else
             mapfile -t all_json_files < <(find configs/ -name "*.json" -print0 | xargs -0 -n1)
           fi
@@ -176,6 +385,9 @@ jobs:
           jq_filter="."
           
           case "$input" in
+            EXPLICIT_SELECTION)
+              # Explicit device selection already fixed the file list — no tree filter
+              ;;
             OOS14+15+16)
               ;;
             OOS15+16)
@@ -1178,6 +1390,10 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       KSU_SHA: ${{ needs.set-op-model.outputs.ksu_resolved_hash }}
+    outputs:
+      manager_repo: ${{ steps.apk-manifest.outputs.manager_repo }}
+      apk_names: ${{ steps.apk-manifest.outputs.apk_names }}
+      apk_sources: ${{ steps.apk-manifest.outputs.apk_sources }}
     steps:
       - name: 📦 Fetch commit-matched manager apps
         run: |
@@ -1189,6 +1405,7 @@ jobs:
             BakaSU)  MANAGER_REPO="Baka-SU/BakaSU" ;;
             KSU)       MANAGER_REPO="tiann/KernelSU" ;;
           esac
+          echo "MANAGER_REPO=${MANAGER_REPO}" >> "$GITHUB_ENV"
           echo "Manager repo: $MANAGER_REPO — resolving commit-exact build for ${KSU_SHA}"
 
           MANAGER_RUN_ID=""
@@ -1202,9 +1419,15 @@ jobs:
               --jq '.artifacts[] | select(.expired == false) | select(.name | test("release"; "i")) | "\(.id) \(.name)"' || true)
             while read -r aid aname; do
               [ -z "$aid" ] && continue
+              ls -1 ./*.apk 2>/dev/null | sort > /tmp/apks-before.txt || true
               gh api "repos/${MANAGER_REPO}/actions/artifacts/${aid}/zip" > "${aname}.zip"
               unzip -o -j "${aname}.zip" '*.apk' -d ./ >/dev/null || true
               rm -f "${aname}.zip"
+              ls -1 ./*.apk 2>/dev/null | sort > /tmp/apks-after.txt || true
+              comm -13 /tmp/apks-before.txt /tmp/apks-after.txt | while read -r new_apk; do
+                [ -z "$new_apk" ] && continue
+                printf '%s\tartifact\t%s\n' "$new_apk" "$aid" >> apk-map.tsv
+              done
             done <<< "$ART_ROWS"
           fi
 
@@ -1219,7 +1442,12 @@ jobs:
             for asset_url in $(gh api "repos/${MANAGER_REPO}/releases/latest" \
               --jq '.assets[] | select(.name | endswith(".apk")) | .browser_download_url'); do
               case "$asset_url" in
-                *release*.apk|*release-*.apk) curl --fail --location --retry 3 --retry-delay 5 -O "$asset_url" || true ;;
+                *release*.apk|*release-*.apk)
+                  curl --fail --location --retry 3 --retry-delay 5 -O "$asset_url" || true
+                  if [ -f "${asset_url##*/}" ]; then
+                    printf '%s\turl\t%s\n' "${asset_url##*/}" "$asset_url" >> apk-map.tsv
+                  fi
+                  ;;
               esac
             done
           fi
@@ -1233,14 +1461,110 @@ jobs:
           ls -l ./*.apk
           echo "✅ Manager APKs fetched (${MANAGER_REPO} @ ${KSU_SHA:0:12})"
 
-      - name: ⬆️ Upload manager APKs
+      - name: 📃 Emit APK manifest for per-file upload
+        id: apk-manifest
         if: always()
+        run: |
+          set -euo pipefail
+          MAP=./manager-apks/apk-map.tsv
+          touch "$MAP"
+          while IFS=$'\t' read -r apk kind ref; do
+            [ -z "$apk" ] && continue
+            case "$apk" in
+              *[!A-Za-z0-9._-]*)
+                echo "::error::Unsafe APK filename for artifact naming: ${apk}"
+                exit 1
+                ;;
+            esac
+          done < "$MAP"
+          for f in ./manager-apks/*.apk; do
+            if [ ! -e "$f" ]; then continue; fi
+            b=$(basename "$f")
+            if ! cut -f1 "$MAP" | grep -Fxq "$b"; then
+              echo "::error::${b} exists in ./manager-apks but is missing from the APK manifest"
+              exit 1
+            fi
+          done
+          APK_COUNT=$(cut -f1 "$MAP" | sort -u | grep -c . || true)
+          if [ "${APK_COUNT:-0}" -eq 0 ]; then
+            echo "::error::APK manifest is empty — no APKs were mapped during fetch"
+            exit 1
+          fi
+          NAMES_JSON=$(cut -f1 "$MAP" | sort -u | jq -R . | jq -sc .)
+          {
+            printf '{'
+            first=1
+            while IFS=$'\t' read -r apk kind ref; do
+              [ -z "$apk" ] && continue
+              if [ $first -eq 0 ]; then printf ','; fi
+              first=0
+              printf '"%s": {"kind": "%s", "ref": "%s"}' "$apk" "$kind" "$ref"
+            done < "$MAP"
+            printf '}'
+          } > sources.json
+          jq -e . sources.json >/dev/null
+          {
+            echo "apk_names=${NAMES_JSON}"
+            echo "apk_sources=$(jq -c . sources.json)"
+            echo "manager_repo=${MANAGER_REPO}"
+          } >> "$GITHUB_OUTPUT"
+          echo "APK manifest: $NAMES_JSON"
+          echo "✅ APK manifest emitted (${APK_COUNT} APK(s) from ${MANAGER_REPO})"
+
+  upload-manager-apks:
+    name: Upload manager APK (${{ matrix.apk }})
+    needs: [fetch-manager-apks]
+    if: |
+      !cancelled() &&
+      inputs.make_release != true &&
+      needs.fetch-manager-apks.result == 'success'
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      APK_NAME: ${{ matrix.apk }}
+      MANAGER_REPO: ${{ needs.fetch-manager-apks.outputs.manager_repo }}
+      APK_SOURCES: ${{ needs.fetch-manager-apks.outputs.apk_sources }}
+    strategy:
+      fail-fast: false
+      matrix:
+        apk: ${{ fromJson(needs.fetch-manager-apks.outputs.apk_names) }}
+    steps:
+      - name: ⬇️ Retrieve ${{ matrix.apk }} from upstream
+        run: |
+          set -euo pipefail
+          KIND=$(printf '%s' "$APK_SOURCES" | jq -r --arg apk "$APK_NAME" '.[$apk].kind // empty')
+          REF=$(printf '%s' "$APK_SOURCES" | jq -r --arg apk "$APK_NAME" '.[$apk].ref // empty')
+          mkdir -p ./apk-out
+          case "$KIND" in
+            artifact)
+              gh api "repos/${MANAGER_REPO}/actions/artifacts/${REF}/zip" > ./src.zip
+              unzip -o -j ./src.zip "$APK_NAME" -d ./apk-out >/dev/null 2>&1 || \
+                unzip -o -j ./src.zip "*/$APK_NAME" -d ./apk-out >/dev/null
+              rm -f ./src.zip
+              ;;
+            url)
+              curl --fail --location --retry 3 --retry-delay 5 -o "./apk-out/$APK_NAME" "$REF"
+              ;;
+            *)
+              echo "::error::No source recorded for ${APK_NAME} — APK manifest incomplete"
+              exit 1
+              ;;
+          esac
+          if [ ! -f "./apk-out/$APK_NAME" ]; then
+            echo "::error::${APK_NAME} missing after retrieval"
+            exit 1
+          fi
+          echo "Retrieved: $(ls -l "./apk-out/$APK_NAME")"
+          echo "✅ Retrieved ${APK_NAME} from ${MANAGER_REPO}"
+
+      - name: ⬆️ Upload ${{ matrix.apk }} as unzipped artifact
         uses: actions/upload-artifact@v7
         with:
-          name: manager-apks
-          path: manager-apks/*.apk
+          path: apk-out/${{ matrix.apk }}
+          archive: false
           if-no-files-found: error
           retention-days: 7
+
   trigger-release:
     needs: [set-op-model, resolve-nomount, build-nomount-module, build]
     runs-on: ubuntu-24.04
