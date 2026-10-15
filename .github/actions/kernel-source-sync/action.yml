@@ -46,6 +46,8 @@ runs:
         import glob
         from concurrent.futures import ThreadPoolExecutor
         import requests
+        import json
+        import tarfile
         
         MAX_WORKERS = (os.cpu_count() or 2) * 4
         NPROC = int(subprocess.check_output("nproc", shell=True).strip())
@@ -158,6 +160,24 @@ runs:
                         extract_cmd = f"tar -I 'pigz -p {NPROC} -b 256' -x --record-size=1M -f {archive_path} -C {path} {strip}"
                         subprocess.run(extract_cmd, shell=True, check=True)
                     
+                    # Provenance sidecar: GitHub source tarballs embed the resolved commit
+                    # SHA in the pax global-header comment; cached toolchain tarballs may
+                    # carry a ref instead (commit stays empty, manifest rev is the fallback).
+                    sync_commit = ""
+                    try:
+                        src_file = os.path.join(shm_workspace, base_filename) if found_in_cache else archive_path
+                        if os.path.isfile(src_file):
+                            with tarfile.open(src_file, "r:gz") as _tf:
+                                _c = _tf.pax_headers.get("comment", "") or ""
+                                if len(_c) == 40 and all(c in "0123456789abcdefABCDEF" for c in _c):
+                                    sync_commit = _c
+                    except Exception:
+                        sync_commit = ""
+                    sync_dest = path if path not in ["./", "."] else "."
+                    with open(os.path.join(sync_dest, ".sync-info.json"), "w") as _si:
+                        json.dump({"repo": name, "path": path, "url": url, "rev": rev,
+                                   "commit": sync_commit, "archive": url,
+                                   "synced_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, _si, indent=2)
                     duration = time.time() - start_time
                     print(f"Synced {name} successfully! ({duration:.2f}s)")
                     return True
@@ -229,6 +249,13 @@ runs:
                 print("::error::One or more projects failed to sync!")
                 print("::endgroup::")
                 exit(1)
+
+        missing_info = [t[0] for t in sync_tasks
+                        if not os.path.isfile(os.path.join(t[1] if t[1] not in ["./", "."] else ".", ".sync-info.json"))]
+        if missing_info:
+            print(f"::error::sync provenance (.sync-info.json) missing for: {', '.join(missing_info)}")
+            print("::endgroup::")
+            exit(1)
         
         print("Processing linkfiles and copyfiles...")
         for path, child in post_process_data:
@@ -254,4 +281,5 @@ runs:
         minutes = int(total_duration // 60)
         seconds = total_duration % 60
         print(f"Kernel Sync completed in {minutes}m {seconds:.2f}s")
+        print(f"✅ Kernel sources synced ({len(sync_tasks)} projects, .sync-info.json provenance recorded)")
         print("::endgroup::")
