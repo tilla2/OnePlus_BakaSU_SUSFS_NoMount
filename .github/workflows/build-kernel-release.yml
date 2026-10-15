@@ -227,9 +227,9 @@ on:
           - KSU
         default: BakaSU
       ksu_branch_or_hash:
-        description: 'KSU branch or commit hash'
+        description: 'KSU branch or commit hash. Default = last verified-good BakaSU commit (BakaSU main currently breaks SUSFS compat). For KSUN/KSU the verified BakaSU default is swapped for main automatically'
         type: string
-        default: 'main'
+        default: '5b76b884c75f729a220bb317aa4a4fc78f0e0e9c'
       ksu_pin_last_success:
         description: 'Root manager: same as last successful run (uses the commit recorded by the last fully successful build; fails loudly if none exists yet)'
         required: false
@@ -276,9 +276,9 @@ on:
         type: string
         default: ''
       android16-6_12_susfs_branch_or_commit:
-        description: 'Enter SusFS Branch or commit hash for android16-6.12'
+        description: 'Enter SusFS Branch or commit hash for android16-6.12. Default = last verified-good SUSFS commit for the pinned BakaSU; clear it to track gki-android16-6.12 (or to let susfs_pin_last_success apply)'
         type: string
-        default: ''
+        default: 'b213c54126fb243595ce7876e91d84d6e0861fec'
       susfs_pin_last_success:
         description: 'SUSFS (per GKI/KMI): same as last successful run for every KMI left empty below — a typed ref for a specific KMI still overrides the pin for that KMI'
         required: false
@@ -472,6 +472,11 @@ jobs:
           
           ksu_type="${{ inputs.ksu_type }}"
           ksu_ref="${{ inputs.ksu_branch_or_hash }}"
+          # The dispatch default is a verified BakaSU commit; it does not exist in KSUN/KSU repos
+          if [ "$ksu_type" != "BakaSU" ] && [ "$ksu_ref" = "5b76b884c75f729a220bb317aa4a4fc78f0e0e9c" ]; then
+            echo "ℹ️  Verified BakaSU default commit is BakaSU-only — using main for $ksu_type"
+            ksu_ref="main"
+          fi
           
           # ── Load "last successful run" pin store (artifact 'last-success-pins', file pins.json) ──
           PINS_JSON="{}"
