@@ -105,7 +105,7 @@ Upstream is `WildKernels/OnePlus_KernelSU_SUSFS`, branch `main`. Synchronisation
 3. Apply the reported changes (rerun locally without `--dry-run`, or apply the published diff), update the device menus for any new configs, and commit.
 4. Open one pull request into `The-Big-One`. A dry run on the result should report "no changes needed".
 
-The sync-sanitize workflow never pushes and never opens pull requests; it only reports and publishes its report and diff as artifacts. Questions about upstream behaviour go to the WildKernels community at `t.me/huangdihd_wildkernel`.
+The sync-sanitize workflow also runs automatically, always as a dry run, on every pull request that touches `configs/`, `manifests/`, `scripts/sync/`, the build action or the workflow itself, so the sync pull request shows the sanitizer verdict as a check. It never pushes and never opens pull requests; it only reports and publishes its report and diff as artifacts. Questions about upstream behaviour go to the WildKernels community at `t.me/huangdihd_wildkernel`.
 
 ## 14. Clean-up policy
 
