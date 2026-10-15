@@ -362,15 +362,13 @@ jobs:
           echo "skip_build=false" >> "$GITHUB_ENV"
           echo "::group::Matrix generation"
 
-          # Dispatch-only workflow: push events get a valid-but-empty matrix so
-          # every downstream job skips cleanly instead of failing on empty inputs.
           if [ "${{ github.event_name }}" = "push" ]; then
             echo "✅ Push event — build-kernel-release is dispatch-only, skipping with an empty matrix"
             echo "skip_build=true" >> "$GITHUB_ENV"
             echo "::endgroup::"
             exit 0
           fi
-          
+
           input="${{ inputs.op_model }}"
           device_a14="${{ inputs.device_a14 }}"
           device_a15="${{ inputs.device_a15 }}"
@@ -381,7 +379,6 @@ jobs:
 
           echo "[" > matrix.json
 
-          # Explicit device selection: device menus + extra config path(s)
           declare -a selected=()
           for spec in "a14|${device_a14}" "a15|${device_a15}" "a16|${device_a16}"; do
             tree="${spec%%|*}"
@@ -428,12 +425,11 @@ jobs:
             fi
           done
           echo "]" >> matrix.json
-          
+
           jq_filter="."
-          
+
           case "$input" in
             EXPLICIT_SELECTION)
-              # Explicit device selection already fixed the file list — no tree filter
               ;;
             A14+A15+A16)
               ;;
@@ -453,12 +449,10 @@ jobs:
               jq_filter="map(select(.os_version == \"A14\"))"
               ;;
             android*-*.*)
-              # Extract android version and kernel version
               IFS='-' read -r av kv <<< "$input"
-              
-              # Build android*-* only for A15 and A16
+
               jq_filter="map(select(.os_version == \"A15\" or .os_version == \"A16\")) | map(select(.android_version == \"$av\" and .kernel_version == \"$kv\"))"
-              
+
               echo "ℹ️  Android-Kernel filter applied: $av-$kv"
               echo "   Restricted to: A15 and A16 only"
               ;;
@@ -467,17 +461,17 @@ jobs:
               jq_filter="map(select(false))"
               ;;
           esac
-          
+
           filtered=$(jq -c "$jq_filter" matrix.json)
           count=$(jq 'length' <<<"$filtered")
-          
+
           filtered=$(echo "$filtered" | jq '
             sort_by(
               (.os_version | gsub("A"; "") | tonumber) * -1,
               .model
             )
           ')
-          
+
           if [ "$count" -eq 0 ]; then
             echo "::error::No config files found for input '$input' after applying filters!"
             echo ""
@@ -485,20 +479,19 @@ jobs:
             jq -r '.[] | "  - \(.model) (\(.os_version), \(.android_version)-\(.kernel_version))"' matrix.json
             exit 1
           fi
-          
-          # Inject KSU type and hash into every device config
+
           merged_matrix=$(jq \
             --arg ksu_type "$ksu_type" \
             --arg ksu_hash "$ksu_hash" \
             '[.[] | . + {ksu_type: $ksu_type, ksu_hash: $ksu_hash}]' \
             <<<"$filtered")
           final_count=$(echo "$merged_matrix" | jq 'length')
-          
+
           echo "✅ Found $final_count device(s) to build"
           echo ""
           echo "Selected devices:"
           jq -r '.[] | "  - \(.model) (\(.os_version), \(.android_version)-\(.kernel_version), \(.ksu_type) - \(.ksu_hash))"' <<<"$merged_matrix"
-          
+
           echo "count=$count" >> "$GITHUB_OUTPUT"
           echo "$merged_matrix" > filtered_matrix.json
           echo "::endgroup::"
@@ -524,35 +517,30 @@ jobs:
 
           ksu_type="${{ inputs.ksu_type }}"
           ksu_ref="${{ inputs.ksu_branch_or_hash }}"
-          
+
           # ── Load "last successful run" pin store (artifact 'last-success-pins') ──
-          # Only hits the API when a pin toggle is actually requested — with
-          # pin_last_success=none the store is never read (no chatter, no warnings).
           PINS_JSON="{}"
           if [ "${{ inputs.pin_last_success }}" != "none" ]; then
             pins_art="$(gh api "repos/${{ github.repository }}/actions/artifacts?name=last-success-pins&per_page=100" \
               --jq '[.artifacts[] | select(.expired == false)] | sort_by(.id) | last | .id // empty' 2>/dev/null || true)"
             if [ -z "$pins_art" ]; then
-              # upload-artifact@v7 (archive: false) stores under the path basename:
-              # pre-fix stores live under the legacy name 'pins.json' — try it too
               pins_art="$(gh api "repos/${{ github.repository }}/actions/artifacts?name=pins.json&per_page=100" \
                 --jq '[.artifacts[] | select(.expired == false)] | sort_by(.id) | last | .id // empty' 2>/dev/null || true)"
             fi
             if [ -n "$pins_art" ]; then
               rm -rf pins_store && mkdir -p pins_store
-              if gh api "repos/${{ github.repository }}/actions/artifacts/$pins_art/zip" > pins_store/pins.zip 2>/dev/null \
-                 && unzip -oq pins_store/pins.zip -d pins_store \
-                 && { [ -f pins_store/last-success-pins ] || [ -f pins_store/pins.json ]; }; then
-                pins_raw="$(cat pins_store/last-success-pins 2>/dev/null || true)"
-                [ -n "$pins_raw" ] || pins_raw="$(cat pins_store/pins.json 2>/dev/null || true)"
+              gh api "repos/${{ github.repository }}/actions/artifacts/$pins_art/zip" > pins_store/dl.bin 2>/dev/null || true
+              if [ "$(head -c 2 pins_store/dl.bin 2>/dev/null)" = "PK" ]; then
+                unzip -oq pins_store/dl.bin -d pins_store || true
+              else
+                mv pins_store/dl.bin pins_store/last-success-pins 2>/dev/null || true
+              fi
+              pins_raw="$(cat pins_store/last-success-pins 2>/dev/null || true)"
+              [ -n "$pins_raw" ] || pins_raw="$(cat pins_store/pins.json 2>/dev/null || true)"
                 if [ -n "$pins_raw" ] && echo "$pins_raw" | jq -e . >/dev/null 2>&1; then
                   PINS_JSON="$pins_raw"
                   echo "📌 Pin store loaded from artifact $pins_art: $(jq -c . <<<"$pins_raw")"
-                else
-                  echo "::warning::Pin store artifact exists but is not valid JSON — ignoring it"
                 fi
-              else
-                echo "::warning::Could not download/extract pin store artifact $pins_art — treating store as empty"
               fi
               rm -rf pins_store
             else
@@ -596,10 +584,10 @@ jobs:
             KSU_REPO_OWNER="tiann"
             KSU_REPO_NAME="KernelSU"
           fi
-          
+
           HEAD_REF="refs/heads/${ksu_ref}"
           TAG_REF="refs/tags/${ksu_ref}"
-          
+
           QUERY='query($owner: String!, $name: String!, $headRef: String!, $tagRef: String!, $objRef: String!) {
             repository(owner: $owner, name: $name) {
               hb: ref(qualifiedName: $headRef) { t: target { ... on Commit { o: oid } } }
@@ -607,49 +595,47 @@ jobs:
               ho: object(expression: $objRef) { ... on Commit { o: oid } }
             }
           }'
-          
+
           MAX_RETRIES=3
           RETRY_COUNT=0
           RETRY_DELAY=5 # Seconds to wait between retries
-          
+
           echo "Resolving $ksu_type hash ($ksu_ref)..."
-          
+
           until [ $RETRY_COUNT -ge $MAX_RETRIES ]; do
             RESULT=$(gh api graphql -f query="$QUERY" -f owner="$KSU_REPO_OWNER" -f name="$KSU_REPO_NAME" -f headRef="$HEAD_REF" -f tagRef="$TAG_REF" -f objRef="$ksu_ref" 2>/dev/null)
             EXIT_CODE=$?
-            
+
             if [ $EXIT_CODE -eq 0 ] && [ ! -z "$RESULT" ]; then
               echo "  ✅ API Success"
               break
             fi
-            
+
             RETRY_COUNT=$((RETRY_COUNT + 1))
             echo "::warning::API failed (Attempt $RETRY_COUNT/$MAX_RETRIES). Retrying in ${RETRY_DELAY}s..."
             sleep $RETRY_DELAY
           done
-          
+
           if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
             echo "::error::GitHub API unreachable. Cannot validate $ksu_ref"
             exit 1
           fi
-          
+
           resolved_sha=$(echo "$RESULT" | jq -r '.data.repository | (.hb.t.o // .ht.t.o // .ho.o // "unknown")')
-          
+
           if [ "$resolved_sha" == "unknown" ]; then
             echo "::error::Ref/Hash '$ksu_ref' does not exist in $KSU_REPO_OWNER/$KSU_REPO_NAME"
             exit 1
           fi
-          
+
           echo "  ✅ Resolved: $ksu_type/$ksu_ref → $resolved_sha"
           echo "ksu_resolved_hash=$resolved_sha" >> "$GITHUB_OUTPUT"
-          
-          # Inject ksu_resolved_hash into each device in the matrix
+
           merged_matrix=$(echo "$merged_matrix" | jq  --arg resolved_sha "$resolved_sha" 'map(.ksu_resolved_hash = $resolved_sha)')
-          
-          # SUSFS hash fetch
+
           SUSFS_REPO="https://gitlab.com/simonpunk/susfs4ksu.git"
           GITLAB_PROJECT_PATH="simonpunk/susfs4ksu"
-          
+
           declare -A default_branches=(
             ["android12-5.10"]="gki-android12-5.10"
             ["android13-5.15"]="gki-android13-5.15"
@@ -657,7 +643,7 @@ jobs:
             ["android15-6.6"]="gki-android15-6.6"
             ["android16-6.12"]="gki-android16-6.12"
           )
-          
+
           declare -A user_inputs=(
             ["android12-5.10"]="${{ inputs.android12-5_10_susfs_branch_or_commit }}"
             ["android13-5.15"]="${{ inputs.android13-5_15_susfs_branch_or_commit }}"
@@ -665,24 +651,23 @@ jobs:
             ["android15-6.6"]="${{ inputs.android15-6_6_susfs_branch_or_commit }}"
             ["android16-6.12"]="${{ inputs.android16-6_12_susfs_branch_or_commit }}"
           )
-          
+
           mapfile -t active_keys < <(
             echo "$merged_matrix" \
               | jq -r '.[] | select(.susfs == true) | "\(.android_version)-\(.kernel_version)"' \
               | sort -u
           )
-          
+
           echo "🔍 Resolving SUSFS hashes for: ${active_keys[*]:-none}"
-          
+
           declare -A susfs_hashes
           declare -A susfs_versions_per_key
           SUSFS_CLONE_REPO=""
-          
+
           for key in "${active_keys[@]}"; do
             default_val="${default_branches[$key]}"
             user_val="${user_inputs[$key]:-$default_val}"
             # ── SUSFS: "same as last successful run" for this GKI/KMI ──
-            # Order: dispatch ref > pin > auto (GKI default branch) — same as KSU/NoMount.
             if [ "${{ (inputs.pin_last_success == 'all' || contains(inputs.pin_last_success, 'susfs')) }}" = "true" ] && [ -z "${user_inputs[$key]}" ]; then
               stored_susfs="$(jq -r --arg k "$key" '.susfs[$k] // empty' <<<"$PINS_JSON")"
               if [ -z "$stored_susfs" ]; then
@@ -692,49 +677,45 @@ jobs:
               echo "  📌 SUSFS pin: $key → $stored_susfs (last successful run)"
               user_val="$stored_susfs"
             fi
-            
-            # Build GraphQL query — include blob fetch only when releasing
+
             HASH_QUERY="{ project(fullPath: \"${GITLAB_PROJECT_PATH}\") { repository { ch: commit(ref: \"${user_val}\") { sha } } } }"
             RELEASE_QUERY="{ project(fullPath: \"${GITLAB_PROJECT_PATH}\") { repository { ch: commit(ref: \"${user_val}\") { sha } blobs(paths: [\"kernel_patches/include/linux/susfs.h\"], ref: \"${user_val}\") { nodes { rawBlob } } } } }"
-            
+
             if [ "${{ contains(inputs.run_mode, 'release') }}" = "true" ]; then
               GL_QUERY="$RELEASE_QUERY"
             else
               GL_QUERY="$HASH_QUERY"
             fi
-            
+
             MAX_RETRIES=3
             RETRY_COUNT=0
             RETRY_DELAY=5
             resolved=""
-            
+
             until [ $RETRY_COUNT -ge $MAX_RETRIES ]; do
               RESPONSE=$(curl -s --fail -G "https://gitlab.com/api/graphql" --data-urlencode "query=$GL_QUERY")
               EXIT_CODE=$?
-              
+
               if [ $EXIT_CODE -eq 0 ] && [ -n "$RESPONSE" ]; then
                 resolved=$(echo "$RESPONSE" | jq -r '.data.project.repository.ch.sha // empty')
                 if [ -n "$resolved" ] && [ "$resolved" != "null" ]; then
                   echo "  ✅ Query for $key Success"
-                  
+
                   if [ "${{ contains(inputs.run_mode, 'release') }}" = "true" ]; then
                     extracted=$(echo "$RESPONSE" | jq -r '.data.project.repository.blobs.nodes[0].rawBlob // empty' | grep '#define SUSFS_VERSION' | awk -F'"' '{print $2}')
                     susfs_versions_per_key[$key]="${extracted:-unknown}"
                     echo "  ✅ $key → SUSFS_VERSION = ${extracted:-unknown}"
                   fi
-                  
+
                   break
                 fi
               fi
-              
+
               RETRY_COUNT=$((RETRY_COUNT + 1))
               echo "::warning::GitLab GraphQL API failed (Attempt $RETRY_COUNT/$MAX_RETRIES). Retrying..."
               sleep $RETRY_DELAY
             done
-            
-            # Fallback: GitLab GraphQL unreachable -> git clone susfs4ksu
-            # once and extract every key's data from the clone (resolved SHA;
-            # and in release mode SUSFS_VERSION from susfs.h).
+
             if [ -z "$resolved" ] || [ "$resolved" = "null" ]; then
               echo "::warning::GitLab GraphQL unreachable for '$key'; falling back to git clone of susfs4ksu"
               if [ -z "$SUSFS_CLONE_REPO" ]; then
@@ -759,35 +740,30 @@ jobs:
                 echo "  ✅ $key → resolved via clone fallback: $resolved"
               fi
             fi
-            
-            # Final Validation — SUSFS hash
+
             if [ -z "$resolved" ] || [ "$resolved" = "null" ]; then
               echo "::error::Could not resolve SUSFS ref '$user_val' for $key on GitLab (GraphQL and git-clone fallback both failed)."
               exit 1
             fi
-            
-            # Final Validation — SUSFS version
+
             if [ "${{ contains(inputs.run_mode, 'release') }}" = "true" ] && [ "${susfs_versions_per_key[$key]:-unknown}" = "unknown" ]; then
               echo "::error::Could not extract SUSFS_VERSION from susfs.h for '$key' after $MAX_RETRIES attempts. Cannot proceed with release."
               exit 1
             fi
-            
+
             susfs_hashes["$key"]="$resolved"
             echo "  ✅ Resolved: $key → $resolved"
           done
-          
-          # Write CSV list of active GKI versions
+
           active_gki_keys_csv=$(IFS=','; echo "${active_keys[*]:-}")
           echo "active_gki_keys=$active_gki_keys_csv" >> "$GITHUB_OUTPUT"
-          
-          # Write hash to GITHUB_OUTPUT
+
           echo "susfs_hash_android12_5_10=${susfs_hashes[android12-5.10]:-unknown}" >> "$GITHUB_OUTPUT"
           echo "susfs_hash_android13_5_15=${susfs_hashes[android13-5.15]:-unknown}" >> "$GITHUB_OUTPUT"
           echo "susfs_hash_android14_6_1=${susfs_hashes[android14-6.1]:-unknown}"   >> "$GITHUB_OUTPUT"
           echo "susfs_hash_android15_6_6=${susfs_hashes[android15-6.6]:-unknown}"   >> "$GITHUB_OUTPUT"
           echo "susfs_hash_android16_6_12=${susfs_hashes[android16-6.12]:-unknown}" >> "$GITHUB_OUTPUT"
-          
-          # SUSFS_VERSION — only when releasing
+
           if [ "${{ contains(inputs.run_mode, 'release') }}" = "true" ]; then
             susfs_base_version="unknown"
             for key in "${active_keys[@]}"; do
@@ -797,13 +773,12 @@ jobs:
                 break
               fi
             done
-            
+
             if [ "$susfs_base_version" = "unknown" ]; then
               echo "::error::Could not extract SUSFS_VERSION from susfs.h for any active GKI key. Cannot proceed with release."
               exit 1
             fi
-            
-            # make_release=true: mismatch is a hard error — prevents wrong tag
+
             for key in "${active_keys[@]}"; do
               key_ver="${susfs_versions_per_key[$key]:-unknown}"
               if [ "$key_ver" != "$susfs_base_version" ]; then
@@ -811,11 +786,10 @@ jobs:
                 exit 1
               fi
             done
-            
+
             echo "susfs_base_version=$susfs_base_version" >> "$GITHUB_OUTPUT"
           fi
-          
-          # Inject susfs_resolved_hash into each device in the matrix
+
           susfs_hashes_json=$(jq -n \
             --arg a12 "${susfs_hashes[android12-5.10]:-unknown}" \
             --arg a13 "${susfs_hashes[android13-5.15]:-unknown}" \
@@ -829,7 +803,7 @@ jobs:
               "android15-6.6":  $a15,
               "android16-6.12": $a16
             }')
-          
+
           echo "$susfs_hashes_json" > susfs_lookup_temp.json
           merged_matrix=$(echo "$merged_matrix" | jq \
             --slurpfile hashes_array susfs_lookup_temp.json \
@@ -837,9 +811,9 @@ jobs:
               ($hashes_array[0]) as $hashes |
               [.[] | . + {susfs_resolved_hash: ($hashes["\(.android_version)-\(.kernel_version)"] // "unknown")}]
             ')
-          
+
           rm susfs_lookup_temp.json
-          
+
           merged_matrix=$(echo "$merged_matrix" | jq '
             sort_by(
               (.os_version | gsub("A"; "") | tonumber? // 0) * -1,
@@ -848,9 +822,6 @@ jobs:
           ')
 
           # ── uname resolution: per-KMI dispatch override > config uname > generated (one per kernel line) ──
-          # The override axis is the KMI (android_version-kernel_version) — the same key the SUSFS refs use.
-          # A config folder can host devices on different KMIs (e.g. OP13-6.6.30 lives in a16 but runs android15-6.6),
-          # so the dispatch override follows the kernel, not the config tree.
           declare -A uname_override=(
             ["android12-5.10"]="${{ inputs.android12-5_10_custom_uname }}"
             ["android13-5.15"]="${{ inputs.android13-5_15_custom_uname }}"
@@ -868,8 +839,7 @@ jobs:
               echo "✅ custom_uname_$kmi accepted: $ov"
             fi
           done
-          # Generation key: KMI + kernel line. The config only records major.minor; a trailing -X.Y.Z in the
-          # model name (e.g. OP15-6.12.58) pins the sublevel, so such devices get their own suffix.
+          # gen key = KMI + kernel line; trailing -X.Y.Z in model name pins the sublevel
           declare -A gen_cache=()
           uname_rows=()
           resolved_json="[]"
@@ -908,12 +878,11 @@ jobs:
           printf '%s\n' "${uname_rows[@]}"
           echo "✅ uname resolved for $(jq length <<<"$merged_matrix") device(s) (override > config > generated)"
           echo "$merged_matrix" > final_matrix_temp.json
-          
-          # Recalculate wrapped with updated matrix and write output
+
           wrapped=$(jq --slurp '{ include: .[] }' final_matrix_temp.json)
           echo "matrix=$(echo "$wrapped" | jq -c .)" >> "$GITHUB_OUTPUT"
           rm -f final_matrix_temp.json filtered_matrix.json
-          
+
           echo "::endgroup::"
           echo "✅ Build matrix generated"
 
@@ -931,7 +900,7 @@ jobs:
         run: |
           ksu_type="${{ inputs.ksu_type }}"
           ksu_ref="${{ inputs.ksu_branch_or_hash }}"
-          
+
           ksu_display=""
           if [ "$ksu_type" = "BakaSU" ] || [ "$ksu_type" = "KSU" ] || [ "$ksu_type" = "KSUN" ]; then
             if [[ "$ksu_ref" =~ ^[0-9a-f]{40}$ ]]; then
@@ -940,40 +909,39 @@ jobs:
               ksu_display+="🔀 \`$ksu_type\`, \`$ksu_ref\` (\`${{ steps.set-matrix-final.outputs.ksu_resolved_hash }}\`)"
             fi
           fi
-          
+
           build_ts_input="${{ inputs.build_timestamp }}"
           if [ -z "$build_ts_input" ]; then
             build_ts_display="⏱️ auto (current build time)"
           else
             build_ts_display="📌 \`$build_ts_input\`"
           fi
-          
+
           {
             cat << 'EOF'
           ## 🎯 Build Plan
-          
+
           **Target:** ${{ inputs.op_model }}  
           **Devices:** ${{ steps.set-matrix-final.outputs.count }}  
-          
+
           **Configuration:**
           EOF
-          
+
             echo "- KSU Config: $ksu_display"
             echo "- Build Timestamp: $build_ts_display"
           echo "- Pin mode (same as last successful run): KSU ${{ (inputs.pin_last_success == 'all' || contains(inputs.pin_last_success, 'ksu')) && 'ON' || 'off' }} · SUSFS ${{ (inputs.pin_last_success == 'all' || contains(inputs.pin_last_success, 'susfs')) && 'ON' || 'off' }} · NoMount ${{ (inputs.pin_last_success == 'all' || contains(inputs.pin_last_success, 'nomount')) && 'ON' || 'off' }}" >> "$GITHUB_STEP_SUMMARY"
-          
+
             cat << 'EOF'
           - Optimization: ${{ inputs.optimize_level }}
           - Run mode: ${{ inputs.run_mode }}
           - Build profile: ${{ inputs.build_profile }}
           - Create Release: ${{ contains(inputs.run_mode, 'release') && '✅ Yes' || '❌ No' }}
           - Sync toolchains: ${{ inputs.mirror_toolchains && '✅ Yes' || '❌ No' }}
-          
+
           **SUSFS Configuration:**
           EOF
           } >> "$GITHUB_STEP_SUMMARY"
-          
-          # Display SUSFS config for each kernel version
+
           declare -A susfs_inputs=(
             ["android12-5.10"]="${{ inputs.android12-5_10_susfs_branch_or_commit }}"
             ["android13-5.15"]="${{ inputs.android13-5_15_susfs_branch_or_commit }}"
@@ -981,7 +949,7 @@ jobs:
             ["android15-6.6"]="${{ inputs.android15-6_6_susfs_branch_or_commit }}"
             ["android16-6.12"]="${{ inputs.android16-6_12_susfs_branch_or_commit }}"
           )
-          
+
           declare -A step_hashes=(
             ["android12-5.10"]="${{ steps.set-matrix-final.outputs.susfs_hash_android12_5_10 }}"
             ["android13-5.15"]="${{ steps.set-matrix-final.outputs.susfs_hash_android13_5_15 }}"
@@ -989,31 +957,26 @@ jobs:
             ["android15-6.6"]="${{ steps.set-matrix-final.outputs.susfs_hash_android15_6_6 }}"
             ["android16-6.12"]="${{ steps.set-matrix-final.outputs.susfs_hash_android16_6_12 }}"
           )
-          
-          # Iterate only on the GKI versions present in this run
+
           IFS=',' read -ra active_keys_display \
             <<< "${{ steps.set-matrix-final.outputs.active_gki_keys }}"
-          
+
           for key in "${active_keys_display[@]}"; do
             value="${susfs_inputs[$key]:-}"
             fetched_hash="${step_hashes[$key]:-unknown}"
-            
+
             if [ -z "$value" ]; then
-              # Auto: no input > hash resolved by ls-remote
               echo "- $key: 🔄 auto (\`$fetched_hash\`)" >> $GITHUB_STEP_SUMMARY
             elif [[ "$value" =~ ^[0-9a-f]{40}$ ]]; then
-              # Manual 40-char hash > direct passthrough
               echo "- $key: 📌 \`$value\`" >> $GITHUB_STEP_SUMMARY
             else
-              # Branch name > show branch + resolved hash
               echo "- $key: 🔀 \`$value\` (\`$fetched_hash\`)" >> $GITHUB_STEP_SUMMARY
             fi
           done
-          
+
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "> **💡 Note:** Hashes are resolved at run time via API calls before builds start." >> $GITHUB_STEP_SUMMARY
-          
-          # Add A15/A16 restriction note for android-kernel filters
+
           if [[ "${{ inputs.op_model }}" == android*-*.* ]]; then
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "> **⚠️ Android-Kernel Filter:** Only A15 and A16 devices will be built for \`${{ inputs.op_model }}\`" >> $GITHUB_STEP_SUMMARY
@@ -1042,33 +1005,28 @@ jobs:
           commit="${{ inputs.nomount_commit }}"
 
           # ── NoMount: "same as last successful run" ──
-          # Only hits the API when a pin toggle is actually requested — with
-          # pin_last_success=none the store is never read (no chatter, no warnings).
           PINS_JSON="{}"
           if [ "${{ inputs.pin_last_success }}" != "none" ]; then
             pins_art="$(gh api "repos/${{ github.repository }}/actions/artifacts?name=last-success-pins&per_page=100" \
               --jq '[.artifacts[] | select(.expired == false)] | sort_by(.id) | last | .id // empty' 2>/dev/null || true)"
             if [ -z "$pins_art" ]; then
-              # upload-artifact@v7 (archive: false) stores under the path basename:
-              # pre-fix stores live under the legacy name 'pins.json' — try it too
               pins_art="$(gh api "repos/${{ github.repository }}/actions/artifacts?name=pins.json&per_page=100" \
                 --jq '[.artifacts[] | select(.expired == false)] | sort_by(.id) | last | .id // empty' 2>/dev/null || true)"
             fi
             if [ -n "$pins_art" ]; then
               rm -rf pins_store && mkdir -p pins_store
-              if gh api "repos/${{ github.repository }}/actions/artifacts/$pins_art/zip" > pins_store/pins.zip 2>/dev/null \
-                 && unzip -oq pins_store/pins.zip -d pins_store \
-                 && { [ -f pins_store/last-success-pins ] || [ -f pins_store/pins.json ]; }; then
-                pins_raw="$(cat pins_store/last-success-pins 2>/dev/null || true)"
-                [ -n "$pins_raw" ] || pins_raw="$(cat pins_store/pins.json 2>/dev/null || true)"
+              gh api "repos/${{ github.repository }}/actions/artifacts/$pins_art/zip" > pins_store/dl.bin 2>/dev/null || true
+              if [ "$(head -c 2 pins_store/dl.bin 2>/dev/null)" = "PK" ]; then
+                unzip -oq pins_store/dl.bin -d pins_store || true
+              else
+                mv pins_store/dl.bin pins_store/last-success-pins 2>/dev/null || true
+              fi
+              pins_raw="$(cat pins_store/last-success-pins 2>/dev/null || true)"
+              [ -n "$pins_raw" ] || pins_raw="$(cat pins_store/pins.json 2>/dev/null || true)"
                 if [ -n "$pins_raw" ] && echo "$pins_raw" | jq -e . >/dev/null 2>&1; then
                   PINS_JSON="$pins_raw"
                   echo "📌 NoMount pin store loaded from artifact $pins_art"
-                else
-                  echo "::warning::Pin store artifact exists but is not valid JSON — ignoring it"
                 fi
-              else
-                echo "::warning::Could not download/extract pin store artifact $pins_art — treating store as empty"
               fi
               rm -rf pins_store
             fi
@@ -1090,9 +1048,7 @@ jobs:
             fi
           fi
 
-          # find_module_for <sha>: locate the successful "build module" CI run for
-          # exactly this SHA and its live module artifact (name carries the short
-          # hash of that commit; the intermediate "module-base" artifact is skipped).
+          # find_module_for <sha>: upstream CI run + live module artifact for this SHA
           find_module_for() {
             local sha="$1" short7 run_id art
             short7="${sha:0:7}"
@@ -1172,7 +1128,7 @@ jobs:
             echo "**Userspace module:** built from source in this run (zig cc) — exact match for \`$commit\`."
           } >> "$GITHUB_STEP_SUMMARY"
           echo "::endgroup::"
-          
+
   build-nomount-module:
     name: Build NoMount module from source
     needs: resolve-nomount
@@ -1210,7 +1166,6 @@ jobs:
           source_dir="${RUNNER_TEMP}/nomount-module-source"
           module_dir="${RUNNER_TEMP}/nomount-metamodule"
           git clone --no-checkout https://github.com/maxsteeel/nomount.git "$source_dir"
-          # full history required: rev-list --count below must not hit a shallow boundary
           git -C "$source_dir" fetch origin "$expected_commit"
           git -C "$source_dir" checkout --detach "$expected_commit"
           actual_commit="$(git -C "$source_dir" rev-parse HEAD)"
@@ -1218,9 +1173,7 @@ jobs:
             echo "NoMount module source mismatch: expected $expected_commit, got $actual_commit." >&2
             exit 1
           fi
-          
-          # Upstream-identical versioning (mirrors maxsteeel/nomount
-          # .github/workflows/build.yml): NAME-BASE_VERSION-<dev|release>-SHORT7-COMMIT_COUNT
+
           NM_COMMIT_COUNT="$(git -C "$source_dir" rev-list --count HEAD)"
           NM_UP_BRANCH="$(gh api "repos/maxsteeel/nomount/commits/${actual_commit}/branches-where-head" --jq '.[0].name' 2>/dev/null || true)"
           [ -n "$NM_UP_BRANCH" ] || NM_UP_BRANCH="${{ inputs.nomount_branch }}"
@@ -1300,11 +1253,6 @@ jobs:
     name: Prepare ccache binary (download once)
     runs-on: ubuntu-24.04
     steps:
-      # Download the custom ccache binary ONCE for the whole matrix and share it as
-      # an artifact. Previously every parallel matrix job curl'd the same GitHub raw
-      # URL simultaneously, which made GitHub's edge rate-limit / 504 the CI IPs and
-      # fail the whole build (the URL is fine in a browser -- it's the ~30x parallel
-      # hammering that triggers the throttle).
       - name: Download custom ccache once
         run: |
           set -uo pipefail
@@ -1387,8 +1335,6 @@ jobs:
             sudo chmod +x /usr/bin/ccache
             echo "✅ installed custom ccache from shared artifact"
           else
-            # prepare_ccache could not fetch it (504/throttle); keep the apt ccache
-            # already installed in 'Install Minimal Dependencies'.
             echo "::warning::shared ccache artifact unavailable; using apt ccache"
           fi
           rm -rf ccache-dl
@@ -1403,7 +1349,7 @@ jobs:
             CACHE_DIR="${{ github.workspace }}/.ccache"
             CCACHE_LOG="${{ github.workspace }}/ccache.log"
             mkdir -p "$CACHE_DIR"
-            
+
             SETTINGS=(
               "CCACHE_DIR=$CACHE_DIR"
               "CCACHE_MAXSIZE=12G"
@@ -1421,17 +1367,17 @@ jobs:
               "CCACHE_LOGFILE=${CCACHE_LOG}"
               "CCACHE_SLOPPINESS=file_macro,time_macros,include_file_mtime,include_file_ctime,pch_defines,system_headers,locale"
             )
-            
+
             for setting in "${SETTINGS[@]}"; do
               export "$setting"
               echo "$setting" >> "$GITHUB_ENV"
             done
-            
+
             if ccache --help 2>&1 | grep -q 'depend_mode'; then
               export CCACHE_DEPEND=true
               echo "CCACHE_DEPEND=true" >> "$GITHUB_ENV"
             fi
-            
+
             echo "✅ ccache configured successfully"
             echo "Current ccache configuration:"
             ccache -p
@@ -1481,7 +1427,7 @@ jobs:
         if: always()
         run: |
           echo "::group::Build Statistics"
-          
+
           echo "Device: ${{ matrix.model }}"
           echo "OS Version: ${{ matrix.os_version }}"
           echo "Kernel: ${{ matrix.android_version }}-${{ matrix.kernel_version }}"
@@ -1489,7 +1435,7 @@ jobs:
             echo "SUSFS Hash: ${{ matrix.susfs_resolved_hash }}"
           fi
           echo "Status: ${{ job.status }}"
-          
+
           if [ "${{ steps.build.outcome }}" = "success" ]; then
             echo ""
             echo "✅ Build completed successfully"
@@ -1503,47 +1449,47 @@ jobs:
             else
               echo "  - KSU: v${{ steps.build.outputs.ksu_version }}"
             fi
-            
+
             echo "ksu_ver=${{ steps.build.outputs.ksu_version }}" >> "$GITHUB_OUTPUT"
-            
+
             if [ "${{ matrix.susfs }}" = true ]; then
               echo "  - SUSFS: ${{ steps.build.outputs.susfs_version }}"
             fi
             echo "  - NoMount dev: ${{ steps.build.outputs.nomount_commit }}"
             echo "  - Build time: ${{ steps.build.outputs.build_time }}s"
-            
+
             if [ "${{ contains(inputs.build_profile, 'clean') }}" != "true" ]; then
               echo "  - ccache hit rate: ${{ steps.build.outputs.ccache_hit_rate }}"
               echo "  - ccache direct rate: ${{ steps.build.outputs.ccache_direct_rate }}"
             else
               echo "  - ccache: disabled (clean build)"
             fi
-            
+
             if [ -n "${{ steps.build.outputs.warnings }}" ]; then
               echo "  - Warnings: ${{ steps.build.outputs.warnings }}"
             fi
           else
             echo "❌ Build failed"
           fi
-          
+
           echo "::endgroup::"
 
       - name: 📝 Job summary
         if: always()
         run: |
           cat >> $GITHUB_STEP_SUMMARY << EOF
-          
+
           ### ${{ matrix.model }} (${{ matrix.os_version }}) - ${{ job.status == 'success' && '✅ Success' || '❌ Failed' }}
-          
+
           **Kernel:** ${{ matrix.android_version }}-${{ matrix.kernel_version }}
           EOF
-          
+
           if [ "${{ matrix.susfs }}" = true ]; then
             cat >> $GITHUB_STEP_SUMMARY << EOF
           **SUSFS Hash:** \`${{ matrix.susfs_resolved_hash }}\`
           EOF
           fi
-          
+
           if [ "${{ steps.build.outcome }}" = "success" ]; then
             cat >> $GITHUB_STEP_SUMMARY << EOF
           | Metric | Value |
@@ -1563,7 +1509,7 @@ jobs:
           | **KSU** | v${{ steps.build.outputs.ksu_version }} |
           EOF
             fi
-            
+
             if [ "${{ matrix.susfs }}" = true ]; then
               cat >> $GITHUB_STEP_SUMMARY << EOF
           | **SUSFS** | ${{ steps.build.outputs.susfs_version }} |
@@ -1573,20 +1519,20 @@ jobs:
           cat >> $GITHUB_STEP_SUMMARY << EOF
           | **Build Time** | ${{ steps.build.outputs.build_time }}s |
           EOF
-            
+
             if [ "${{ contains(inputs.build_profile, 'clean') }}" != "true" ]; then
               cat >> $GITHUB_STEP_SUMMARY << EOF
           | **ccache Hit Rate** | ${{ steps.build.outputs.ccache_hit_rate }} |
           | **ccache Direct Rate** | ${{ steps.build.outputs.ccache_direct_rate }} |
           EOF
             fi
-            
+
             if [ -n "${{ steps.build.outputs.warnings }}" ]; then
               echo "| **Warnings** | ${{ steps.build.outputs.warnings }} |" >> $GITHUB_STEP_SUMMARY
             fi
-            
+
             cat >> $GITHUB_STEP_SUMMARY << EOF
-          
+
           **Image SHA256:** \`${{ steps.build.outputs.image_sha256 }}\`
           **AnyKernel3 Zip SHA256:** \`${{ steps.build.outputs.zip_sha256 }}\`
           EOF
@@ -1596,15 +1542,13 @@ jobs:
         if: always()
         run: |
           echo "::group::Cleanup"
-          
-          # Remove build artifacts but PRESERVE ccache
+
           sudo rm -rf "$GITHUB_WORKSPACE/out" || true
           sudo rm -rf "$GITHUB_WORKSPACE/build" || true
           sudo rm -rf "$GITHUB_WORKSPACE/kernel/out" || true
           sudo rm -rf "$GITHUB_WORKSPACE/.repo" || true
           sudo rm -rf /tmp/* || true
-          
-          # Show ccache stats (don't clear it!)
+
           if command -v ccache >/dev/null 2>&1; then
             echo ""
             echo "📊 ccache statistics after build:"
@@ -1612,13 +1556,11 @@ jobs:
             echo ""
             echo "💾 ccache preserved for next build"
           fi
-          
+
           echo ""
           echo "💽 Final disk usage:"
           df -h /
-          
-          
-          # Verification: removed build trees must be gone; ccache stays untouched
+
           cleanup_failed=0
           for p in "$GITHUB_WORKSPACE/out" "$GITHUB_WORKSPACE/build" "$GITHUB_WORKSPACE/kernel/out" "$GITHUB_WORKSPACE/.repo"; do
             if [ -e "$p" ]; then
@@ -1632,7 +1574,6 @@ jobs:
           fi
           echo "✅ Final cleanup verified — removed build trees gone, ccache untouched, disk reported"
           echo "::endgroup::"
-
 
   fetch-manager-apks:
     name: Fetch manager APKs (artifact, no release)
@@ -1723,7 +1664,6 @@ jobs:
           set -euo pipefail
           MAP=./manager-apks/apk-map.tsv
           touch "$MAP"
-          # Normalize legacy path-prefixed entries (e.g. ./) to bare basenames
           if [ -s "$MAP" ]; then
             sed -i 's|^\./||' "$MAP"
             awk -F'\t' '!seen[$1]++' "$MAP" > "${MAP}.tmp" && mv "${MAP}.tmp" "$MAP"
@@ -1991,7 +1931,6 @@ jobs:
           MANAGER_APK_NAMES="$(ls ./*.apk | xargs -n1 basename | paste -sd',' -)"
           echo "MANAGER_APK_NAMES=${MANAGER_APK_NAMES}" >> "$GITHUB_ENV"
 
-          # NoMount module (always built from source now) — provenance verification
           echo "NoMount resolved to $NM_SHA ($NM_MODE) — using the module built from source in this run"
           MODULE_ZIP="$(find . -type f -name 'NoMount-*.zip' | head -n1)"
           if [ -z "$MODULE_ZIP" ]; then
@@ -2021,11 +1960,9 @@ jobs:
         id: generate-notes
         run: |
           echo "=== Start building the release notes ==="
-          
-          # Collect build metadata
+
           declare -A device_info
-          
-          
+
           for file in $(find downloaded-artifacts -maxdepth 1 -name "AK3_*.zip" -type f | sort); do
             if [ -f "$file" ]; then
               zipname=$(basename "$file" .zip)
@@ -2045,15 +1982,14 @@ jobs:
               device_info["$full_model"]="$model|$os_version|$kernel_version|$ksu_type|$ksu_ver|$susfs_ver|$zipname"
             fi
           done
-          
+
           ksu_type="${{ inputs.ksu_type }}"
           ksu_ref="${{ inputs.ksu_branch_or_hash }}"
           ksu_resolved_hash="${{ needs.set-op-model.outputs.ksu_resolved_hash }}"
-          
+
           OPTIMIZE_LEVEL="${{ inputs.optimize_level }}"
           CLEAN_BUILD="${{ contains(inputs.build_profile, 'clean') }}"
-          
-          # Hash map for GKI version
+
           declare -A susfs_map=(
             ["android12-5.10"]="${{ needs.set-op-model.outputs.susfs_hash_android12_5_10 }}"
             ["android13-5.15"]="${{ needs.set-op-model.outputs.susfs_hash_android13_5_15 }}"
@@ -2061,31 +1997,30 @@ jobs:
             ["android15-6.6"]="${{ needs.set-op-model.outputs.susfs_hash_android15_6_6 }}"
             ["android16-6.12"]="${{ needs.set-op-model.outputs.susfs_hash_android16_6_12 }}"
           )
-          
-          # List of GKI versions present in this run
+
           IFS=',' read -ra active_gki_keys \
             <<< "${{ needs.set-op-model.outputs.active_gki_keys }}"
-          
+
           cat << EOF > release_notes.md
           # 🎯 OnePlus Kernels with $ROOT_DISPLAY, SUSFS $SUSFS_BASE_VERSION, and NoMount
-          
+
           > **Build Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')  
           > **Build ID:** \`${{ github.run_id }}\`  
           > **Workflow:** [\`${{ github.workflow }}\`](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
-          
+
           ---
-          
+
           ## 📦 Built Devices (${#device_info[@]} total)
-          
+
           | Model | OS Version | Kernel Version | Features |
           |-------|------------|----------------|----------|
           EOF
-          
+
           while IFS= read -r full_key; do
             [ -z "$full_key" ] && continue
-            
+
             IFS='|' read -r model os_ver kernel_ver _ _ _ zipfile <<< "${device_info["$full_key"]}"
-            
+
             features=()
             status_file="./downloaded-artifacts/patch-status-${model}_${os_ver}.txt"
             if [[ ! -f "$status_file" ]]; then
@@ -2142,19 +2077,19 @@ jobs:
                 fi
               done
             fi
-            
+
             if [[ "$os_ver" =~ ^A[0-9]+$ ]]; then
               os_display_version="OxygenOS ${os_ver#A}"
             else
               os_display_version=$os_ver
             fi
-            
+
             download_url="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${NEW_TAG}/${zipfile}.zip"
             model_link="[$model]($download_url)"
             printf "| %s | %-10s | %-16s | %-48s |\n" \
               "$model_link" "$os_display_version" "$kernel_ver" "$features_str" >> release_notes.md
           done < <(printf '%s\n' "${!device_info[@]}" | sort)
-          
+
           if [ ${#device_info[@]} -gt 0 ]; then
             first_entry=$(printf '%s\n' "${!device_info[@]}" | sort | head -n1)
             IFS='|' read -r _ _ _ _ ksu_ver_global _ _ <<< "${device_info["$first_entry"]}"
@@ -2163,17 +2098,16 @@ jobs:
             exit 1
           fi
           MANAGER_SRC="${MANAGER_RUN_URL:-}"
-          
+
           cat << EOF >> release_notes.md
-          
+
           ---
-          
+
           ## 🔧 Build Configuration
-          
+
           | Component | Version/Setting |
           |-----------|----------------|
           EOF
-          # Display function: hash → direct hash, branch → branch (hash)
           ksu_display_value() {
             local input="$1"
             local resolved="$2"
@@ -2183,7 +2117,7 @@ jobs:
               echo "$input ($resolved)"
             fi
           }
-          
+
           ksu_display=$(ksu_display_value "$ksu_ref" "$ksu_resolved_hash")
           if [ "$ksu_type" = "KSUN" ]; then
             cat << EOF >> release_notes.md
@@ -2201,15 +2135,15 @@ jobs:
           | **KernelSU Version** | \`$ksu_ver_global\` |
           EOF
           fi
-          
+
           cat << EOF >> release_notes.md
           | **SUSFS Version** | \`$SUSFS_BASE_VERSION\` |
           | **Optimization Level** | \`$OPTIMIZE_LEVEL\` |
           | **Clean Build** | $( [ "$CLEAN_BUILD" = "true" ] && echo "✅ Yes (no ccache)" || echo "❌ No (ccache enabled)" ) |
           | **Compiler** | Clang (version varies by device) |
-          
+
           ### 📌 SUSFS Branch Mapping
-          
+
           | Kernel Version | SUSFS Commit |
           |----------------|--------------|
           $(for key in "${active_gki_keys[@]}"; do
@@ -2335,11 +2269,11 @@ jobs:
           - **[Community Contributors](https://github.com/${{ github.repository }}/graphs/contributors)** - Testing and feedback
 
           ---
-          
+
           **⚡ RealS3S Kernel Lab**
-          
+
           EOF
-          
+
           echo "--- Final Release Notes ---"
           cat release_notes.md
           echo "✅ Release notes generated"
@@ -2378,17 +2312,17 @@ jobs:
         if: success()
         run: |
           cat >> $GITHUB_STEP_SUMMARY << EOF
-          
+
           ---
-          
+
           ## 🎉 Release Created Successfully
-          
+
           **Tag:** [\`${{ env.NEW_TAG }}\`](${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ env.NEW_TAG }})  
           **Kernels:** $(find ./downloaded-artifacts -maxdepth 1 -name "AK3_*.zip" -type f | wc -l)
-          
+
           ### 📦 Assets
           EOF
-          
+
           shopt -s nullglob
           for zip in ./downloaded-artifacts/AK3_*.zip ./downloaded-artifacts/NoMount-*.zip; do
             if [ -f "$zip" ]; then
@@ -2398,7 +2332,6 @@ jobs:
               echo "- \`$name\` (${size_mb} MB)" >> $GITHUB_STEP_SUMMARY
             fi
           done
-
 
   record-last-successful-pins:
     name: 📌 Record refs as "last successful run" pins
@@ -2452,34 +2385,26 @@ jobs:
               )
             }')
 
-          # Merge with the previous pin artifact so SUSFS pins of GMKIs not
-          # built in this run survive; Root manager / NoMount always reflect
-          # the latest success. (Pin store = ONE rolling artifact, never a
-          # git branch: zero history buildup, zero ref writes, nothing to
-          # delete before a rename, immune to push-trigger loops.)
           old_pins="{}"
           old_art="$(gh api "repos/${{ github.repository }}/actions/artifacts?name=${PINS_ARTIFACT}&per_page=100" \
             --jq '[.artifacts[] | select(.expired == false)] | sort_by(.id) | last | .id // empty' 2>/dev/null || true)"
           if [ -z "$old_art" ]; then
-            # pre-fix stores live under the legacy name 'pins.json' (path basename)
             old_art="$(gh api "repos/${{ github.repository }}/actions/artifacts?name=pins.json&per_page=100" \
               --jq '[.artifacts[] | select(.expired == false)] | sort_by(.id) | last | .id // empty' 2>/dev/null || true)"
           fi
           if [ -n "$old_art" ]; then
             rm -rf pins_prev && mkdir -p pins_prev
-            if gh api "repos/${{ github.repository }}/actions/artifacts/$old_art/zip" > pins_prev/store.zip 2>/dev/null \
-               && unzip -oq pins_prev/store.zip -d pins_prev \
-               && { [ -f pins_prev/last-success-pins ] || [ -f pins_prev/pins.json ]; }; then
-              raw="$(cat pins_prev/last-success-pins 2>/dev/null || true)"
-              [ -n "$raw" ] || raw="$(cat pins_prev/pins.json 2>/dev/null || true)"
-              if [ -n "$raw" ] && echo "$raw" | jq -e . >/dev/null 2>&1; then
-                old_pins="$raw"
-                echo "  📥 Previous pin artifact $old_art loaded"
-              else
-                echo "::warning::Previous pin artifact exists but is not valid JSON — starting a fresh store"
-              fi
+            gh api "repos/${{ github.repository }}/actions/artifacts/$old_art/zip" > pins_prev/dl.bin 2>/dev/null || true
+            if [ "$(head -c 2 pins_prev/dl.bin 2>/dev/null)" = "PK" ]; then
+              unzip -oq pins_prev/dl.bin -d pins_prev || true
             else
-              echo "::warning::Could not download previous pin artifact $old_art — starting a fresh store"
+              mv pins_prev/dl.bin pins_prev/last-success-pins 2>/dev/null || true
+            fi
+            raw="$(cat pins_prev/last-success-pins 2>/dev/null || true)"
+            [ -n "$raw" ] || raw="$(cat pins_prev/pins.json 2>/dev/null || true)"
+            if [ -n "$raw" ] && echo "$raw" | jq -e . >/dev/null 2>&1; then
+              old_pins="$raw"
+              echo "  📥 Previous pin artifact $old_art loaded"
             fi
             rm -rf pins_prev
           fi
@@ -2487,9 +2412,6 @@ jobs:
           merged=$(jq -n --argjson new "$new_pins" --argjson old "$old_pins" \
             '$new + {susfs: (($old.susfs // {}) + ($new.susfs // {}))}')
 
-          # The file name IS the stored artifact name: upload-artifact@v7 with
-          # archive: false names the artifact after the path basename, so the
-          # file must be called exactly like the 'name:' input below.
           printf '%s' "$merged" > last-success-pins
           jq -e . last-success-pins >/dev/null || { echo "::error::Generated pin store is not valid JSON"; exit 1; }
           echo "  ✅ last-success-pins ready: $(jq -c . last-success-pins)"
@@ -2553,10 +2475,6 @@ jobs:
             fi
           done < <(gh api "repos/${{ github.repository }}/actions/artifacts?name=${PINS_ARTIFACT}&per_page=100" \
             --jq '.artifacts[] | select(.expired == false) | .id')
-          # Legacy stores: pre-fix runs uploaded the store under the name
-          # 'pins.json' (the file basename). Remove them now that the
-          # canonical artifact above exists — the merge step already carried
-          # their content into this run's store.
           while read -r art_id; do
             if [ -z "$art_id" ]; then continue; fi
             if gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$art_id" >/dev/null 2>&1; then
