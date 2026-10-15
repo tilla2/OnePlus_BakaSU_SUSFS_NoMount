@@ -295,27 +295,27 @@ on:
         type: string
         default: ''
       android12-5_10_custom_uname:
-        description: 'Optional uname suffix override for every device on android12-5.10 in this run (max 44 chars). Leave empty to use per-config uname, falling back to an OEM-like generated suffix.'
+        description: 'Optional uname suffix override for android12-5.10 devices whose config has no uname (max 44 chars). Leave empty to use per-config uname, falling back to an OEM-like generated suffix.'
         required: false
         type: string
         default: ''
       android13-5_15_custom_uname:
-        description: 'Optional uname suffix override for every device on android13-5.15 in this run (max 44 chars). Leave empty to use per-config uname, falling back to an OEM-like generated suffix.'
+        description: 'Optional uname suffix override for android13-5.15 devices whose config has no uname (max 44 chars). Leave empty to use per-config uname, falling back to an OEM-like generated suffix.'
         required: false
         type: string
         default: ''
       android14-6_1_custom_uname:
-        description: 'Optional uname suffix override for every device on android14-6.1 in this run (max 44 chars). Leave empty to use per-config uname, falling back to an OEM-like generated suffix.'
+        description: 'Optional uname suffix override for android14-6.1 devices whose config has no uname (max 44 chars). Leave empty to use per-config uname, falling back to an OEM-like generated suffix.'
         required: false
         type: string
         default: ''
       android15-6_6_custom_uname:
-        description: 'Optional uname suffix override for every device on android15-6.6 in this run (max 44 chars). Leave empty to use per-config uname, falling back to an OEM-like generated suffix.'
+        description: 'Optional uname suffix override for android15-6.6 devices whose config has no uname (max 44 chars). Leave empty to use per-config uname, falling back to an OEM-like generated suffix.'
         required: false
         type: string
         default: ''
       android16-6_12_custom_uname:
-        description: 'Optional uname suffix override for every device on android16-6.12 in this run (max 44 chars). Leave empty to use per-config uname, falling back to an OEM-like generated suffix.'
+        description: 'Optional uname suffix override for android16-6.12 devices whose config has no uname (max 44 chars). Leave empty to use per-config uname, falling back to an OEM-like generated suffix.'
         required: false
         type: string
         default: ''
@@ -820,7 +820,7 @@ jobs:
             )
           ')
 
-          # ── uname resolution: per-KMI dispatch override > config uname > generated (one per kernel line) ──
+          # ── uname resolution: config uname > per-KMI dispatch override > generated (one per kernel line) ──
           declare -A uname_override=(
             ["android12-5.10"]="${{ inputs.android12-5_10_custom_uname }}"
             ["android13-5.15"]="${{ inputs.android13-5_15_custom_uname }}"
@@ -835,7 +835,7 @@ jobs:
                 echo "❌ custom_uname_$kmi '$ov' is invalid (charset A-Za-z0-9._+- , max 44 chars)"
                 exit 1
               fi
-              echo "✅ custom_uname_$kmi accepted: $ov"
+              echo "✅ custom_uname_$kmi valid: $ov (applies only where the config uname is empty)"
             fi
           done
           # gen key = KMI + kernel line; trailing -X.Y.Z in model name pins the sublevel
@@ -844,10 +844,10 @@ jobs:
           resolved_json="[]"
           while IFS=$'\t' read -r idx model osv av kv cfg_uname; do
             ov="${uname_override[${av}-${kv}]:-}"
-            if [ -n "$ov" ]; then
-              val="$ov"; src="override"
-            elif [ -n "$cfg_uname" ]; then
+            if [ -n "$cfg_uname" ]; then
               val="$cfg_uname"; src="config"
+            elif [ -n "$ov" ]; then
+              val="$ov"; src="override"
             else
               gkv="$kv"
               [[ "$model" =~ -([0-9]+\.[0-9]+\.[0-9]+)$ ]] && gkv="${BASH_REMATCH[1]}"
@@ -875,7 +875,7 @@ jobs:
             printf '%s\n' "${uname_rows[@]}"
           } >> "$GITHUB_STEP_SUMMARY"
           printf '%s\n' "${uname_rows[@]}"
-          echo "✅ uname resolved for $(jq length <<<"$merged_matrix") device(s) (override > config > generated)"
+          echo "✅ uname resolved for $(jq length <<<"$merged_matrix") device(s) (config > override > generated)"
           echo "$merged_matrix" > final_matrix_temp.json
 
           wrapped=$(jq --slurp '{ include: .[] }' final_matrix_temp.json)
