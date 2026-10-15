@@ -5,6 +5,8 @@ name: Sync Sanitize (post-merge oos→a normalization)
 # branded unames, enforces the ChimeraKernel root_tag and re-applies the
 # fork transforms. This workflow NEVER pushes and never opens PRs: it
 # reports (dry run) or shows the diff (apply) — the maintainer commits.
+# Pull requests touching configs/manifests/sync/action paths get an automatic
+# dry run (workflow_dispatch only works once the file is on the default branch).
 
 on:
   workflow_dispatch:
@@ -14,6 +16,14 @@ on:
         type: boolean
         required: true
         default: true
+  # Automatic report-only check on PRs that touch sync-relevant paths (always a dry run).
+  pull_request:
+    paths:
+      - 'configs/**'
+      - 'manifests/**'
+      - 'scripts/sync/**'
+      - '.github/actions/build-kernel/action.yml'
+      - '.github/workflows/sync-sanitize.yml'
 
 permissions:
   contents: read
@@ -24,7 +34,7 @@ concurrency:
 
 jobs:
   sanitize:
-    name: 🧽 Sanitize tree (${{ inputs.dry_run && 'dry run' || 'apply' }})
+    name: 🧽 Sanitize tree (${{ (github.event_name != 'workflow_dispatch' || inputs.dry_run) && 'dry run' || 'apply' }})
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -34,7 +44,7 @@ jobs:
       - name: 🧽 Run sanitizer
         id: run
         env:
-          DRY_RUN: ${{ inputs.dry_run }}
+          DRY_RUN: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run }}
         run: |
           set -euo pipefail
           args=()
@@ -58,7 +68,7 @@ jobs:
           echo "✅ Sanitizer run complete (dry_run=${DRY_RUN})"
 
       - name: 🔍 Working-tree changes (apply mode)
-        if: ${{ !inputs.dry_run }}
+        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.dry_run }}
         run: |
           set -euo pipefail
           git add -A -- . ':!sanitize-report.txt' ':!sanitize-report.json' ':!sanitize-changes.diff'
@@ -87,7 +97,7 @@ jobs:
       - name: 📝 Job summary
         if: ${{ always() && hashFiles('sanitize-report.json') != '' }}
         env:
-          DRY_RUN: ${{ inputs.dry_run }}
+          DRY_RUN: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run }}
         run: |
           set -euo pipefail
           c() { jq -r --arg k "$1" '.[$k] // 0' sanitize-report.json; }
