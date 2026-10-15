@@ -21,20 +21,20 @@ on:
         required: true
         type: choice
         options:
-          - OOS14+15+16
-          - OOS15+16
-          - OOS14+15
-          - OOS16
-          - OOS15
-          - OOS14
+          - A14+A15+A16
+          - A15+A16
+          - A14+A15
+          - A16
+          - A15
+          - A14
           - android16-6.12
           - android15-6.6
           - android14-6.1
           - android13-5.15
           - android12-5.10
-        default: OOS14+15+16
-      device_oos14:
-        description: 'Device menu (optional): pick ONE config from configs/oos14/; "none" = unused. Any explicit device selection (menus and/or config_paths) overrides the op_model tree filter'
+        default: A14+A15+A16
+      device_a14:
+        description: 'Device menu (optional): pick ONE config from configs/a14/; "none" = unused. Any explicit device selection (menus and/or config_paths) overrides the op_model tree filter'
         required: false
         type: choice
         default: none
@@ -53,8 +53,8 @@ on:
           - OP11
           - OP11r
           - OP12
-      device_oos15:
-        description: 'Device menu (optional): pick ONE config from configs/oos15/; "none" = unused. Any explicit device selection (menus and/or config_paths) overrides the op_model tree filter'
+      device_a15:
+        description: 'Device menu (optional): pick ONE config from configs/a15/; "none" = unused. Any explicit device selection (menus and/or config_paths) overrides the op_model tree filter'
         required: false
         type: choice
         default: none
@@ -134,8 +134,8 @@ on:
           - OP13T-6.6.56
           - OP13r
           - OP13r-6.1.75
-      device_oos16:
-        description: 'Device menu (optional): pick ONE config from configs/oos16/; "none" = unused. Any explicit device selection (menus and/or config_paths) overrides the op_model tree filter'
+      device_a16:
+        description: 'Device menu (optional): pick ONE config from configs/a16/; "none" = unused. Any explicit device selection (menus and/or config_paths) overrides the op_model tree filter'
         required: false
         type: choice
         default: none
@@ -211,8 +211,9 @@ on:
           - OP15-6.12.58
           - OP15T
           - OP15r
+          - Myron
       config_paths:
-        description: 'Optional extra device config path(s) for multi-device builds — comma, semicolon or space separated, e.g. oos16/OP15.json, oos15/OP13.json (full configs/… paths also accepted, .json optional). Deduplicated and combined with the device menus'
+        description: 'Optional extra device config path(s) for multi-device builds — comma, semicolon or space separated, e.g. a16/OP15.json, a15/OP13.json (full configs/… paths also accepted, .json optional). Deduplicated and combined with the device menus'
         required: false
         type: string
         default: ''
@@ -340,9 +341,9 @@ jobs:
           echo "::group::Matrix generation"
           
           input="${{ inputs.op_model }}"
-          device_oos14="${{ inputs.device_oos14 }}"
-          device_oos15="${{ inputs.device_oos15 }}"
-          device_oos16="${{ inputs.device_oos16 }}"
+          device_a14="${{ inputs.device_a14 }}"
+          device_a15="${{ inputs.device_a15 }}"
+          device_a16="${{ inputs.device_a16 }}"
           config_paths="${{ inputs.config_paths }}"
           ksu_type="${{ inputs.ksu_type }}"
           ksu_hash="${{ inputs.ksu_branch_or_hash }}"
@@ -351,7 +352,7 @@ jobs:
 
           # Explicit device selection: device menus + extra config path(s)
           declare -a selected=()
-          for spec in "oos14|${device_oos14}" "oos15|${device_oos15}" "oos16|${device_oos16}"; do
+          for spec in "a14|${device_a14}" "a15|${device_a15}" "a16|${device_a16}"; do
             tree="${spec%%|*}"
             dev="${spec#*|}"
             if [ -z "$dev" ]; then dev="none"; fi
@@ -374,7 +375,7 @@ jobs:
             mapfile -t selected < <(printf '%s\n' "${selected[@]}" | awk '!seen[$0]++')
             for f in "${selected[@]}"; do
               if [[ "$f" == *".."* || ! -f "$f" ]]; then
-                echo "::error::Unknown device config '$f' — pick from the device menus or use an existing configs/oos<NN>/<device>.json path. Valid configs:"
+                echo "::error::Unknown device config '$f' — pick from the device menus or use an existing configs/a<NN>/<device>.json path. Valid configs:"
                 find configs/ -name "*.json" | sort
                 exit 1
               fi
@@ -403,32 +404,32 @@ jobs:
             EXPLICIT_SELECTION)
               # Explicit device selection already fixed the file list — no tree filter
               ;;
-            OOS14+15+16)
+            A14+A15+A16)
               ;;
-            OOS15+16)
-              jq_filter="map(select(.os_version == \"OOS15\" or .os_version == \"OOS16\"))"
+            A15+A16)
+              jq_filter="map(select(.os_version == \"A15\" or .os_version == \"A16\"))"
               ;;
-            OOS14+15)
-              jq_filter="map(select(.os_version == \"OOS14\" or .os_version == \"OOS15\"))"
+            A14+A15)
+              jq_filter="map(select(.os_version == \"A14\" or .os_version == \"A15\"))"
               ;;
-            OOS16)
-              jq_filter="map(select(.os_version == \"OOS16\"))"
+            A16)
+              jq_filter="map(select(.os_version == \"A16\"))"
               ;;
-            OOS15)
-              jq_filter="map(select(.os_version == \"OOS15\"))"
+            A15)
+              jq_filter="map(select(.os_version == \"A15\"))"
               ;;
-            OOS14)
-              jq_filter="map(select(.os_version == \"OOS14\"))"
+            A14)
+              jq_filter="map(select(.os_version == \"A14\"))"
               ;;
             android*-*.*)
               # Extract android version and kernel version
               IFS='-' read -r av kv <<< "$input"
               
-              # Build android*-* only for OOS15 and OOS16
-              jq_filter="map(select(.os_version == \"OOS15\" or .os_version == \"OOS16\")) | map(select(.android_version == \"$av\" and .kernel_version == \"$kv\"))"
+              # Build android*-* only for A15 and A16
+              jq_filter="map(select(.os_version == \"A15\" or .os_version == \"A16\")) | map(select(.android_version == \"$av\" and .kernel_version == \"$kv\"))"
               
               echo "ℹ️  Android-Kernel filter applied: $av-$kv"
-              echo "   Restricted to: OOS15 and OOS16 only"
+              echo "   Restricted to: A15 and A16 only"
               ;;
             *)
               echo "::warning::Unknown input '$input'. Using empty filter."
@@ -441,7 +442,7 @@ jobs:
           
           filtered=$(echo "$filtered" | jq '
             sort_by(
-              (.os_version | gsub("OOS"; "") | tonumber) * -1,
+              (.os_version | gsub("A"; "") | tonumber) * -1,
               .model
             )
           ')
@@ -768,7 +769,7 @@ jobs:
           
           merged_matrix=$(echo "$merged_matrix" | jq '
             sort_by(
-              (.os_version | gsub("OOS"; "") | tonumber? // 0) * -1,
+              (.os_version | gsub("A"; "") | tonumber? // 0) * -1,
               .model
             )
           ')
@@ -781,6 +782,7 @@ jobs:
           rm final_matrix_temp.json
           
           echo "::endgroup::"
+          echo "✅ Build matrix generated"
 
       - name: Upload build matrix
         uses: actions/upload-artifact@v7
@@ -876,11 +878,12 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "> **💡 Note:** Hashes are resolved at run time via API calls before builds start." >> $GITHUB_STEP_SUMMARY
           
-          # Add OOS restriction note for android-kernel filters
+          # Add A15/A16 restriction note for android-kernel filters
           if [[ "${{ inputs.op_model }}" == android*-*.* ]]; then
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "> **⚠️ Android-Kernel Filter:** Only OOS15 and OOS16 devices will be built for \`${{ inputs.op_model }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "> **⚠️ Android-Kernel Filter:** Only A15 and A16 devices will be built for \`${{ inputs.op_model }}\`" >> $GITHUB_STEP_SUMMARY
           fi
+          echo "✅ Build plan summary written"
 
   resolve-nomount:
     name: Resolve NoMount commit (locked for all kernels)
@@ -1986,8 +1989,8 @@ jobs:
               done
             fi
             
-            if [[ "$os_ver" =~ ^OOS[0-9]+$ ]]; then
-              os_display_version="OxygenOS ${os_ver#OOS}"
+            if [[ "$os_ver" =~ ^A[0-9]+$ ]]; then
+              os_display_version="OxygenOS ${os_ver#A}"
             else
               os_display_version=$os_ver
             fi
@@ -2185,6 +2188,7 @@ jobs:
           
           echo "--- Final Release Notes ---"
           cat release_notes.md
+          echo "✅ Release notes generated"
 
       - name: 🚀 Create GitHub Release
         run: |
