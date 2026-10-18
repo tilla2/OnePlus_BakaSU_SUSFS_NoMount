@@ -573,59 +573,58 @@ runs:
                 }
                 if (lastminus + 1 != firstplus) adjacent = 0
               }
-              # ── v10 universal exact placement ────────────────────────────
-              # The ENTIRE old side of the hunk (context + removals, in hunk
-              # order) must match the target verbatim at exactly one
-              # contiguous site. No partial-anchor scoring: a 3-of-5 context
-              # match is drift, not an anchor. Any interleaving of additions
-              # and removals is handled uniformly (split goto/label pairs
-              # included) because placement derives from the match itself,
-              # not from hunk-shape heuristics. Patch-agnostic by design.
+              if (nremrun > 1 || naddrun > 1 || !adjacent)
+                fail2("complex hunk shape; needs rebase")
               if (nadd > 0) {
                 for (j = 1; j <= n - nadd + 1; j++)
                   if (addeq(j) && anchored(j, nadd) > 0) { printf "ALREADY\n" > "/dev/stderr"; exit 2 }
               }
-              nold = 0
-              for (i = 1; i <= nb; i++) {
-                c = substr(b[i], 1, 1)
-                if (c == "+") continue
-                nold++; otext[nold] = substr(b[i], 2)
+              if (nrem == 0) {
+                best = 0; ties = 0; bestpos = 0
+                for (i = 1; i <= n + 1; i++) {
+                  k = sufmatch(i, nl); t = prefmatch(i, nt)
+                  score = k + t
+                  if (score == 0) continue
+                  ok = 0
+                  for (m = 1; m <= k && !ok; m++) if (nonblank(lctx[nl - k + m])) ok = 1
+                  for (m = 1; m <= t && !ok; m++) if (nonblank(tctx[m])) ok = 1
+                  if (!ok) continue
+                  if (score > best) { best = score; bestpos = i; ties = 1 }
+                  else if (score == best) ties++
+                }
+                if (best == 0) fail2("no recognizable anchor context in target")
+                if (ties > 1) fail2("ambiguous anchor (" ties " equally-good sites)")
+                for (i = 1; i < bestpos; i++) print fl[i]
+                for (m = 1; m <= nadd; m++) print add[m]
+                for (i = bestpos; i <= n; i++) print fl[i]
+                printf "inserted %d line(s) after line %d (anchor score %d)\n", nadd, bestpos - 1, best > "/dev/stderr"
+                exit 0
               }
-              if (nold == 0) fail2("hunk has no old side; not regenerating")
               nsites = 0
-              for (j = 1; j <= n - nold + 1; j++) {
-                ok = 1
-                for (m = 1; m <= nold && ok; m++) if (fl[j + m - 1] != otext[m]) ok = 0
-                if (ok) site[++nsites] = j
+              for (j = 1; j <= n - nrem + 1; j++) if (remeq(j)) site[++nsites] = j
+              if (nsites == 0) fail2("removed lines not found verbatim (semantic drift; needs rebase)")
+              best = -1; ties = 0; bestj = 0
+              for (s = 1; s <= nsites; s++) {
+                j = site[s]
+                k = sufmatch(j, nl); t = prefmatch(j + nrem, nt)
+                score = k + t
+                if (score > best) { best = score; bestj = j; ties = 1 }
+                else if (score == best) ties++
               }
-              if (nsites == 0)
-                fail2("old-side context not present in target verbatim (patch vintage != this tree; not placeable by regen)")
-              if (nsites > 1)
-                fail2("ambiguous: old-side context matches " nsites " distinct sites; refusing to guess")
-              j = site[1]
+              if (nsites > 1 && ties > 1) fail2("ambiguous removed-block site (" nsites " verbatim, " ties " equally good)")
+              j = bestj
               for (i = 1; i < j; i++) print fl[i]
-              fp = j
-              for (i = 1; i <= nb; i++) {
-                c = substr(b[i], 1, 1); ln = substr(b[i], 2)
-                if (c == "+") print ln
-                else if (c == "-") fp++
-                else { print fl[fp]; fp++ }
-              }
-              for (i = fp; i <= n; i++) print fl[i]
-              printf "placed at line %d (full old-side match, unique site; +%d/-%d)\n", j, nadd, nrem > "/dev/stderr"
+              for (m = 1; m <= nadd; m++) print add[m]
+              for (i = j + nrem; i <= n; i++) print fl[i]
+              printf "replaced %d line(s) at line %d with %d\n", nrem, j, nadd > "/dev/stderr"
               exit 0
             }
           ' "$hunk" "$f" > "$tmp_out" 2> "$errf" || rc=$?
           diag=$(paste -sd ';' "$errf" 2>/dev/null || true)
           rm -f "$errf"
           if [ "$rc" = "0" ]; then
-            if ! c_gotos_ok "$tmp_out"; then
-              rm -f "$tmp_out"
-              echo "hunk would split goto/label across functions; refusing to place"
-              return 1
-            fi
             cat "$tmp_out" > "$f"; rm -f "$tmp_out"
-            echo "${diag:-placed (full old-side match, unique site)}"
+            echo "${diag:-regenerated exactly}"
             return 0
           elif [ "$rc" = "2" ]; then
             rm -f "$tmp_out"
@@ -635,54 +634,6 @@ runs:
           rm -f "$tmp_out"
           echo "${diag:-not placeable}"
           return 1
-        }
-        c_gotos_ok() {
-          # Whole-file C control-flow sanity for regenerated files: every
-          # goto X must see an X: label inside the same function. Kernel
-          # style keeps inner braces indented, so a column-0 } always ends
-          # the enclosing function; a candidate label separated from its
-          # goto by such a line lives in a different function and C rejects
-          # the tree at compile time (undeclared label). Failing here keeps
-          # the sandbox edit out of the live tree instead of shipping a
-          # broken kernel. Runs on every regenerated file, patch-agnostic.
-          awk '
-            { fl[++n] = $0 }
-            END {
-              bad = 0
-              for (i = 1; i <= n; i++) {
-                if (fl[i] !~ /goto[ \t]+[A-Za-z_][A-Za-z0-9_]*;/) continue
-                g = fl[i]; sub(/.*goto[ \t]+/, "", g); sub(/;.*/, "", g)
-                ok = 0
-                for (j = 1; j <= n; j++) {
-                  if (fl[j] !~ ("^[ \t]*" g ":")) continue
-                  lo = (i < j ? i : j); hi = (i < j ? j : i); cross = 0
-                  for (k = lo + 1; k < hi; k++) if (fl[k] ~ /^}/) { cross = 1; break }
-                  if (!cross) { ok = 1; break }
-                }
-                if (!ok) {
-                  printf "c_gotos_ok: goto %s (line %d) has no same-function label\n", g, i > "/dev/stderr"
-                  bad = 1
-                }
-              }
-              exit (bad ? 1 : 0)
-            }
-          ' "$1"
-        }
-        blk_already() {
-          # Pure-insertion hunk (no removals) whose added block (>=3 lines) is
-          # already present verbatim in the target => already applied. Checked
-          # before any apply so re-runs can never double-insert at a drifted anchor.
-          local hunk="$1" root="$2" tgt f block
-          tgt=$( { grep -m1 -E '^\+\+\+ ' "$hunk" || true; } | awk '{print $2}' | sed 's#^b/##;s#^a/##' )
-          { [ -n "$tgt" ] && [ "$tgt" != "/dev/null" ]; } || return 1
-          f="$root/$tgt"; [ -f "$f" ] || return 1
-          grep -qE '^-[^-]' "$hunk" && return 1
-          block=$(grep -E '^\+[^+]' "$hunk" | cut -c2-)
-          [ "$(printf '%s\n' "$block" | grep -c .)" -ge 3 ] || return 1
-          # grep -Fz treats a multi-line pattern as any-part-matches: a single
-          # block line present in the file would classify the hunk "already" and
-          # silently drop it. Compare newline-free fingerprints instead.
-          [ -n "$block" ] && tr '\n' '\v' < "$f" | grep -Fq -- "$(printf '%s' "$block" | tr '\n' '\v')"
         }
         gen_patch() {
           local name="$1" patch_file="$2" sed_expr="${3:-}" verify_spec="${4:-}"
@@ -711,11 +662,6 @@ runs:
           hlist=$(ls "$hunk_dir"/*.hunk 2>/dev/null || true)
           : > "${base}/stage.log"
           if [ -z "$hlist" ]; then
-            if blk_already "$src" "$md"; then
-              echo "[patchgen] ${name}: pure-insertion block already present in tree"
-              echo "${name}|already" >> "$psf"
-              return 0
-            fi
             if patch -p1 --forward --fuzz=0 --no-backup-if-mismatch -d "$md" < "$src" >> "${base}/stage.log" 2>&1; then
               staged=1; already_ct=0; failed_ct=0
             elif patch -p1 --dry-run -R --fuzz=0 -d "$md" < "$src" >/dev/null 2>&1; then
@@ -735,58 +681,31 @@ runs:
             fi
           else
             staged=0; already_ct=0; failed_ct=0; failed_list=""
-            # Multi-pass hunk relaxation: hunks anchor independently, so a
-            # hunk whose validity depends on another hunk's insertion (e.g.
-            # a `goto L;` whose `L:` label a later hunk introduces) can fail
-            # a single pass purely because its counterpart is not in the
-            # tree yet. Retry outstanding hunks after every successful
-            # placement round and stop when a round places nothing.
-            # Universal — no per-patch special cases; hunks still unresolved
-            # after the passes fail loudly naming the hunk id.
-            pass=0
-            : > "${base}/pending"
-            for h in $hlist; do printf '%s\n' "$h" >> "${base}/pending"; done
-            while [ -s "${base}/pending" ] && [ "$pass" -le 8 ]; do
-              pass=$((pass+1))
-              progress=0
-              : > "${base}/next"
-              while IFS= read -r h; do
-                htarget=$( { grep -m1 -E '^\+\+\+ ' "$h" || true; } | awk '{print $2}')
-                if blk_already "$h" "$md"; then
+            for h in $hlist; do
+              htarget=$( { grep -m1 -E '^\+\+\+ ' "$h" || true; } | awk '{print $2}')
+              if patch -p1 --forward --fuzz=0 --no-backup-if-mismatch -d "$md" < "$h" >> "${base}/stage.log" 2>&1; then
+                staged=$((staged+1))
+              elif patch -p1 --dry-run -R --fuzz=0 -d "$md" < "$h" >> "${base}/stage.log" 2>&1; then
+                already_ct=$((already_ct+1))
+              else
+                rcv=0
+                verdict=$(regen_hunk "$h" "$md") || rcv=$?
+                if [ "$rcv" = "0" ]; then
+                  staged=$((staged+1))
+                  echo "hunk ${h##*/} regenerated exactly: ${verdict}" >> "${base}/stage.log"
+                  echo "[patchgen] ${name}: REGEN ${h##*/} (${htarget:-?}): ${verdict}"
+                elif [ "$rcv" = "2" ]; then
                   already_ct=$((already_ct+1))
-                elif patch -p1 --forward --fuzz=0 --no-backup-if-mismatch -d "$md" < "$h" >> "${base}/stage.log" 2>&1; then
-                  staged=$((staged+1)); progress=$((progress+1))
-                elif patch -p1 --dry-run -R --fuzz=0 -d "$md" < "$h" >> "${base}/stage.log" 2>&1; then
-                  already_ct=$((already_ct+1))
+                  echo "hunk ${h##*/} already in tree: ${verdict}" >> "${base}/stage.log"
+                  echo "[patchgen] ${name}: SKIP ${h##*/} (${htarget:-?}): already in tree"
                 else
-                  rcv=0
-                  verdict=$(regen_hunk "$h" "$md") || rcv=$?
-                  if [ "$rcv" = "0" ]; then
-                    staged=$((staged+1)); progress=$((progress+1))
-                    echo "hunk ${h##*/} regenerated (pass ${pass}): ${verdict}" >> "${base}/stage.log"
-                    echo "[patchgen] ${name}: REGEN ${h##*/} (${htarget:-?}): ${verdict} [pass ${pass}]"
-                  elif [ "$rcv" = "2" ]; then
-                    already_ct=$((already_ct+1))
-                    echo "hunk ${h##*/} already in tree: ${verdict}" >> "${base}/stage.log"
-                    echo "[patchgen] ${name}: SKIP ${h##*/} (${htarget:-?}): already in tree"
-                  else
-                    printf '%s\n' "$h" >> "${base}/next"
-                  fi
+                  failed_ct=$((failed_ct+1))
+                  echo "hunk not stageable: ${h##*/} (${verdict})" >> "${base}/stage.log"
+                  echo "[patchgen] ${name}: FAIL ${h##*/} (${htarget:-?}): ${verdict}"
+                  failed_list+="$(basename "$h") "
                 fi
-              done < "${base}/pending"
-              mv "${base}/next" "${base}/pending"
-              if [ "$progress" -eq 0 ]; then break; fi
+              fi
             done
-            if [ -s "${base}/pending" ]; then
-              while IFS= read -r h; do
-                failed_ct=$((failed_ct+1))
-                htarget=$( { grep -m1 -E '^\+\+\+ ' "$h" || true; } | awk '{print $2}')
-                echo "hunk not stageable: ${h##*/} (unresolved after ${pass} relaxation passes)" >> "${base}/stage.log"
-                echo "[patchgen] ${name}: FAIL ${h##*/} (${htarget:-?}): unresolved after ${pass} relaxation passes"
-                failed_list+="$(basename "$h") "
-              done < "${base}/pending"
-            fi
-            rm -f "${base}/pending"
             find "$md" -name '*.rej' -delete 2>/dev/null || true
             find "$md" -name '*.orig' -delete 2>/dev/null || true
             echo "[patchgen] ${name}: staged=${staged} already=${already_ct} failed=${failed_ct}"
@@ -829,10 +748,7 @@ runs:
             echo "${name}|failed" >> "$psf"
             return 0
           fi
-          # Verify only the content this run actually placed (regen.patch).
-          # Sampling the full original patch re-flags hunks classified "already"
-          # (e.g. FinaSU drift-fixed files) as misses and reverts a clean apply.
-          if ! verify_applied "$name" "${base}/regen.patch"; then
+          if ! verify_applied "$name" "$src"; then
             {
               echo "[patchgen] ${name} self-verification FAILED (sampled added lines missing after apply)."
               echo "  Reverse-applying the patch to keep the tree consistent."
@@ -2133,22 +2049,6 @@ runs:
       run: |
         set -euo pipefail
         echo "::group::Apply SUSFS kernel patches"
-        # ── Pristine-source guard ────────────────────────────────────────────────────
-        # A restored source cache must NOT already contain fs-side SUSFS. A dirty
-        # snapshot (saved from a mid/post-patch run) surfaces either as a bogus
-        # "already=<most hunks>" classification with a self-verify revert, or as a
-        # single unresolved hunk (task_mmu.c bypass_orig_flow) — both observed on
-        # v10: a refusal with this signature can also stem from SUSFS vintage
-        # drift (a branch-head patch rebased past this tree's GKI baseline),
-        # but that is handled downstream by the exact-placement regen; this
-        # guard only rejects dirty caches.
-        # FinaSU runs restoring a dirty variant-keyed source cache. Fail loud with
-        # the remedy instead of a confusing patchgen cascade.
-        if [ -f "./fs/susfs.c" ] || grep -q "CONFIG_KSU_SUSFS" ./fs/Makefile 2>/dev/null; then
-          echo "::error::Source tree is already SUSFS-patched (fs/susfs.c present or CONFIG_KSU_SUSFS in fs/Makefile) - the restored source cache is dirty. Bump the source cache_key prefix or clear the actions cache for this branch, then re-run."
-          exit 1
-        fi
-
 
         cd "$KERNEL_PLATFORM_FOLDER"
         cd "$COMMON_KERNEL_FOLDER"
@@ -2296,7 +2196,7 @@ runs:
         else
           gen_patch susfs-main "$patch_to_apply" "" "g:fs/Makefile|susfs.o"
           if ! grep -Eq '^susfs-main\|(applied|already)' "$PS_FILE" 2>/dev/null; then
-            echo "::error::SUSFS kernel patch failed to stage at fuzz=0 (resolved SUSFS ref: ${SUSFS_REF:-unknown}, source: ${SUSFS_REF_SOURCE:-unknown}). Known causes: (1) SUSFS vintage drift — the branch-head patch is generated upstream against a newer GKI baseline than this source tree (signature: fs/proc/task_mmu.c show_smaps_rollup context with vma_data_pages()/reworked smap_gather_stats() that older vintages like 6.12.23 lack); dispatch a newer source vintage (e.g. OP15-6.12.58/69/92) or set the susfs input for this KMI explicitly; (2) dirty/restored source cache — the pristine guard above flags the bypass_orig_flow signature; (3) a manual pin that does not match this kernel tree (see patch-faillogs/)"
+            echo "::error::SUSFS kernel patch failed to stage at fuzz=0 (resolved SUSFS ref: ${SUSFS_REF:-unknown}, source: ${SUSFS_REF_SOURCE:-unknown}; check SUSFS vintage vs this tree's GKI baseline - see patch-faillogs/)"
             exit 1
           fi
         fi
@@ -4093,51 +3993,28 @@ runs:
         echo "============================================"
         
         # Dedup gki_defconfig before kconfig runs: fragment appends can repeat
-        
         # symbols already present, and kconfig emits "override: reassigning to
-        
         # symbol" for each duplicate. Keeping the LAST occurrence of each symbol
-        
         # is exactly the semantics kconfig applies — without the warning noise.
-        
         DF="$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig"
-        
         if [ -f "$DF" ]; then
-        
           awk '
-        
             {
-        
               line[NR] = $0; sym = ""
-        
               if (match($0, /^# CONFIG_[A-Za-z0-9_]+ is not set$/)) { s = substr($0, 3); sub(/ is not set$/, "", s); sym = s }
-        
               else if (match($0, /^CONFIG_[A-Za-z0-9_]+=/)) { sym = substr($0, RSTART, RLENGTH - 1) }
-        
               if (sym != "") { last[sym] = NR; seen[sym]++ }
-        
             }
-        
             END {
-        
               for (i = 1; i <= NR; i++) {
-        
                 cur = line[i]; s = ""
-        
                 if (match(cur, /^# CONFIG_[A-Za-z0-9_]+ is not set$/)) { t = substr(cur, 3); sub(/ is not set$/, "", t); s = t }
-        
                 else if (match(cur, /^CONFIG_[A-Za-z0-9_]+=/)) { s = substr(cur, RSTART, RLENGTH - 1) }
-        
                 if (s != "" && seen[s] > 1 && last[s] != i) next
-        
                 print cur
-        
               }
-        
             }
-        
           ' "$DF" > "$DF.tmp" && mv "$DF.tmp" "$DF"
-        
         fi
         
         make LD="$COMMON_KERNEL_FOLDER/ld-wrapper" HOSTLD="$COMMON_KERNEL_FOLDER/ld-wrapper" O="$OUT" gki_defconfig
