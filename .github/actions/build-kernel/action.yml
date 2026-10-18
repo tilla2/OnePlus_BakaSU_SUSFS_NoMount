@@ -623,6 +623,11 @@ runs:
           diag=$(paste -sd ';' "$errf" 2>/dev/null || true)
           rm -f "$errf"
           if [ "$rc" = "0" ]; then
+            if ! c_gotos_ok "$tmp_out"; then
+              rm -f "$tmp_out"
+              echo "hunk would split goto/label across functions; refusing to place"
+              return 1
+            fi
             cat "$tmp_out" > "$f"; rm -f "$tmp_out"
             echo "${diag:-regenerated exactly}"
             return 0
@@ -634,6 +639,38 @@ runs:
           rm -f "$tmp_out"
           echo "${diag:-not placeable}"
           return 1
+        }
+        c_gotos_ok() {
+          # Whole-file C control-flow sanity for regenerated files: every
+          # goto X must see an X: label inside the same function. Kernel
+          # style keeps inner braces indented, so a column-0 } always ends
+          # the enclosing function; a candidate label separated from its
+          # goto by such a line lives in a different function and C rejects
+          # the tree at compile time (undeclared label). Failing here keeps
+          # the sandbox edit out of the live tree instead of shipping a
+          # broken kernel. Runs on every regenerated file, patch-agnostic.
+          awk '
+            { fl[++n] = $0 }
+            END {
+              bad = 0
+              for (i = 1; i <= n; i++) {
+                if (fl[i] !~ /goto[ \t]+[A-Za-z_][A-Za-z0-9_]*;/) continue
+                g = fl[i]; sub(/.*goto[ \t]+/, "", g); sub(/;.*/, "", g)
+                ok = 0
+                for (j = 1; j <= n; j++) {
+                  if (fl[j] !~ ("^[ \t]*" g ":")) continue
+                  lo = (i < j ? i : j); hi = (i < j ? j : i); cross = 0
+                  for (k = lo + 1; k < hi; k++) if (fl[k] ~ /^}/) { cross = 1; break }
+                  if (!cross) { ok = 1; break }
+                }
+                if (!ok) {
+                  printf "c_gotos_ok: goto %s (line %d) has no same-function label\n", g, i > "/dev/stderr"
+                  bad = 1
+                }
+              }
+              exit (bad ? 1 : 0)
+            }
+          ' "$1"
         }
         blk_already() {
           # Pure-insertion hunk (no removals) whose added block (>=3 lines) is
@@ -1311,12 +1348,16 @@ runs:
           if [ -z "$SUSFS_INPUT" ]; then
             # use kernel-specific default
             SUSFS_BRANCH="${DEFAULT_SUSFS[$KERNEL_KEY]:-gki-android15-6.6}"
+            SUSFS_REF_SOURCE="kmi-default branch"
             echo "ℹ️  Using default SUSFS branch for $KERNEL_KEY: $SUSFS_BRANCH"
           else
             # 40-char hash or branch/commit passed directly
             SUSFS_BRANCH="$SUSFS_INPUT"
+            SUSFS_REF_SOURCE="explicit input pin"
             echo "🔧 Using resolved SUSFS ref: $SUSFS_BRANCH"
           fi
+          echo "SUSFS_REF=$SUSFS_BRANCH" >> "$GITHUB_ENV"
+          echo "SUSFS_REF_SOURCE=$SUSFS_REF_SOURCE" >> "$GITHUB_ENV"
         fi
         
         retry_fetch_archive() {
@@ -1450,8 +1491,11 @@ runs:
         else
           git -C nomount checkout --detach origin/HEAD 2>/dev/null || git -C nomount checkout --detach
           NOMOUNT_COMMIT_SHA="$(git -C nomount rev-parse HEAD)"
+          NOMOUNT_REF_SOURCE="upstream latest"
           echo "::warning::No NoMount commit provided; tracking upstream latest (${NOMOUNT_COMMIT_SHA})"
         fi
+        if [ -z "${NOMOUNT_REF_SOURCE:-}" ]; then NOMOUNT_REF_SOURCE="explicit input pin"; fi
+        echo "NOMOUNT_REF_SOURCE=$NOMOUNT_REF_SOURCE" >> "$GITHUB_ENV"
         git -C nomount log --oneline -1
         echo "NOMOUNT_COMMIT_SHA=$NOMOUNT_COMMIT_SHA" >> "$GITHUB_ENV"
         echo "Using NoMount commit: $NOMOUNT_COMMIT_SHA"
@@ -2206,7 +2250,7 @@ runs:
         else
           gen_patch susfs-main "$patch_to_apply" "" "g:fs/Makefile|susfs.o"
           if ! grep -Eq '^susfs-main\|(applied|already)' "$PS_FILE" 2>/dev/null; then
-            echo "::error::SUSFS kernel patch failed to stage at fuzz=0 (see patch-faillogs/)"
+            echo "::error::SUSFS kernel patch failed to stage at fuzz=0 (resolved SUSFS ref: ${SUSFS_REF:-unknown}; if manually pinned, verify it matches this kernel tree or clear susfs_commit_hash_or_branch to use the per-KMI default) (see patch-faillogs/)"
             exit 1
           fi
         fi
@@ -2605,7 +2649,7 @@ runs:
         SUBLEVEL="$(awk '/^SUBLEVEL *=/ { print $3; exit }' Makefile 2>/dev/null || true)"
         RTM="kernel/locking/rtmutex.c"
         RTMUTEX_PIN="d6255c5f44e3871743c7d1570436822227b4b2fd"
-        RTMUTEX_BASE="https://raw.githubusercontent.com/LingLuo17/AnyKernel3/${RTMUTEX_PIN}/security_patch/cve-2026-43499"
+        RTMUTEX_BASE="https://raw.githubusercontent.com/LingLuo17/AnyKernel3/${RTMUTEX_PIN}/security_patch"
         skip_cve() {
           echo "rtmutex-cve|skipped" >> "$PS_FILE"
           echo "::endgroup::"
@@ -2848,7 +2892,7 @@ runs:
               grep -q 'scoped_guard(raw_spinlock, &waiter_task->pi_lock)' "$RTM"
             fi
             echo "RTMUTEX_CVE_FIXED=true" >> "$GITHUB_ENV"
-            echo "RTMUTEX_CVE_SOURCE=LingLuo17/AnyKernel3 security_patch/cve-2026-43499 @${RTMUTEX_PIN:0:7}" >> "$GITHUB_ENV"
+            echo "RTMUTEX_CVE_SOURCE=LingLuo17/AnyKernel3 security_patch (flat) @${RTMUTEX_PIN:0:7}" >> "$GITHUB_ENV"
             echo "✅ CVE-2026-43499 rtmutex fix chain applied (${KERNEL_VERSION}.${SUBLEVEL:-x}, remove_waiter futex PI proxy path + CVE-2026-53163 follow-ups)"
             echo "::endgroup::"
             ;;
@@ -4441,7 +4485,7 @@ runs:
             echo "| **SUSFS Version** | ${SUSVER:-unknown} |"
             
             if [ "$SUSFS_SHA" != "unknown" ]; then
-              echo "| **SUSFS Commit** | [\`${SUSFS_SHA:0:8}\`](https://gitlab.com/simonpunk/susfs4ksu/-/commit/$SUSFS_SHA) |"
+              echo "| **SUSFS Commit** | [\`${SUSFS_SHA:0:8}\`](https://gitlab.com/simonpunk/susfs4ksu/-/commit/$SUSFS_SHA) (${SUSFS_REF_SOURCE:-kmi-default branch}: \`${SUSFS_REF:-branch}\`) |"
             else
               echo "| **SUSFS Commit** | unknown |"
             fi
@@ -4467,7 +4511,7 @@ runs:
           echo "| **LZ4 1.10.0 + ARMv8 NEON** | $(pstat lz4) |"
           echo "| **zstd 1.5.7 + tunable level** | $(pstat zstd-upgrade) |"
           echo "| **CVE-2026-43499 rtmutex fix** | $(pstat rtmutex-cve) |"
-          echo "| **NoMount** | $(pstat nomount) |"
+          echo "| **NoMount** | $(pstat nomount) (${NOMOUNT_REF_SOURCE:-unknown}) |"
           echo "| **Vendor Module Blacklist** | $(pstat vendor-modules-blacklist) |"
           echo "| **WildKernels' Optimisations** | $(pstat wk-opt) |"
           
