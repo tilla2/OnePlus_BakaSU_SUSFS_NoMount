@@ -1846,6 +1846,11 @@ runs:
           && grep -q "^KSU_SECOND_SIGNATURE_RELEASE := 1" KernelSU/kernel/Kbuild \
           || { echo "::error::Kbuild cert injection failed (anchor line missing - FinaSU upstream Kbuild layout may have changed)"; exit 1; }
 
+        # Upstream's KSU_KERNEL_DIR := $(srctree)/$(src) double-prefixes $(src) in
+        # O= in-tree builds, leaving kernel/include (klog.h) unreachable; bridge it.
+        grep -qF 'ccflags-y += -I$(src)/include' KernelSU/kernel/Kbuild \
+          || printf '\n# in-tree include path (OnePlus_BakaSU_SUSFS_NoMount)\nccflags-y += -I$(src) -I$(src)/include\n' >> KernelSU/kernel/Kbuild
+
         KSU_COMMIT_SHA=$(git -C KernelSU rev-parse HEAD)
         COMMITS=$(git -C KernelSU rev-list --count HEAD)
         KSU_VERSION=$((30000 + COMMITS))
