@@ -646,7 +646,10 @@ runs:
           grep -qE '^-[^-]' "$hunk" && return 1
           block=$(grep -E '^\+[^+]' "$hunk" | cut -c2-)
           [ "$(printf '%s\n' "$block" | grep -c .)" -ge 3 ] || return 1
-          [ -n "$block" ] && grep -Fqz "$block" "$f"
+          # grep -Fz treats a multi-line pattern as any-part-matches: a single
+          # block line present in the file would classify the hunk "already" and
+          # silently drop it. Compare newline-free fingerprints instead.
+          [ -n "$block" ] && tr '\n' '\v' < "$f" | grep -Fq -- "$(printf '%s' "$block" | tr '\n' '\v')"
         }
         gen_patch() {
           local name="$1" patch_file="$2" sed_expr="${3:-}" verify_spec="${4:-}"
@@ -2505,13 +2508,15 @@ runs:
           echo "block/adios.c already present, enabling config only"
           echo "adios|applied" >> "$PS_FILE"
         fi
-        grep -q 'config MQ_IOSCHED_ADIOS' block/Kconfig.iosched
-        grep -q 'adios.o' block/Makefile
+        grep -q 'config MQ_IOSCHED_ADIOS' block/Kconfig.iosched \
+          || { echo "::error::ADIOS: 'config MQ_IOSCHED_ADIOS' missing from block/Kconfig.iosched after apply"; exit 1; }
+        grep -q 'adios.o' block/Makefile \
+          || { echo "::error::ADIOS: 'adios.o' missing from block/Makefile after apply"; exit 1; }
         grep -q '^CONFIG_MQ_IOSCHED_ADIOS=y' arch/arm64/configs/gki_defconfig || \
           echo 'CONFIG_MQ_IOSCHED_ADIOS=y' >> arch/arm64/configs/gki_defconfig
         grep -q '^CONFIG_MQ_IOSCHED_DEFAULT_ADIOS=y' arch/arm64/configs/gki_defconfig || \
           echo 'CONFIG_MQ_IOSCHED_DEFAULT_ADIOS=y' >> arch/arm64/configs/gki_defconfig
-        grep -n 'CONFIG_MQ_IOSCHED' arch/arm64/configs/gki_defconfig
+        grep -n 'CONFIG_MQ_IOSCHED' arch/arm64/configs/gki_defconfig || true
         echo "ADIOS_ENABLED=true" >> "$GITHUB_ENV"
         echo "ADIOS_SOURCE=https://github.com/firelzrd/adios" >> "$GITHUB_ENV"
         echo "✅ ADIOS I/O scheduler enabled"
