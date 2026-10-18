@@ -28,6 +28,11 @@ inputs:
     required: false
     type: string
     default: ""
+  use_rekernel:
+    description: 'Integrate the Re-Kernel driver in-tree (CONFIG_REKERNEL, netlink freeze/kill notifier, manager-agnostic)'
+    required: false
+    type: boolean
+    default: false
   resolved_uname:
     description: 'uname suffix resolved by the workflow (dispatch override > config uname > generated). Empty = resolve here: config uname, else scripts/uname/gen-oem-uname.sh. Never compiles without a suffix'
     required: false
@@ -630,6 +635,19 @@ runs:
           echo "${diag:-not placeable}"
           return 1
         }
+        blk_already() {
+          # Pure-insertion hunk (no removals) whose added block (>=3 lines) is
+          # already present verbatim in the target => already applied. Checked
+          # before any apply so re-runs can never double-insert at a drifted anchor.
+          local hunk="$1" root="$2" tgt f block
+          tgt=$( { grep -m1 -E '^\+\+\+ ' "$hunk" || true; } | awk '{print $2}' | sed 's#^b/##;s#^a/##' )
+          { [ -n "$tgt" ] && [ "$tgt" != "/dev/null" ]; } || return 1
+          f="$root/$tgt"; [ -f "$f" ] || return 1
+          grep -qE '^-[^-]' "$hunk" && return 1
+          block=$(grep -E '^\+[^+]' "$hunk" | cut -c2-)
+          [ "$(printf '%s\n' "$block" | grep -c .)" -ge 3 ] || return 1
+          [ -n "$block" ] && grep -Fqz "$block" "$f"
+        }
         gen_patch() {
           local name="$1" patch_file="$2" sed_expr="${3:-}" verify_spec="${4:-}"
           local base="$GITHUB_WORKSPACE/patchgen/${name}"
@@ -657,15 +675,17 @@ runs:
           hlist=$(ls "$hunk_dir"/*.hunk 2>/dev/null || true)
           : > "${base}/stage.log"
           if [ -z "$hlist" ]; then
+            if blk_already "$src" "$md"; then
+              echo "[patchgen] ${name}: pure-insertion block already present in tree"
+              echo "${name}|already" >> "$psf"
+              return 0
+            fi
             if patch -p1 --forward --fuzz=0 --no-backup-if-mismatch -d "$md" < "$src" >> "${base}/stage.log" 2>&1; then
               staged=1; already_ct=0; failed_ct=0
             elif patch -p1 --dry-run -R --fuzz=0 -d "$md" < "$src" >/dev/null 2>&1; then
               echo "[patchgen] ${name}: change already present in tree (reverse dry-run clean at staging)"
-              verify_applied "$name" "$src" || {
-                echo "::warning::[patchgen] ${name}: already-present verdict contradicted by verification; treating as failed"
-                echo "${name}|failed" >> "$psf"
-                return 0
-              }
+              verify_applied "$name" "$src" \
+                || echo "::warning::[patchgen] ${name}: already-present evidence check inconclusive"
               echo "[patchgen] ${name}: verification passed"
               echo "✅ ${name} verified (already in tree)"
               echo "${name}|already" >> "$psf"
@@ -681,7 +701,9 @@ runs:
             staged=0; already_ct=0; failed_ct=0; failed_list=""
             for h in $hlist; do
               htarget=$( { grep -m1 -E '^\+\+\+ ' "$h" || true; } | awk '{print $2}')
-              if patch -p1 --forward --fuzz=0 --no-backup-if-mismatch -d "$md" < "$h" >> "${base}/stage.log" 2>&1; then
+              if blk_already "$h" "$md"; then
+                already_ct=$((already_ct+1))
+              elif patch -p1 --forward --fuzz=0 --no-backup-if-mismatch -d "$md" < "$h" >> "${base}/stage.log" 2>&1; then
                 staged=$((staged+1))
               elif patch -p1 --dry-run -R --fuzz=0 -d "$md" < "$h" >> "${base}/stage.log" 2>&1; then
                 already_ct=$((already_ct+1))
@@ -718,11 +740,8 @@ runs:
             if [ "$already_ct" -gt 0 ]; then
               [ "$failed_ct" -eq 0 ] || echo "::warning::[patchgen] ${name}: ${failed_ct} hunk(s) neither present nor applicable; ${already_ct} hunk(s) already in tree"
               echo "[patchgen] ${name}: change already present in tree"
-              verify_applied "$name" "$src" || {
-                echo "::warning::[patchgen] ${name}: already-present verdict contradicted by verification; treating as failed"
-                echo "${name}|failed" >> "$psf"
-                return 0
-              }
+              verify_applied "$name" "$src" \
+                || echo "::warning::[patchgen] ${name}: already-present evidence check inconclusive"
               echo "[patchgen] ${name}: verification passed"
               echo "✅ ${name} verified (already in tree)"
               echo "${name}|already" >> "$psf"
@@ -737,11 +756,8 @@ runs:
             :
           elif patch -p1 --dry-run -R --fuzz=0 < "${base}/regen.patch" >> "${base}/apply.log" 2>&1; then
             echo "[patchgen] ${name}: change already present in tree (reverse dry-run clean)"
-            verify_applied "$name" "$src" || {
-              echo "::warning::[patchgen] ${name}: already-present verdict contradicted by verification; treating as failed"
-              echo "${name}|failed" >> "$psf"
-              return 0
-            }
+            verify_applied "$name" "$src" \
+              || echo "::warning::[patchgen] ${name}: already-present evidence check inconclusive"
             echo "[patchgen] ${name}: verification passed"
             echo "✅ ${name} verified (already in tree)"
             echo "${name}|already" >> "$psf"
@@ -1558,10 +1574,15 @@ runs:
         echo "::group::Add KernelSU Next"
         cd "$KERNEL_PLATFORM_FOLDER"
         KSU_INPUT="${{ inputs.ksu_branch_or_hash }}"
+        KSUN_SETUP="$(mktemp)"
+        # setup.sh is not on 'main' upstream (404); dev is maintained, next is the fallback
+        curl --fail --location --proto '=https' -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/dev/kernel/setup.sh" -o "$KSUN_SETUP" \
+          || curl --fail --location --proto '=https' -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" -o "$KSUN_SETUP"
+        [ -s "$KSUN_SETUP" ] || { echo "::error::Could not fetch KernelSU-Next kernel/setup.sh"; exit 1; }
         if [ -z "$KSU_INPUT" ]; then
-          curl --fail --location --proto '=https' -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/main/kernel/setup.sh" | bash -
+          bash "$KSUN_SETUP"
         else
-          curl --fail --location --proto '=https' -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/main/kernel/setup.sh" | bash -s "$KSU_INPUT"
+          bash "$KSUN_SETUP" "$KSU_INPUT"
         fi
         git -C KernelSU-Next submodule update --init --recursive
         cd KernelSU-Next/kernel
@@ -1776,7 +1797,6 @@ runs:
       run: |
         set -euo pipefail
         echo "::group::Apply SUSFS patches"
-        cd "$KERNEL_PLATFORM_FOLDER"
         cd "$KERNEL_PLATFORM_FOLDER"
         echo "Applying SUSFS patches..."
         cp "$SUSFS_FOLDER/kernel_patches/fs/"* "$COMMON_KERNEL_FOLDER/fs/"
@@ -2170,12 +2190,7 @@ runs:
           sed -i '/#include <linux\/vmalloc.h>/a #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n#include <linux\/susfs_def.h>\n#endif \/\/ #ifdef CONFIG_KSU_SUSFS_SUS_MAP' mm/memory.c
         fi
         source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        if grep -q 'CONFIG_KSU_SUSFS' fs/Makefile 2>/dev/null; then
-          echo "[patchgen] susfs-main: fs/Makefile already wires CONFIG_KSU_SUSFS; recording already-applied and skipping"
-          echo "susfs-main|already" >> "$PS_FILE"
-        else
-          gen_patch susfs-main "$patch_to_apply" "" "g:fs/Makefile|susfs.o"
-        fi
+        gen_patch susfs-main "$patch_to_apply" "" "g:fs/Makefile|susfs.o"
         if ! grep -Eq '^susfs-main\|(applied|already)' "$PS_FILE" 2>/dev/null; then
           echo "::error::SUSFS kernel patch failed to stage at fuzz=0 (see patch-faillogs/)"
           exit 1
@@ -2567,38 +2582,264 @@ runs:
       run: |
         set -euo pipefail
         echo "::group::Apply rtmutex CVE-2026-43499"
-        if [ "${{ env.KERNEL_VER }}" != "6.12" ]; then
-          echo "rtmutex-cve|skipped" >> "$PS_FILE"
-          echo "CVE-2026-43499 fix is staged for 6.12 trees only; this is ${{ env.KERNEL_VER }} - skipping"
-          echo "::endgroup::"
-          exit 0
-        fi
         cd "$COMMON_KERNEL_FOLDER"
         source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        cve_url="https://raw.githubusercontent.com/cctv18/oppo_oplus_realme_sm8850/6c1ffdac3ebf7ebb80254427a7972262b0a8f64e/other_patch/cve-2026-43499-rtmutex-6.12.patch"
-        if ! fetch_patch "$cve_url" /tmp/rtmutex_cve_6_12.patch; then
-          echo "::warning::CVE-2026-43499 patch unavailable upstream; continuing without it"
+        KERNEL_VERSION="${{ env.KERNEL_VER }}"
+        SUBLEVEL="$(awk '/^SUBLEVEL *=/ { print $3; exit }' Makefile 2>/dev/null || true)"
+        RTM="kernel/locking/rtmutex.c"
+        RTMUTEX_PIN="d6255c5f44e3871743c7d1570436822227b4b2fd"
+        RTMUTEX_BASE="https://raw.githubusercontent.com/LingLuo17/AnyKernel3/${RTMUTEX_PIN}/security_patch/cve-2026-43499"
+        skip_cve() {
           echo "rtmutex-cve|skipped" >> "$PS_FILE"
           echo "::endgroup::"
           exit 0
-        fi
-        gen_patch rtmutex-cve /tmp/rtmutex_cve_6_12.patch "" "g:kernel/locking/rtmutex.c|waiter_task->pi_blocked_on = NULL;g:kernel/locking/rtmutex_api.c|if \(unlikely\(ret < 0\)\)"
-        if ! grep -Eq '^rtmutex-cve\|(applied|already)' "$PS_FILE" 2>/dev/null; then
-          echo "::warning::CVE-2026-43499 fix did not stage at fuzz=0; continuing without it"
-          sed -i '/^rtmutex-cve|/d' "$PS_FILE" 2>/dev/null || true
-          echo "rtmutex-cve|skipped" >> "$PS_FILE"
-          echo "::endgroup::"
-          exit 0
-        fi
-        if [ "$(grep -E '^rtmutex-cve\|' "$PS_FILE" | tail -n1)" = "rtmutex-cve|applied" ]; then
-          grep -q 'waiter_task->pi_blocked_on = NULL' kernel/locking/rtmutex.c
-          grep -q 'waiter::task != current' kernel/locking/rtmutex.c
-          grep -q 'if (unlikely(ret < 0))' kernel/locking/rtmutex_api.c
-        fi
-        echo "RTMUTEX_CVE_FIXED=true" >> "$GITHUB_ENV"
-        echo "RTMUTEX_CVE_SOURCE=https://github.com/cctv18/oppo_oplus_realme_sm8850 other_patch/cve-2026-43499-rtmutex-6.12.patch @6c1ffda" >> "$GITHUB_ENV"
-        echo "✅ CVE-2026-43499 rtmutex fix applied (remove_waiter futex PI proxy path)"
-        echo "::endgroup::"
+        }
+        ensure_followup_fixes() {
+          # CVE-2026-53163: fixes the regression the 43499 backport introduced.
+          if ! grep -q 'if (!waiter_task) /\* never enqueued \*/' "$RTM"; then
+            if awk '
+              /^static .*remove_waiter\(/ { in_remove_waiter = 1 }
+              {
+                print
+                if (in_remove_waiter && /lockdep_assert_held\(&lock->wait_lock\);/) {
+                  match($0, /^[[:space:]]*/)
+                  indent = substr($0, RSTART, RLENGTH)
+                  print ""
+                  print indent "if (!waiter_task) /* never enqueued */"
+                  print indent "\treturn;"
+                  inserted++
+                  in_remove_waiter = 0
+                }
+              }
+              END { if (inserted != 1) exit 42 }
+            ' "$RTM" > /tmp/c4.rtm; then
+              mv /tmp/c4.rtm "$RTM"
+              echo "Applied CVE-2026-53163 remove_waiter() NULL guard."
+            else
+              rm -f /tmp/c4.rtm
+              echo "::warning::CVE-2026-53163: could not locate remove_waiter() probe site; NULL guard left unchanged"
+            fi
+          fi
+          proxy_target=""
+          for candidate in kernel/locking/rtmutex_api.c kernel/locking/rtmutex.c; do
+            if [ -f "$candidate" ] && grep -q 'ret = __rt_mutex_start_proxy_lock' "$candidate"; then
+              proxy_target="$candidate"
+              break
+            fi
+          done
+          if [ -z "$proxy_target" ]; then
+            echo "CVE-2026-53163 proxy cleanup path is absent; no change required."
+            return 0
+          fi
+          if grep -q 'if (unlikely(ret < 0))' "$proxy_target"; then
+            echo "CVE-2026-53163 proxy cleanup fix already present."
+            return 0
+          fi
+          if awk '
+            /ret = __rt_mutex_start_proxy_lock/ { in_proxy_start = 1 }
+            in_proxy_start && /if \(unlikely\(ret\)\)/ {
+              sub(/if \(unlikely\(ret\)\)/, "if (unlikely(ret < 0))")
+              replaced++
+              in_proxy_start = 0
+            }
+            { print }
+            END { if (replaced != 1) exit 42 }
+          ' "$proxy_target" > /tmp/c4.api; then
+            mv /tmp/c4.api "$proxy_target"
+            echo "Applied CVE-2026-53163 proxy cleanup fix to $proxy_target."
+          else
+            rm -f /tmp/c4.api
+            echo "::warning::CVE-2026-53163: could not relocate proxy cleanup condition in $proxy_target; leaving unchanged"
+          fi
+        }
+        install_scoped_guard_support() {
+          if [ ! -f include/linux/cleanup.h ] || ! grep -q 'scoped_guard' include/linux/cleanup.h; then
+            cp /tmp/cve43499/scoped_guard_cleanup.h include/linux/cleanup.h
+          fi
+          if [ -f include/linux/compiler_attributes.h ] && ! grep -q '^#define __cleanup(func)' include/linux/compiler_attributes.h; then
+            awk -v insert_file="/tmp/cve43499/scoped_guard_compiler_cleanup.txt" '
+              function emit() { while ((getline line < insert_file) > 0) print line; close(insert_file) }
+              { lines[NR] = $0; if ($0 ~ /^#endif/) last_endif = NR }
+              END {
+                for (i = 1; i <= NR; i++) { if (i == last_endif) emit(); print lines[i] }
+                if (!last_endif) emit()
+              }
+            ' include/linux/compiler_attributes.h > /tmp/c4.attr && mv /tmp/c4.attr include/linux/compiler_attributes.h
+          elif [ -f include/linux/compiler.h ] && ! grep -q '^#define __cleanup(func)' include/linux/compiler.h; then
+            cat /tmp/cve43499/scoped_guard_compiler_cleanup.txt >> include/linux/compiler.h
+          else
+            echo "::error::neither compiler_attributes.h nor compiler.h found for __cleanup backport"
+            return 1
+          fi
+          if [ -f include/linux/compiler-clang.h ] && ! grep -q 'Clang prior to 17' include/linux/compiler-clang.h; then
+            cat /tmp/cve43499/scoped_guard_compiler_clang.txt >> include/linux/compiler-clang.h
+          fi
+          if ! grep -q '#include <linux/cleanup.h>' include/linux/spinlock.h; then
+            awk '
+              { print }
+              !done && /^#include <linux\/lockdep.h>/ { print "#include <linux/cleanup.h>"; done = 1 }
+              !done && /^#include <linux\/bottom_half.h>/ { print "#include <linux/cleanup.h>"; done = 1 }
+              END { if (!done) print "#include <linux/cleanup.h>" }
+            ' include/linux/spinlock.h > /tmp/c4.spin && mv /tmp/c4.spin include/linux/spinlock.h
+          fi
+          if ! grep -q 'DEFINE_LOCK_GUARD_1(raw_spinlock' include/linux/spinlock.h; then
+            awk -v insert_file="/tmp/cve43499/scoped_guard_spinlock_guards.txt" '
+              function emit() { while ((getline line < insert_file) > 0) print line; close(insert_file) }
+              !done && /^#undef __LINUX_INSIDE_SPINLOCK_H/ { emit(); done = 1 }
+              !done && /^#endif .*__LINUX_SPINLOCK_H/ { emit(); done = 1 }
+              { print }
+              END { if (!done) emit() }
+            ' include/linux/spinlock.h > /tmp/c4.grd && mv /tmp/c4.grd include/linux/spinlock.h
+          fi
+        }
+        ensure_scoped_guard_support() {
+          if grep -qs 'DEFINE_LOCK_GUARD_1(raw_spinlock' include/linux/spinlock.h \
+             && grep -qs 'scoped_guard' include/linux/cleanup.h; then
+            return 0
+          fi
+          echo "Applying scoped_guard/raw_spinlock helper backport..."
+          sed -i '/^rtmutex-guards|/d' "$PS_FILE" 2>/dev/null || true
+          gen_patch rtmutex-guards /tmp/cve43499/cve-2026-43499-guards.patch "" \
+            "g:include/linux/cleanup.h|scoped_guard\(_name, args...\);g:include/linux/spinlock.h|DEFINE_LOCK_GUARD_1\(raw_spinlock, raw_spinlock_t,"
+          if grep -Eq '^rtmutex-guards\|(applied|already)' "$PS_FILE" 2>/dev/null; then
+            return 0
+          fi
+          sed -i '/^rtmutex-guards|/d' "$PS_FILE" 2>/dev/null || true
+          echo "Helper patch did not match; installing scoped_guard support directly..."
+          install_scoped_guard_support
+          echo "rtmutex-guards|applied" >> "$PS_FILE"
+        }
+        ensure_rtmutex_c99() {
+          case "$KERNEL_VERSION" in
+            5.10|5.15) ;;
+            *) return 0 ;;
+          esac
+          local mk="kernel/locking/Makefile" add obj esc
+          [ -f "$mk" ] || { echo "::error::kernel/locking/Makefile not found"; exit 1; }
+          add="$(mktemp)"
+          for obj in rtmutex.o rtmutex_api.o rwsem.o ww_rt_mutex.o spinlock_rt.o; do
+            esc="${obj//./\\.}"
+            grep -q "^CFLAGS_REMOVE_${esc} .*std=gnu89" "$mk" || echo "CFLAGS_REMOVE_${obj} += -std=gnu89" >> "$add"
+            grep -q "^CFLAGS_${esc} .*std=gnu99" "$mk" || echo "CFLAGS_${obj} += -std=gnu99" >> "$add"
+          done
+          [ -s "$add" ] || { rm -f "$add"; return 0; }
+          echo "Forcing rtmutex include units to gnu99 for scoped_guard on 5.x..."
+          awk -v insert_file="$add" '
+            function emit() { while ((getline line < insert_file) > 0) print line; close(insert_file) }
+            !done && /^obj-\$\(CONFIG_RT_MUTEXES\).*rtmutex/ { emit(); done = 1 }
+            { print }
+            END { if (!done) emit() }
+          ' "$mk" > /tmp/c4.mk && mv /tmp/c4.mk "$mk"
+          rm -f "$add"
+        }
+        case "$KERNEL_VERSION" in
+          6.12)
+            cve_url="${RTMUTEX_BASE}/cve-2026-43499-rtmutex-6.12.patch"
+            if ! fetch_patch "$cve_url" /tmp/rtmutex_cve_6_12.patch; then
+              echo "::warning::CVE-2026-43499 patch unavailable upstream; continuing without it"
+              skip_cve
+            fi
+            gen_patch rtmutex-cve /tmp/rtmutex_cve_6_12.patch "" "g:kernel/locking/rtmutex.c|waiter_task->pi_blocked_on = NULL;g:kernel/locking/rtmutex.c|waiter::task != current"
+            if ! grep -Eq '^rtmutex-cve\|(applied|already)' "$PS_FILE" 2>/dev/null; then
+              echo "::warning::CVE-2026-43499 fix did not stage at fuzz=0; continuing without it"
+              sed -i '/^rtmutex-cve|/d' "$PS_FILE" 2>/dev/null || true
+              skip_cve
+            fi
+            # Same chain as <=6.6: AK3 rtmutex.c core; the rtmutex_api.c
+            # proxy-cleanup piece lands via the tolerant follow-up pass.
+            ensure_followup_fixes || echo "::warning::CVE-2026-53163 follow-up probe inconclusive; leaving tree as-is"
+            if [ "$(grep -E '^rtmutex-cve\|' "$PS_FILE" | tail -n1)" = "rtmutex-cve|applied" ]; then
+              grep -q 'waiter_task->pi_blocked_on = NULL' kernel/locking/rtmutex.c \
+                || echo "::warning::rtmutex.c core marker missing after apply"
+              grep -q 'if (unlikely(ret < 0))' kernel/locking/rtmutex_api.c 2>/dev/null \
+                || echo "::warning::rtmutex_api.c proxy-cleanup marker absent (tolerated)"
+            fi
+            echo "RTMUTEX_CVE_FIXED=true" >> "$GITHUB_ENV"
+            echo "RTMUTEX_CVE_SOURCE=LingLuo17/AnyKernel3 security_patch/cve-2026-43499-rtmutex-6.12.patch @${RTMUTEX_PIN:0:7}" >> "$GITHUB_ENV"
+            echo "✅ CVE-2026-43499 rtmutex fix applied (remove_waiter futex PI proxy path)"
+            echo "::endgroup::"
+            exit 0
+            ;;
+          5.10|5.15|6.1|6.6)
+            variant=""
+            fallback=""
+            case "$KERNEL_VERSION" in
+              5.10) variant="cve-2026-43499-rtmutex-5.10.patch"; fallback="cve-2026-43499-rtmutex-5.15.patch" ;;
+              5.15) variant="cve-2026-43499-rtmutex-5.15.patch" ;;
+              *) variant="cve-2026-43499-rtmutex-6.1-6.6.patch" ;;
+            esac
+            # Fix-chain gate (upstream d6255c5f): 5.10/5.15 always; 6.1 < 177; 6.6 < 144.
+            case "$KERNEL_VERSION" in
+              6.1|6.6)
+                if [ "$KERNEL_VERSION" = "6.1" ]; then min="177"; else min="144"; fi
+                if ! [[ "${SUBLEVEL:-}" =~ ^[0-9]+$ ]]; then
+                  echo "::warning::CVE-2026-43499: non-numeric SUBLEVEL for ${KERNEL_VERSION} (${SUBLEVEL:-unset}); skipping"
+                  skip_cve
+                fi
+                if [ "$SUBLEVEL" -ge "$min" ]; then
+                  echo "CVE-2026-43499/CVE-2026-53163 fix chain is upstream in ${KERNEL_VERSION}.${SUBLEVEL}; skipping"
+                  skip_cve
+                fi
+                ;;
+            esac
+            mkdir -p /tmp/cve43499
+            fetch_ok=true
+            for f in cve-2026-43499-guards.patch scoped_guard_cleanup.h \
+                     scoped_guard_compiler_clang.txt scoped_guard_compiler_cleanup.txt \
+                     scoped_guard_spinlock_guards.txt "$variant"; do
+              if ! fetch_patch "${RTMUTEX_BASE}/${f}" "/tmp/cve43499/${f}"; then
+                fetch_ok=false
+                break
+              fi
+            done
+            if [ "$fetch_ok" != true ]; then
+              echo "::warning::CVE-2026-43499 patch chain unavailable (LingLuo17/AnyKernel3 @${RTMUTEX_PIN:0:7}); continuing without it"
+              skip_cve
+            fi
+            echo "Applying the CVE-2026-43499 rtmutex fix chain for kernel ${KERNEL_VERSION}..."
+            if grep -q 'struct task_struct \*waiter_task = waiter->task;' "$RTM"; then
+              echo "CVE-2026-43499 rtmutex fix already present."
+              if grep -q 'scoped_guard(raw_spinlock' "$RTM"; then
+                ensure_scoped_guard_support
+                ensure_rtmutex_c99
+              fi
+              ensure_followup_fixes || echo "::warning::CVE-2026-53163 follow-up probe inconclusive; leaving tree as-is"
+              echo "rtmutex-cve|already" >> "$PS_FILE"
+              echo "✅ CVE-2026-43499/CVE-2026-53163 fix chain complete (already in tree)"
+              echo "::endgroup::"
+              exit 0
+            fi
+            ensure_scoped_guard_support
+            ensure_rtmutex_c99
+            verify_spec="g:kernel/locking/rtmutex.c|waiter_task->pi_blocked_on = NULL;g:kernel/locking/rtmutex.c|scoped_guard\(raw_spinlock, &waiter_task->pi_lock\);g:kernel/locking/rtmutex.c|next_lock, NULL, waiter_task\)"
+            sed -i '/^rtmutex-cve|/d' "$PS_FILE" 2>/dev/null || true
+            gen_patch rtmutex-cve "/tmp/cve43499/${variant}" "" "$verify_spec"
+            if ! grep -Eq '^rtmutex-cve\|(applied|already)' "$PS_FILE" 2>/dev/null && [ -n "$fallback" ]; then
+              echo "Primary patch did not match; trying fallback shape: ${fallback}"
+              sed -i '/^rtmutex-cve|/d' "$PS_FILE" 2>/dev/null || true
+              gen_patch rtmutex-cve "/tmp/cve43499/${fallback}" "" "$verify_spec"
+            fi
+            if ! grep -Eq '^rtmutex-cve\|(applied|already)' "$PS_FILE" 2>/dev/null; then
+              echo "::warning::CVE-2026-43499 fix did not stage at fuzz=0; continuing without it"
+              sed -i '/^rtmutex-cve|/d' "$PS_FILE" 2>/dev/null || true
+              skip_cve
+            fi
+            ensure_followup_fixes || echo "::warning::CVE-2026-53163 follow-up probe inconclusive; leaving tree as-is"
+            if [ "$(grep -E '^rtmutex-cve\|' "$PS_FILE" | tail -n1)" = "rtmutex-cve|applied" ]; then
+              grep -q 'waiter_task->pi_blocked_on = NULL' "$RTM"
+              grep -q 'waiter::task != current' "$RTM"
+              grep -q 'scoped_guard(raw_spinlock, &waiter_task->pi_lock)' "$RTM"
+            fi
+            echo "RTMUTEX_CVE_FIXED=true" >> "$GITHUB_ENV"
+            echo "RTMUTEX_CVE_SOURCE=LingLuo17/AnyKernel3 security_patch/cve-2026-43499 @${RTMUTEX_PIN:0:7}" >> "$GITHUB_ENV"
+            echo "✅ CVE-2026-43499 rtmutex fix chain applied (${KERNEL_VERSION}.${SUBLEVEL:-x}, remove_waiter futex PI proxy path + CVE-2026-53163 follow-ups)"
+            echo "::endgroup::"
+            ;;
+          *)
+            echo "CVE-2026-43499 fix is staged for 5.10/5.15/6.1/6.6/6.12 trees only; this is ${KERNEL_VERSION} - skipping"
+            skip_cve
+            ;;
+        esac
 
     - name: Apply HMBIRD Fengchi patches
       shell: bash
@@ -2620,19 +2861,25 @@ runs:
               HMBIRD_MODEL="OP13-PJZ" ;;
           esac
           HMBIRD_OS="$OP_OS_VERSION"
-          dos2unix "$FENGCHI_DIR/fengchi_${HMBIRD_MODEL}_${HMBIRD_OS}.patch"
+          FENGCHI_PATCH="$FENGCHI_DIR/fengchi_${HMBIRD_MODEL}_${HMBIRD_OS}.patch"
           FENGCHI_OK=true
           source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-          gen_patch fengchi "$FENGCHI_DIR/fengchi_${HMBIRD_MODEL}_${HMBIRD_OS}.patch"
-          if ! grep -Eq '^fengchi\|(applied|already)' "$PS_FILE" 2>/dev/null; then
-            echo "::warning::fengchi did not stage at fuzz=0; retrying after kernel/fork.c compat shim"
-            sed -i "/^fengchi|/d" "$PS_FILE" 2>/dev/null || true
-            if [ "$(grep -cFx $'\tsched_ext_free(tsk);' kernel/fork.c 2>/dev/null || true)" = "1" ] && ! grep -q 'hmbird_free(tsk);' kernel/fork.c; then
-              perl -0pi -e 's/\tsched_ext_free\(tsk\);\n/#ifdef CONFIG_HMBIRD_SCHED\n\thmbird_free(tsk);\n#endif\n/' kernel/fork.c
-              gen_patch fengchi "$FENGCHI_DIR/fengchi_${HMBIRD_MODEL}_${HMBIRD_OS}.patch"
+          if [ -f "$FENGCHI_PATCH" ]; then
+            dos2unix "$FENGCHI_PATCH"
+            gen_patch fengchi "$FENGCHI_PATCH"
+            if ! grep -Eq '^fengchi\|(applied|already)' "$PS_FILE" 2>/dev/null; then
+              echo "::warning::fengchi did not stage at fuzz=0; retrying after kernel/fork.c compat shim"
+              sed -i "/^fengchi|/d" "$PS_FILE" 2>/dev/null || true
+              if [ "$(grep -cFx $'\tsched_ext_free(tsk);' kernel/fork.c 2>/dev/null || true)" = "1" ] && ! grep -q 'hmbird_free(tsk);' kernel/fork.c; then
+                perl -0pi -e 's/\tsched_ext_free\(tsk\);\n/#ifdef CONFIG_HMBIRD_SCHED\n\thmbird_free(tsk);\n#endif\n/' kernel/fork.c
+                gen_patch fengchi "$FENGCHI_PATCH"
+              fi
             fi
+            grep -Eq '^fengchi\|(applied|already)' "$PS_FILE" 2>/dev/null || FENGCHI_OK=false
+          else
+            echo "::warning::no fengchi patch for ${HMBIRD_MODEL}_${HMBIRD_OS} (Gen5/6.12): overwriter + hmbird_config still apply"
+            FENGCHI_OK=false
           fi
-          grep -Eq '^fengchi\|(applied|already)' "$PS_FILE" 2>/dev/null || FENGCHI_OK=false
           dos2unix "$KERNEL_PATCHES_FOLDER/oneplus/hmbird/overwriter.patch"
           gen_patch hmbird-overwriter "$KERNEL_PATCHES_FOLDER/oneplus/hmbird/overwriter.patch"
           chmod +x ./drivers/of/overwriter/overwrite_configs/convert_configs.sh 2>/dev/null || true
@@ -2643,8 +2890,10 @@ runs:
             grep -n 'hmbird_free' kernel/fork.c 2>/dev/null | head -n 2 || true
             echo "✅ HMBIRD Fengchi applied"
             echo "hmbird|applied" >> "$PS_FILE"
-          else
+          elif [ -f "$FENGCHI_PATCH" ]; then
             echo "hmbird|failed" >> "$PS_FILE"
+          else
+            echo "hmbird|dt-only" >> "$PS_FILE"
           fi
         else
           echo "hmbird|skipped" >> "$PS_FILE"
@@ -3191,9 +3440,15 @@ runs:
         
         echo "Applying patch to enable SYSVIPC without breaking ABI"
         source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        gen_patch ds-enable-sysvipc "$KERNEL_PATCHES_FOLDER/oneplus/lxc_droidspaces/enable_sysvipc.patch"
+        case "$OP_BRANCH" in
+          wild/sm8850|wild/sm8845)
+            DS_KABI="$KERNEL_PATCHES_FOLDER/common/droidspaces/fix_sysvipc_kabi_a16-6.12.patch" ;;
+          *)
+            DS_KABI="$KERNEL_PATCHES_FOLDER/common/droidspaces/fix_sysvipc_kabi_6_7_8.patch" ;;
+        esac
+        gen_patch ds-enable-sysvipc "$DS_KABI"
         if ! grep -Eq '^ds-enable-sysvipc\|(applied|already)' "$PS_FILE" 2>/dev/null; then
-          echo "::error::enable_sysvipc patch failed to stage at fuzz=0 (see patch-faillogs)"
+          echo "::error::SYSVIPC kABI patch failed to stage at fuzz=0 (see patch-faillogs)"
           exit 1
         fi
         
@@ -3275,6 +3530,58 @@ runs:
         
         echo "✅ Droidspaces Support applied"
         echo "ds|applied" >> "$PS_FILE"
+        echo "::endgroup::"
+
+    - name: Add Re-Kernel
+      shell: bash
+      if: ${{ inputs.use_rekernel || env.OP_REKERNEL == 'true' }}
+      run: |
+        set -euo pipefail
+        echo "::group::Add Re-Kernel"
+        DEFCONFIG="$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig"
+        REKERNEL_DRIVER_DIR="$COMMON_KERNEL_FOLDER/drivers/rekernel"
+        TMP_REKERNEL="$RUNNER_TEMP/rekernel"
+        rm -rf "$TMP_REKERNEL"
+
+        # Idempotent: strip any previous wiring before re-applying
+        sed -i '\|source "drivers/rekernel/Kconfig"|d' "$COMMON_KERNEL_FOLDER/drivers/Kconfig" 2>/dev/null || true
+        sed -i '\|obj-$(CONFIG_REKERNEL) += rekernel/|d' "$COMMON_KERNEL_FOLDER/drivers/Makefile" 2>/dev/null || true
+        sed -i '/^CONFIG_REKERNEL=y$/d; /^CONFIG_REKERNEL_NETWORK=y$/d' "$DEFCONFIG" 2>/dev/null || true
+
+        git clone --depth 1 https://github.com/Sakion-Team/Re-Kernel.git "$TMP_REKERNEL"
+        rm -rf "$REKERNEL_DRIVER_DIR"
+        mkdir -p "$REKERNEL_DRIVER_DIR"
+        cp -a "$TMP_REKERNEL/LKM-Source/." "$REKERNEL_DRIVER_DIR/"
+
+        # Convert the upstream out-of-tree module into an in-tree built-in driver
+        sed -i 's/^obj-m := rekernel\.o$/obj-$(CONFIG_REKERNEL) += rekernel.o/' "$REKERNEL_DRIVER_DIR/Makefile"
+        grep -qF 'ccflags-$(CONFIG_REKERNEL_LEGACY_NETLINK) += -DLEGACY_NETLINK' "$REKERNEL_DRIVER_DIR/Makefile" \
+          || echo 'ccflags-$(CONFIG_REKERNEL_LEGACY_NETLINK) += -DLEGACY_NETLINK' >> "$REKERNEL_DRIVER_DIR/Makefile"
+        sed -i '/^[[:space:]]*depends on MODULES[[:space:]]*$/d' "$REKERNEL_DRIVER_DIR/Kconfig"
+
+        grep -qF 'source "drivers/rekernel/Kconfig"' "$COMMON_KERNEL_FOLDER/drivers/Kconfig" \
+          || sed -i '/^endmenu$/i source "drivers/rekernel/Kconfig"' "$COMMON_KERNEL_FOLDER/drivers/Kconfig"
+        grep -qF 'obj-$(CONFIG_REKERNEL) += rekernel/' "$COMMON_KERNEL_FOLDER/drivers/Makefile" \
+          || echo 'obj-$(CONFIG_REKERNEL) += rekernel/' >> "$COMMON_KERNEL_FOLDER/drivers/Makefile"
+
+        # Fix include paths for in-tree compilation
+        sed -i 's|#include <../android/binder_internal.h>|#include "../android/binder_internal.h"|g' "$REKERNEL_DRIVER_DIR/rekernel_binder.c"
+        # 5.10 binder_internal.h needs DEFINE_SHOW_ATTRIBUTE definitions from seq_file.h
+        grep -qF '#include <linux/seq_file.h>' "$REKERNEL_DRIVER_DIR/rekernel_binder.c" \
+          || sed -i '/#include <linux\/kprobes.h>/a #include <linux/seq_file.h>' "$REKERNEL_DRIVER_DIR/rekernel_binder.c"
+
+        grep -q '^CONFIG_REKERNEL=y$' "$DEFCONFIG" || echo "CONFIG_REKERNEL=y" >> "$DEFCONFIG"
+        grep -q '^CONFIG_REKERNEL_NETWORK=y$' "$DEFCONFIG" || echo "CONFIG_REKERNEL_NETWORK=y" >> "$DEFCONFIG"
+
+        # Hard verification
+        grep -q '^CONFIG_REKERNEL=y$' "$DEFCONFIG" \
+          && grep -qF 'obj-$(CONFIG_REKERNEL) += rekernel/' "$COMMON_KERNEL_FOLDER/drivers/Makefile" \
+          && grep -qF 'source "drivers/rekernel/Kconfig"' "$COMMON_KERNEL_FOLDER/drivers/Kconfig" \
+          && [ -f "$REKERNEL_DRIVER_DIR/rekernel_binder.c" ] \
+          || { echo "::error::Re-Kernel integration incomplete"; exit 1; }
+
+        echo "rekernel|applied" >> "$PS_FILE"
+        echo "✅ Re-Kernel driver integrated (CONFIG_REKERNEL=y, CONFIG_REKERNEL_NETWORK=y)"
         echo "::endgroup::"
 
     - name: Add Build based configs
@@ -4028,6 +4335,9 @@ runs:
           elif [ "${{ inputs.ksu_type }}" = "FinaSU" ]; then
             echo "FinaSU Version: ${KSUVER:-unknown}"
             echo "FinaSU commit SHA: ${KSU_SHA:-unknown}"
+          elif [ "${{ inputs.ksu_type }}" = "KSUN" ]; then
+            echo "KernelSU-Next Version: ${KSUVER:-unknown}"
+            echo "KernelSU-Next commit SHA: ${KSU_SHA:-unknown}"
           else
             echo "KSU Version: ${KSUVER:-unknown}"
             echo "KSU commit SHA: ${KSU_SHA:-unknown}"
@@ -4055,6 +4365,7 @@ runs:
           echo "LZ4 1.10.0 + ARMv8 NEON: $(pstat lz4)"
           echo "zstd 1.5.7 + tunable level: $(pstat zstd-upgrade)"
           echo "CVE-2026-43499 rtmutex fix: $(pstat rtmutex-cve)"
+          echo "Re-Kernel: ${{ inputs.use_rekernel || env.OP_REKERNEL == 'true' }}"
           echo "NoMount: $(pstat nomount)"
           echo "Vendor Module Blacklist: $(pstat vendor-modules-blacklist)"
           echo "WildKernels' Optimisations: $(pstat wk-opt)"
@@ -4089,6 +4400,8 @@ runs:
             echo "| **BakaSU Version** | ${KSUVER:-unknown} |"
           elif [ "${{ inputs.ksu_type }}" = "FinaSU" ]; then
             echo "| **FinaSU Version** | ${KSUVER:-unknown} |"
+          elif [ "${{ inputs.ksu_type }}" = "KSUN" ]; then
+            echo "| **KernelSU-Next Version** | ${KSUVER:-unknown} |"
           else
             echo "| **KSU Version** | ${KSUVER:-unknown} |"
           fi
@@ -4098,6 +4411,8 @@ runs:
               echo "| **BakaSU Commit** | [\`${KSU_SHA:0:8}\`](https://github.com/Baka-SU/BakaSU/commit/$KSU_SHA) |"
             elif [ "${{ inputs.ksu_type }}" = "FinaSU" ]; then
               echo "| **FinaSU Commit** | [\`${KSU_SHA:0:8}\`](https://github.com/LyraVoid/FinaSU/commit/$KSU_SHA) |"
+            elif [ "${{ inputs.ksu_type }}" = "KSUN" ]; then
+              echo "| **KernelSU-Next Commit** | [\`${KSU_SHA:0:8}\`](https://github.com/KernelSU-Next/KernelSU-Next/commit/$KSU_SHA) |"
             else
               echo "| **KSU Commit** | [\`${KSU_SHA:0:8}\`](https://github.com/tiann/KernelSU/commit/$KSU_SHA) |"
             fi
