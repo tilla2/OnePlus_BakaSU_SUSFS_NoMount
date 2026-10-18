@@ -1644,12 +1644,17 @@ jobs:
           if [ -n "$MANAGER_RUN_ID" ]; then
             echo "✅ Commit-exact manager CI run found: ${MANAGER_RUN_ID}"
             echo "MANAGER_RUN_URL=https://github.com/${MANAGER_REPO}/actions/runs/${MANAGER_RUN_ID}" >> "$GITHUB_ENV"
+            # Artifact names are not standardized upstream (FinaSU: "manager",
+            # KSU/KSUN: unversioned bundles) - no name filter: order likely
+            # manager bundles first and probe every live artifact; the unzip
+            # probe self-filters and the loop stops at the first APK found.
             ART_ROWS=$(gh api "repos/${MANAGER_REPO}/actions/runs/${MANAGER_RUN_ID}/artifacts?per_page=100" \
-              --jq '.artifacts[] | select(.expired == false) | select(.name | test("release"; "i")) | "\(.id) \(.name)"' || true)
+              --jq '[.artifacts[] | select(.expired == false)] | sort_by((.name | test("manager|release|apk"; "i")) | not) | .[] | "\(.id) \(.name)"' || true)
             while read -r aid aname; do
               [ -z "$aid" ] && continue
+              [ -s apk-map.tsv ] && break
               ls -1 *.apk 2>/dev/null | sort > /tmp/apks-before.txt || true
-              gh api "repos/${MANAGER_REPO}/actions/artifacts/${aid}/zip" > "${aname}.zip"
+              gh api "repos/${MANAGER_REPO}/actions/artifacts/${aid}/zip" > "${aname}.zip" || true
               unzip -o -j "${aname}.zip" '*.apk' -d ./ >/dev/null || true
               rm -f "${aname}.zip"
               ls -1 *.apk 2>/dev/null | sort > /tmp/apks-after.txt || true
@@ -1661,7 +1666,7 @@ jobs:
           fi
 
           if ! ls ./*.apk >/dev/null 2>&1; then
-            echo "::warning::No live commit-exact manager build for ${KSU_SHA} (artifact expired or CI absent) — falling back to the latest upstream release"
+            echo "::warning::No live commit-exact manager build for ${KSU_SHA} (CI absent or no artifact contained an APK) — falling back to the latest upstream release"
             LATEST_TAG="$(gh api "repos/${MANAGER_REPO}/releases/latest" --jq '.tag_name' 2>/dev/null || true)"
             if [ -z "$LATEST_TAG" ]; then
               echo "::error::No manager APK could be fetched from ${MANAGER_REPO} for ${KSU_SHA}"
@@ -1933,17 +1938,23 @@ jobs:
             echo "✅ Commit-exact manager CI run found: ${MANAGER_RUN_ID}"
             echo "MANAGER_RUN_URL=https://github.com/${MANAGER_REPO}/actions/runs/${MANAGER_RUN_ID}" >> "$GITHUB_ENV"
             mkdir -p /tmp/mgr
+            # Same non-standardized upstream artifact names - no name filter,
+            # priority-ordered probe (see fetch-manager-apks).
             ART_ROWS=$(gh api "repos/${MANAGER_REPO}/actions/runs/${MANAGER_RUN_ID}/artifacts?per_page=100" \
-              --jq '.artifacts[] | select(.expired == false) | select(.name | test("release"; "i")) | "\(.id) \(.name)"' || true)
+              --jq '[.artifacts[] | select(.expired == false)] | sort_by((.name | test("manager|release|apk"; "i")) | not) | .[] | "\(.id) \(.name)"' || true)
             while read -r aid aname; do
               [ -z "$aid" ] && continue
-              gh api "repos/${MANAGER_REPO}/actions/artifacts/${aid}/zip" > "/tmp/mgr/${aname}.zip"
+              ls -1 *.apk 2>/dev/null | sort > /tmp/mgr/apks-before.txt || true
+              gh api "repos/${MANAGER_REPO}/actions/artifacts/${aid}/zip" > "/tmp/mgr/${aname}.zip" || true
               unzip -o -j "/tmp/mgr/${aname}.zip" '*.apk' -d ./ >/dev/null || true
+              ls -1 *.apk 2>/dev/null | sort > /tmp/mgr/apks-after.txt || true
+              comm -13 /tmp/mgr/apks-before.txt /tmp/mgr/apks-after.txt > /tmp/mgr/new.txt
+              [ -s /tmp/mgr/new.txt ] && break
             done <<< "$ART_ROWS"
           fi
 
           if ! ls ./*.apk >/dev/null 2>&1; then
-            echo "::warning::No live commit-exact manager build for ${KSU_SHA} (artifact expired or CI absent) — falling back to the latest upstream release"
+            echo "::warning::No live commit-exact manager build for ${KSU_SHA} (CI absent or no artifact contained an APK) — falling back to the latest upstream release"
             LATEST_TAG="$(gh api "repos/${MANAGER_REPO}/releases/latest" --jq '.tag_name' 2>/dev/null || true)"
             if [ -z "$LATEST_TAG" ]; then
               echo "::error::No manager APK could be fetched from ${MANAGER_REPO} for ${KSU_SHA}"
@@ -2033,6 +2044,22 @@ jobs:
             ["android14-6.1"]="${{ needs.set-op-model.outputs.susfs_hash_android14_6_1 }}"
             ["android15-6.6"]="${{ needs.set-op-model.outputs.susfs_hash_android15_6_6 }}"
             ["android16-6.12"]="${{ needs.set-op-model.outputs.susfs_hash_android16_6_12 }}"
+          )
+
+          # Provenance per KMI: where each SUSFS pin actually came from, so the
+          # release notes never imply "latest upstream" when a pin was honored.
+          pin_last="${{ inputs.pin_last_success }}"
+          susfs_src_of() {
+            if [ -n "$1" ]; then echo "workflow input pin"
+            elif [ "$pin_last" = "both" ] || [ "$pin_last" = "susfs" ]; then echo "pin store (last successful)"
+            else echo "kmi-default branch"; fi
+          }
+          declare -A susfs_src=(
+            ["android12-5.10"]="$(susfs_src_of "${{ inputs.android12-5_10_susfs_branch_or_commit }}")"
+            ["android13-5.15"]="$(susfs_src_of "${{ inputs.android13-5_15_susfs_branch_or_commit }}")"
+            ["android14-6.1"]="$(susfs_src_of "${{ inputs.android14-6_1_susfs_branch_or_commit }}")"
+            ["android15-6.6"]="$(susfs_src_of "${{ inputs.android15-6_6_susfs_branch_or_commit }}")"
+            ["android16-6.12"]="$(susfs_src_of "${{ inputs.android16-6_12_susfs_branch_or_commit }}")"
           )
 
           IFS=',' read -ra active_gki_keys \
@@ -2186,10 +2213,10 @@ jobs:
 
           ### 📌 SUSFS Branch Mapping
 
-          | Kernel Version | SUSFS Commit |
-          |----------------|--------------|
+          | Kernel Version | SUSFS Commit | Source |
+          |----------------|--------------|--------|
           $(for key in "${active_gki_keys[@]}"; do
-            echo "| $key | \`${susfs_map[$key]:-unknown}\` |"
+            echo "| $key | \`${susfs_map[$key]:-unknown}\` | ${susfs_src[$key]:-unknown} |"
           done)
           EOF
           cat << EOF >> release_notes.md
