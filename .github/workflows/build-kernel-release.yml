@@ -87,7 +87,6 @@ on:
           - OP-ACE-5-ULTRA-6.6.50
           - OP-ACE-5.10.209
           - OP-ACE-5.10.226
-          - OP-ACE-PRO
           - OP-ACE-RACE
           - OP-ACE-RACE-5.10.209
           - OP-ACE-RACE-5.10.226
@@ -161,7 +160,6 @@ on:
           - OP-ACE-5-PRO
           - OP-ACE-5-PRO-6.6.89
           - OP-ACE-5-RACE
-          - OP-ACE-5-RACE-6.1.134
           - OP-ACE-5-ULTRA
           - OP-ACE-5-ULTRA-6.6.89
           - OP-ACE-6
@@ -169,7 +167,6 @@ on:
           - OP-ACE-6-ULTRA
           - OP-ACE-6T
           - OP-N6
-          - OP-N6X
           - OP-NORD-3
           - OP-NORD-4
           - OP-NORD-4-6.1.118
@@ -178,10 +175,8 @@ on:
           - OP-NORD-5-6.1.118
           - OP-NORD-6
           - OP-NORD-CE-5
-          - OP-NORD-CE-5-6.1.134
           - OP-NORD-CE4-LITE
           - OP-NORD-CE4-LITE-6.1.118
-          - OP-NORD-CE6
           - OP-NORD-CE6-LITE
           - OP-OPEN
           - OP-OPEN-5.15.167
@@ -219,8 +214,6 @@ on:
           - OP13r-6.1.118
           - OP15
           - OP15-6.12.58
-          - OP15-6.12.69
-          - OP15-6.12.92
           - OP15T
           - OP15r
           - Myron
@@ -237,7 +230,6 @@ on:
           - KSUN
           - BakaSU
           - KSU
-          - FinaSU
         default: BakaSU
       ksu_branch_or_hash:
         description: 'KSU branch or commit hash'
@@ -525,8 +517,6 @@ jobs:
 
           ksu_type="${{ inputs.ksu_type }}"
           ksu_ref="${{ inputs.ksu_branch_or_hash }}"
-          # FinaSU default branch is master; a leftover dispatch default 'main' would not resolve
-          if [ "$ksu_type" = "FinaSU" ] && [ "$ksu_ref" = "main" ]; then ksu_ref="master"; fi
 
           # ── Load "last successful run" pin store (artifact 'last-success-pins') ──
           PINS_JSON="{}"
@@ -576,12 +566,8 @@ jobs:
             fi
           fi
           if [ -z "$ksu_ref" ]; then
-            case "$ksu_type" in
-              FinaSU) ksu_ref="master" ;;
-              KSUN)   ksu_ref="dev" ;;
-              *)      ksu_ref="main" ;;
-            esac
-            echo "ℹ️  No KSU ref at dispatch and no applicable pin — auto: HEAD of '$ksu_ref' for $ksu_type"
+            ksu_ref="main"
+            echo "ℹ️  No KSU ref at dispatch and no applicable pin — auto: HEAD of 'main' for $ksu_type"
           fi
 
           if [ "$ksu_type" == "BakaSU" ]; then
@@ -590,9 +576,6 @@ jobs:
           elif [ "$ksu_type" == "KSUN" ]; then
             KSU_REPO_OWNER="KernelSU-Next"
             KSU_REPO_NAME="KernelSU-Next"
-          elif [ "$ksu_type" == "FinaSU" ]; then
-            KSU_REPO_OWNER="LyraVoid"
-            KSU_REPO_NAME="FinaSU"
           else
             KSU_REPO_OWNER="tiann"
             KSU_REPO_NAME="KernelSU"
@@ -1442,10 +1425,7 @@ jobs:
           name: patch-faillogs-${{ matrix.model }}
           path: |
             patch-faillogs/
-            kernel_workspace/kernel_platform/common/block/*.rej
-            kernel_workspace/kernel_platform/common/net/ipv4/*.rej
-            kernel_workspace/kernel_platform/common/kernel/*.rej
-            kernel_workspace/kernel_platform/common/kernel/sched/*.rej
+            kernel_workspace/kernel_platform/common/**/*.rej
           if-no-files-found: ignore
 
       - name: 📊 Build statistics
@@ -1626,6 +1606,7 @@ jobs:
             KSUN)      MANAGER_REPO="KernelSU-Next/KernelSU-Next" ;;
             BakaSU)  MANAGER_REPO="Baka-SU/BakaSU" ;;
             KSU)       MANAGER_REPO="tiann/KernelSU" ;;
+            FinaSU)    MANAGER_REPO="LyraVoid/FinaSU" ;;
           esac
           echo "MANAGER_REPO=${MANAGER_REPO}" >> "$GITHUB_ENV"
           echo "Manager repo: $MANAGER_REPO — resolving commit-exact build for ${KSU_SHA}"
@@ -1832,6 +1813,9 @@ jobs:
             KSU)
               root_display="KernelSU"
               ;;
+            FinaSU)
+              root_display="FinaSU"
+              ;;
             *)
               echo "::error::Unsupported root implementation '${{ inputs.ksu_type }}'."
               exit 1
@@ -1911,6 +1895,7 @@ jobs:
             KSUN)      MANAGER_REPO="KernelSU-Next/KernelSU-Next" ;;
             BakaSU)  MANAGER_REPO="Baka-SU/BakaSU" ;;
             KSU)       MANAGER_REPO="tiann/KernelSU" ;;
+            FinaSU)    MANAGER_REPO="LyraVoid/FinaSU" ;;
           esac
           echo "Manager repo: $MANAGER_REPO — resolving commit-exact build for ${KSU_SHA}"
 
@@ -2155,11 +2140,6 @@ jobs:
           | **BakaSU Branch/Hash** | \`$ksu_display\` |
           | **BakaSU Version** | \`$ksu_ver_global\` |
           EOF
-          elif [ "$ksu_type" = "FinaSU" ]; then
-            cat << EOF >> release_notes.md
-          | **FinaSU Branch/Hash** | \`$ksu_display\` |
-          | **FinaSU Version** | \`$ksu_ver_global\` |
-          EOF
           elif [ "$ksu_type" == "KSU" ]; then
             cat << EOF >> release_notes.md
           | **KernelSU Branch** | \`$ksu_display\` |
@@ -2196,10 +2176,6 @@ jobs:
           elif [ "$ksu_type" == "BakaSU" ]; then
             cat << EOF >> release_notes.md
           - **BakaSU** - Kernel-based Android root integration
-          EOF
-          elif [ "$ksu_type" == "FinaSU" ]; then
-            cat << EOF >> release_notes.md
-          - **FinaSU** - Kernel-based Android root integration
           EOF
           elif [ "$ksu_type" == "KSU" ]; then
             cat << EOF >> release_notes.md
@@ -2291,10 +2267,6 @@ jobs:
           elif [ "$ksu_type" == "BakaSU" ]; then
             cat << EOF >> release_notes.md
           - **[BakaSU Team](https://github.com/Baka-SU/BakaSU)** - Root solution
-          EOF
-          elif [ "$ksu_type" == "FinaSU" ]; then
-            cat << EOF >> release_notes.md
-          - **[FinaSU Team](https://github.com/LyraVoid/FinaSU)** - Root solution
           EOF
           elif [ "$ksu_type" == "KSU" ]; then
             cat << EOF >> release_notes.md
