@@ -574,7 +574,7 @@ runs:
                 if (lastminus + 1 != firstplus) adjacent = 0
               }
               # ── v10 universal exact placement ────────────────────────────
-              # The hunk's ENTIRE old side (context + removals, in hunk
+              # The ENTIRE old side of the hunk (context + removals, in hunk
               # order) must match the target verbatim at exactly one
               # contiguous site. No partial-anchor scoring: a 3-of-5 context
               # match is drift, not an anchor. Any interleaving of additions
