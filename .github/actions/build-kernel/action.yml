@@ -23,11 +23,6 @@ inputs:
     required: false
     type: string
     default: ""
-  susfs_last_success:
-    description: 'Per-KMI last-successful SUSFS ref from the pin store — fallback candidate for the fuzz=0 vintage probe. Never forced; the branch-head ref stays the default'
-    required: false
-    type: string
-    default: ""
   nomount_commit:
     description: 'NoMount commit SHA to pin (empty = built-in known-good fallback pin)'
     required: false
@@ -1384,10 +1379,6 @@ runs:
           fi
           echo "SUSFS_REF=$SUSFS_BRANCH" >> "$GITHUB_ENV"
           echo "SUSFS_REF_SOURCE=$SUSFS_REF_SOURCE" >> "$GITHUB_ENV"
-          # v10: per-KMI last-successful ref (fallback candidate for the vintage probe; never forced)
-          SUSFS_LAST_SUCCESS="$(jq -r --arg k "$KERNEL_KEY" '.[$k] // empty' <<<"${{ inputs.susfs_last_success }}" 2>/dev/null || true)"
-          echo "SUSFS_LAST_SUCCESS=$SUSFS_LAST_SUCCESS" >> "$GITHUB_ENV"
-          if [ -n "$SUSFS_LAST_SUCCESS" ]; then echo "ℹ️  Vintage probe armed: last-successful SUSFS ref for $KERNEL_KEY = $SUSFS_LAST_SUCCESS"; fi
         fi
         
         retry_fetch_archive() {
@@ -2147,10 +2138,10 @@ runs:
         # snapshot (saved from a mid/post-patch run) surfaces either as a bogus
         # "already=<most hunks>" classification with a self-verify revert, or as a
         # single unresolved hunk (task_mmu.c bypass_orig_flow) — both observed on
-        # v10: the same refusal signature also arises from SUSFS vintage drift (a
-        # branch-head patch rebased past this tree's GKI baseline); the pre-stage
-        # vintage probe in the SUSFS patch step falls back to the per-KMI
-        # last-successful ref before staging, so drift no longer reaches this guard.
+        # v10: a refusal with this signature can also stem from SUSFS vintage
+        # drift (a branch-head patch rebased past this tree's GKI baseline),
+        # but that is handled downstream by the exact-placement regen; this
+        # guard only rejects dirty caches.
         # FinaSU runs restoring a dirty variant-keyed source cache. Fail loud with
         # the remedy instead of a confusing patchgen cascade.
         if [ -f "./fs/susfs.c" ] || grep -q "CONFIG_KSU_SUSFS" ./fs/Makefile 2>/dev/null; then
@@ -2294,49 +2285,6 @@ runs:
           echo "[patchgen] susfs-main: pre-shimming mm/memory.c SUS_MAP include block (patch lacks it)"
           sed -i '/#include <linux\/vmalloc.h>/a #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n#include <linux\/susfs_def.h>\n#endif \/\/ #ifdef CONFIG_KSU_SUSFS_SUS_MAP' mm/memory.c
         fi
-        # ── SUSFS vintage probe (v10, universal): dry-run the exact patch at
-        # fuzz=0 against the still-pristine tree BEFORE staging. The
-        # branch-head patch is generated upstream against that branch's
-        # current GKI baseline; a source tree of an older vintage
-        # legitimately lacks drifted context (show_smaps_rollup rework:
-        # vma_data_pages() / reworked smap_gather_stats()). On probe failure
-        # fall back to the per-KMI last-successful ref — probe-verified and
-        # loudly logged. Head stays the default; pins stay optional
-        # overrides; explicit input pins skip this entirely.
-        SUSFS_EFFECTIVE_REF="${SUSFS_REF:-unknown}"
-        if [ "${SUSFS_REF_SOURCE:-}" = "kmi-default branch" ] && [ -n "${SUSFS_LAST_SUCCESS:-}" ] && [ "${SUSFS_LAST_SUCCESS}" != "${SUSFS_REF:-}" ]; then
-          probe_log="$(mktemp)"
-          if ! patch -p1 --dry-run --forward --fuzz=0 --no-backup-if-mismatch < "$patch_to_apply" > "$probe_log" 2>&1; then
-            drift_ct=$(grep -c 'FAILED' "$probe_log" || true)
-            echo "::warning::SUSFS branch-head ${SUSFS_REF} failed the fuzz=0 pre-stage probe (${drift_ct} hunk(s) unmatched — patch vintage postdates this source tree; typical signature: fs/proc/task_mmu.c show_smaps_rollup rework). Falling back to last-successful SUSFS ref ${SUSFS_LAST_SUCCESS} for this tree. Override anytime via the susfs input for this KMI."
-            pin_dir="$(mktemp -d)"
-            pin_ok=0
-            for pin_attempt in 1 2 3; do
-              if curl -sfL --retry 2 "https://gitlab.com/simonpunk/susfs4ksu/-/archive/${SUSFS_LAST_SUCCESS}/susfs4ksu-${SUSFS_LAST_SUCCESS}.tar.gz" -o "$pin_dir/pin.tar.gz" \
-                 && tar xzf "$pin_dir/pin.tar.gz" -C "$pin_dir" --wildcards '*/kernel_patches/50_add_susfs_in_*.patch' 2>/dev/null \
-                 && pin_patch="$(find "$pin_dir" -name "50_add_susfs_in_${SUSFS_KERNEL_BRANCH}.patch" -print -quit)" \
-                 && [ -n "$pin_patch" ]; then
-                pin_ok=1
-                break
-              fi
-              sleep 5
-            done
-            if [ "$pin_ok" != "1" ]; then
-              echo "::error::SUSFS vintage fallback fetch failed for ${SUSFS_LAST_SUCCESS} (archive unreachable or no 50_add_susfs_in_${SUSFS_KERNEL_BRANCH}.patch in it)"
-              exit 1
-            fi
-            if ! patch -p1 --dry-run --forward --fuzz=0 --no-backup-if-mismatch < "$pin_patch" > "$probe_log" 2>&1; then
-              echo "::error::Both SUSFS branch-head ${SUSFS_REF} and last-successful ${SUSFS_LAST_SUCCESS} failed the fuzz=0 pre-stage probe — this source tree needs a hand-ported susfs patch (see patch-faillogs/)"
-              exit 1
-            fi
-            patch_to_apply="$pin_patch"
-            SUSFS_EFFECTIVE_REF="$SUSFS_LAST_SUCCESS"
-            echo "susfs-fallback|${SUSFS_REF}|${SUSFS_LAST_SUCCESS}" >> "$PS_FILE"
-            echo "[patchgen] susfs-main: vintage fallback engaged — staging ${SUSFS_LAST_SUCCESS} instead of branch-head ${SUSFS_REF}"
-          fi
-          rm -f "$probe_log"
-          echo "SUSFS_EFFECTIVE_REF=$SUSFS_EFFECTIVE_REF" >> "$GITHUB_ENV"
-        fi
         source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
         # susfs-main is redundant (and self-contradictory) when the synced tree
         # already wires SUSFS into fs/Makefile (pre-integrated community/FinaSU
@@ -2348,7 +2296,7 @@ runs:
         else
           gen_patch susfs-main "$patch_to_apply" "" "g:fs/Makefile|susfs.o"
           if ! grep -Eq '^susfs-main\|(applied|already)' "$PS_FILE" 2>/dev/null; then
-            echo "::error::SUSFS kernel patch failed to stage at fuzz=0 (resolved SUSFS ref: ${SUSFS_REF:-unknown}, source: ${SUSFS_REF_SOURCE:-unknown}, effective: ${SUSFS_EFFECTIVE_REF:-same}). Known causes: (1) SUSFS vintage drift — the branch-head patch is generated upstream against a newer GKI baseline than this source tree (signature: fs/proc/task_mmu.c show_smaps_rollup context with vma_data_pages()/reworked smap_gather_stats() that older vintages like 6.12.23 lack); the pre-stage vintage probe falls back to the per-KMI last-successful ref when the pin store has one, or dispatch a newer source vintage (e.g. OP15-6.12.58/69/92), or set the susfs input for this KMI explicitly; (2) dirty/restored source cache — the pristine guard above flags the bypass_orig_flow signature; (3) a manual pin that does not match this kernel tree (see patch-faillogs/)"
+            echo "::error::SUSFS kernel patch failed to stage at fuzz=0 (resolved SUSFS ref: ${SUSFS_REF:-unknown}, source: ${SUSFS_REF_SOURCE:-unknown}). Known causes: (1) SUSFS vintage drift — the branch-head patch is generated upstream against a newer GKI baseline than this source tree (signature: fs/proc/task_mmu.c show_smaps_rollup context with vma_data_pages()/reworked smap_gather_stats() that older vintages like 6.12.23 lack); dispatch a newer source vintage (e.g. OP15-6.12.58/69/92) or set the susfs input for this KMI explicitly; (2) dirty/restored source cache — the pristine guard above flags the bypass_orig_flow signature; (3) a manual pin that does not match this kernel tree (see patch-faillogs/)"
             exit 1
           fi
         fi

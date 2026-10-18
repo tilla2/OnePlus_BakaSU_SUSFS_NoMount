@@ -533,7 +533,7 @@ jobs:
 
           # ── Load "last successful run" pin store (artifact 'last-success-pins') ──
           PINS_JSON="{}"
-          if true; then  # v10: store is ALWAYS loaded — toggles force refs; the load also seeds the SUSFS vintage probe's fallback
+          if true; then  # v10: store is ALWAYS loaded — pin toggles force refs when set
             pins_art="$(gh api "repos/${{ github.repository }}/actions/artifacts?name=last-success-pins&per_page=100" \
               --jq '[.artifacts[] | select(.expired == false)] | sort_by(.id) | last | .id // empty' 2>/dev/null || true)"
             if [ -z "$pins_art" ]; then
@@ -558,8 +558,6 @@ jobs:
             else
               echo "ℹ️  No pins stored yet (no live 'last-success-pins' artifact) — pin toggles fail loudly until a first successful build records one"
             fi
-          else
-            echo "ℹ️  pin_last_success=none — store loaded for the SUSFS vintage probe only (no refs are forced)"
           fi
 
           # ── Root manager: pin (type-locked to the stored KSU type) > dispatch ref > auto (HEAD of the type default branch) ──
@@ -698,7 +696,6 @@ jobs:
           declare -A susfs_hashes
           declare -A susfs_srcs
           declare -A susfs_versions_per_key
-          declare -A susfs_last_success
           SUSFS_CLONE_REPO=""
 
           for key in "${active_keys[@]}"; do
@@ -707,10 +704,9 @@ jobs:
             stored_susfs=""
             susfs_src=""
             # ── SUSFS: "same as last successful run" for this GKI/KMI ──
-            # v10: the stored ref is captured unconditionally. With the toggle
-            # it FORCES the ref (below); without it, it only seeds the build
-            # job's fuzz=0 vintage probe as a fallback candidate — the
-            # branch-head ref stays the default either way.
+            # The stored ref only applies when the pin toggle
+            # (pin_last_success=susfs|both) forces it below; otherwise the
+            # per-KMI dispatch input or the branch head is used.
             if [ -z "${user_inputs[$key]}" ]; then
               stored_susfs="$(jq -r --arg k "$key" '.susfs[$k] // empty' <<<"$PINS_JSON")"
             fi
@@ -730,7 +726,6 @@ jobs:
               susfs_src="branch head (${user_val})"
             fi
             susfs_srcs["$key"]="$susfs_src"
-            susfs_last_success["$key"]="${stored_susfs:-}"
 
             HASH_QUERY="{ project(fullPath: \"${GITLAB_PROJECT_PATH}\") { repository { ch: commit(ref: \"${user_val}\") { sha } } } }"
             RELEASE_QUERY="{ project(fullPath: \"${GITLAB_PROJECT_PATH}\") { repository { ch: commit(ref: \"${user_val}\") { sha } blobs(paths: [\"kernel_patches/include/linux/susfs.h\"], ref: \"${user_val}\") { nodes { rawBlob } } } } }"
@@ -817,19 +812,6 @@ jobs:
           echo "susfs_hash_android14_6_1=${susfs_hashes[android14-6.1]:-unknown}"   >> "$GITHUB_OUTPUT"
           echo "susfs_hash_android15_6_6=${susfs_hashes[android15-6.6]:-unknown}"   >> "$GITHUB_OUTPUT"
           echo "susfs_hash_android16_6_12=${susfs_hashes[android16-6.12]:-unknown}" >> "$GITHUB_OUTPUT"
-          echo "susfs_last_success_android12_5_10=${susfs_last_success[android12-5.10]:-}" >> "$GITHUB_OUTPUT"
-          echo "susfs_last_success_android13_5_15=${susfs_last_success[android13-5.15]:-}" >> "$GITHUB_OUTPUT"
-          echo "susfs_last_success_android14_6_1=${susfs_last_success[android14-6.1]:-}" >> "$GITHUB_OUTPUT"
-          echo "susfs_last_success_android15_6_6=${susfs_last_success[android15-6.6]:-}" >> "$GITHUB_OUTPUT"
-          echo "susfs_last_success_android16_6_12=${susfs_last_success[android16-6.12]:-}" >> "$GITHUB_OUTPUT"
-          susfs_last_json=$(jq -n \
-            --arg a12 "${susfs_last_success[android12-5.10]:-}" \
-            --arg a13 "${susfs_last_success[android13-5.15]:-}" \
-            --arg a14 "${susfs_last_success[android14-6.1]:-}" \
-            --arg a15 "${susfs_last_success[android15-6.6]:-}" \
-            --arg a16 "${susfs_last_success[android16-6.12]:-}" \
-            '{"android12-5.10": $a12, "android13-5.15": $a13, "android14-6.1": $a14, "android15-6.6": $a15, "android16-6.12": $a16}')
-          echo "susfs_last_success_json=$susfs_last_json" >> "$GITHUB_OUTPUT"
           echo "susfs_src_android12_5_10=${susfs_srcs[android12-5.10]:-unknown}" >> "$GITHUB_OUTPUT"
           echo "susfs_src_android13_5_15=${susfs_srcs[android13-5.15]:-unknown}" >> "$GITHUB_OUTPUT"
           echo "susfs_src_android14_6_1=${susfs_srcs[android14-6.1]:-unknown}" >> "$GITHUB_OUTPUT"
@@ -1497,7 +1479,6 @@ jobs:
           ksu_type: ${{ matrix.ksu_type }}
           ksu_branch_or_hash: ${{ matrix.ksu_resolved_hash }}
           susfs_commit_hash_or_branch: ${{ matrix.susfs_resolved_hash }}
-          susfs_last_success: ${{ steps.set-matrix-final.outputs.susfs_last_success_json }}
           nomount_commit: ${{ needs.resolve-nomount.outputs.nomount_commit }}
           optimize_level: ${{ inputs.optimize_level }}
           build_timestamp: ${{ inputs.build_timestamp }}
@@ -2171,15 +2152,6 @@ jobs:
             ["android16-6.12"]="${{ needs.set-op-model.outputs.susfs_hash_android16_6_12 }}"
           )
 
-          # v10: per-KMI last-successful SUSFS refs — fallback candidates for
-          # the build job's fuzz=0 vintage probe (never forced).
-          declare -A susfs_last_map=(
-            ["android12-5.10"]="${{ needs.set-op-model.outputs.susfs_last_success_android12_5_10 }}"
-            ["android13-5.15"]="${{ needs.set-op-model.outputs.susfs_last_success_android13_5_15 }}"
-            ["android14-6.1"]="${{ needs.set-op-model.outputs.susfs_last_success_android14_6_1 }}"
-            ["android15-6.6"]="${{ needs.set-op-model.outputs.susfs_last_success_android15_6_6 }}"
-            ["android16-6.12"]="${{ needs.set-op-model.outputs.susfs_last_success_android16_6_12 }}"
-          )
 
           # Provenance per KMI: where each SUSFS pin actually came from, so the
           # release notes never imply "latest upstream" when a pin was honored.
