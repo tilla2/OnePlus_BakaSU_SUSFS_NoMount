@@ -915,7 +915,7 @@ jobs:
           ksu_ref="${{ inputs.ksu_branch_or_hash }}"
 
           ksu_display=""
-          if [ "$ksu_type" = "BakaSU" ] || [ "$ksu_type" = "KSU" ] || [ "$ksu_type" = "KSUN" ]; then
+          if [ "$ksu_type" = "BakaSU" ] || [ "$ksu_type" = "KSU" ] || [ "$ksu_type" = "KSUN" ] || [ "$ksu_type" = "FinaSU" ]; then
             if [[ "$ksu_ref" =~ ^[0-9a-f]{40}$ ]]; then
               ksu_display+="📌 \`$ksu_type\`, \`$ksu_ref\`"
             else
@@ -1472,6 +1472,8 @@ jobs:
               echo "  - BakaSU: v${{ steps.build.outputs.ksu_version }}"
             elif [ "${{ matrix.ksu_type }}" = "KSUN" ]; then
               echo "  - KernelSU Next: v${{ steps.build.outputs.ksu_version }}"
+            elif [ "${{ matrix.ksu_type }}" = "FinaSU" ]; then
+              echo "  - FinaSU: v${{ steps.build.outputs.ksu_version }}"
             else
               echo "  - KSU: v${{ steps.build.outputs.ksu_version }}"
             fi
@@ -1529,6 +1531,10 @@ jobs:
                       elif [ "${{ matrix.ksu_type }}" = "KSUN" ]; then
                         cat >> $GITHUB_STEP_SUMMARY << EOF
                     | **KernelSU Next** | v${{ steps.build.outputs.ksu_version }} |
+          EOF
+                      elif [ "${{ matrix.ksu_type }}" = "FinaSU" ]; then
+                        cat >> $GITHUB_STEP_SUMMARY << EOF
+                    | **FinaSU** | v${{ steps.build.outputs.ksu_version }} |
           EOF
                       else
               cat >> $GITHUB_STEP_SUMMARY << EOF
@@ -1626,6 +1632,7 @@ jobs:
             KSUN)      MANAGER_REPO="KernelSU-Next/KernelSU-Next" ;;
             BakaSU)  MANAGER_REPO="Baka-SU/BakaSU" ;;
             KSU)       MANAGER_REPO="tiann/KernelSU" ;;
+            FinaSU)    MANAGER_REPO="LyraVoid/FinaSU" ;;
           esac
           echo "MANAGER_REPO=${MANAGER_REPO}" >> "$GITHUB_ENV"
           echo "Manager repo: $MANAGER_REPO — resolving commit-exact build for ${KSU_SHA}"
@@ -1832,6 +1839,9 @@ jobs:
             KSU)
               root_display="KernelSU"
               ;;
+            FinaSU)
+              root_display="FinaSU"
+              ;;
             *)
               echo "::error::Unsupported root implementation '${{ inputs.ksu_type }}'."
               exit 1
@@ -1911,6 +1921,7 @@ jobs:
             KSUN)      MANAGER_REPO="KernelSU-Next/KernelSU-Next" ;;
             BakaSU)  MANAGER_REPO="Baka-SU/BakaSU" ;;
             KSU)       MANAGER_REPO="tiann/KernelSU" ;;
+            FinaSU)    MANAGER_REPO="LyraVoid/FinaSU" ;;
           esac
           echo "Manager repo: $MANAGER_REPO — resolving commit-exact build for ${KSU_SHA}"
 

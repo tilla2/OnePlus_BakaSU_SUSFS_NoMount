@@ -768,7 +768,10 @@ runs:
             echo "${name}|failed" >> "$psf"
             return 0
           fi
-          if ! verify_applied "$name" "$src"; then
+          # Verify only the content this run actually placed (regen.patch).
+          # Sampling the full original patch re-flags hunks classified "already"
+          # (e.g. FinaSU drift-fixed files) as misses and reverts a clean apply.
+          if ! verify_applied "$name" "${base}/regen.patch"; then
             {
               echo "[patchgen] ${name} self-verification FAILED (sampled added lines missing after apply)."
               echo "  Reverse-applying the patch to keep the tree consistent."
@@ -2190,10 +2193,19 @@ runs:
           sed -i '/#include <linux\/vmalloc.h>/a #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n#include <linux\/susfs_def.h>\n#endif \/\/ #ifdef CONFIG_KSU_SUSFS_SUS_MAP' mm/memory.c
         fi
         source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        gen_patch susfs-main "$patch_to_apply" "" "g:fs/Makefile|susfs.o"
-        if ! grep -Eq '^susfs-main\|(applied|already)' "$PS_FILE" 2>/dev/null; then
-          echo "::error::SUSFS kernel patch failed to stage at fuzz=0 (see patch-faillogs/)"
-          exit 1
+        # susfs-main is redundant (and self-contradictory) when the synced tree
+        # already wires SUSFS into fs/Makefile (pre-integrated community/FinaSU
+        # sources). Nothing earlier in this run wires it: 10_enable_susfs_for_ksu
+        # only touches kernel/*. Skip instead of stacking a second integration.
+        if grep -qF 'obj-$(CONFIG_KSU_SUSFS) += susfs.o' fs/Makefile; then
+          echo "[patchgen] susfs-main: fs/Makefile already wires CONFIG_KSU_SUSFS - skipping susfs-main"
+          echo "susfs-main|already" >> "$PS_FILE"
+        else
+          gen_patch susfs-main "$patch_to_apply" "" "g:fs/Makefile|susfs.o"
+          if ! grep -Eq '^susfs-main\|(applied|already)' "$PS_FILE" 2>/dev/null; then
+            echo "::error::SUSFS kernel patch failed to stage at fuzz=0 (see patch-faillogs/)"
+            exit 1
+          fi
         fi
         echo "✅ [susfs-main] verified"
         if [ -n "$filtered_kernel_patch" ]; then
