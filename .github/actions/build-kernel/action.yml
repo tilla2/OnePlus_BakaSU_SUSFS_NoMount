@@ -739,33 +739,58 @@ runs:
             fi
           else
             staged=0; already_ct=0; failed_ct=0; failed_list=""
-            for h in $hlist; do
-              htarget=$( { grep -m1 -E '^\+\+\+ ' "$h" || true; } | awk '{print $2}')
-              if blk_already "$h" "$md"; then
-                already_ct=$((already_ct+1))
-              elif patch -p1 --forward --fuzz=0 --no-backup-if-mismatch -d "$md" < "$h" >> "${base}/stage.log" 2>&1; then
-                staged=$((staged+1))
-              elif patch -p1 --dry-run -R --fuzz=0 -d "$md" < "$h" >> "${base}/stage.log" 2>&1; then
-                already_ct=$((already_ct+1))
-              else
-                rcv=0
-                verdict=$(regen_hunk "$h" "$md") || rcv=$?
-                if [ "$rcv" = "0" ]; then
-                  staged=$((staged+1))
-                  echo "hunk ${h##*/} regenerated exactly: ${verdict}" >> "${base}/stage.log"
-                  echo "[patchgen] ${name}: REGEN ${h##*/} (${htarget:-?}): ${verdict}"
-                elif [ "$rcv" = "2" ]; then
+            # Multi-pass hunk relaxation: hunks anchor independently, so a
+            # hunk whose validity depends on another hunk's insertion (e.g.
+            # a `goto L;` whose `L:` label a later hunk introduces) can fail
+            # a single pass purely because its counterpart is not in the
+            # tree yet. Retry outstanding hunks after every successful
+            # placement round and stop when a round places nothing.
+            # Universal — no per-patch special cases; hunks still unresolved
+            # after the passes fail loudly naming the hunk id.
+            pass=0
+            : > "${base}/pending"
+            for h in $hlist; do printf '%s\n' "$h" >> "${base}/pending"; done
+            while [ -s "${base}/pending" ] && [ "$pass" -le 8 ]; do
+              pass=$((pass+1))
+              progress=0
+              : > "${base}/next"
+              while IFS= read -r h; do
+                htarget=$( { grep -m1 -E '^\+\+\+ ' "$h" || true; } | awk '{print $2}')
+                if blk_already "$h" "$md"; then
                   already_ct=$((already_ct+1))
-                  echo "hunk ${h##*/} already in tree: ${verdict}" >> "${base}/stage.log"
-                  echo "[patchgen] ${name}: SKIP ${h##*/} (${htarget:-?}): already in tree"
+                elif patch -p1 --forward --fuzz=0 --no-backup-if-mismatch -d "$md" < "$h" >> "${base}/stage.log" 2>&1; then
+                  staged=$((staged+1)); progress=$((progress+1))
+                elif patch -p1 --dry-run -R --fuzz=0 -d "$md" < "$h" >> "${base}/stage.log" 2>&1; then
+                  already_ct=$((already_ct+1))
                 else
-                  failed_ct=$((failed_ct+1))
-                  echo "hunk not stageable: ${h##*/} (${verdict})" >> "${base}/stage.log"
-                  echo "[patchgen] ${name}: FAIL ${h##*/} (${htarget:-?}): ${verdict}"
-                  failed_list+="$(basename "$h") "
+                  rcv=0
+                  verdict=$(regen_hunk "$h" "$md") || rcv=$?
+                  if [ "$rcv" = "0" ]; then
+                    staged=$((staged+1)); progress=$((progress+1))
+                    echo "hunk ${h##*/} regenerated exactly (pass ${pass}): ${verdict}" >> "${base}/stage.log"
+                    echo "[patchgen] ${name}: REGEN ${h##*/} (${htarget:-?}): ${verdict} [pass ${pass}]"
+                  elif [ "$rcv" = "2" ]; then
+                    already_ct=$((already_ct+1))
+                    echo "hunk ${h##*/} already in tree: ${verdict}" >> "${base}/stage.log"
+                    echo "[patchgen] ${name}: SKIP ${h##*/} (${htarget:-?}): already in tree"
+                  else
+                    printf '%s\n' "$h" >> "${base}/next"
+                  fi
                 fi
-              fi
+              done < "${base}/pending"
+              mv "${base}/next" "${base}/pending"
+              if [ "$progress" -eq 0 ]; then break; fi
             done
+            if [ -s "${base}/pending" ]; then
+              while IFS= read -r h; do
+                failed_ct=$((failed_ct+1))
+                htarget=$( { grep -m1 -E '^\+\+\+ ' "$h" || true; } | awk '{print $2}')
+                echo "hunk not stageable: ${h##*/} (unresolved after ${pass} relaxation passes)" >> "${base}/stage.log"
+                echo "[patchgen] ${name}: FAIL ${h##*/} (${htarget:-?}): unresolved after ${pass} relaxation passes"
+                failed_list+="$(basename "$h") "
+              done < "${base}/pending"
+            fi
+            rm -f "${base}/pending"
             find "$md" -name '*.rej' -delete 2>/dev/null || true
             find "$md" -name '*.orig' -delete 2>/dev/null || true
             echo "[patchgen] ${name}: staged=${staged} already=${already_ct} failed=${failed_ct}"
@@ -4045,6 +4070,54 @@ runs:
         ccache -s | head -n 20
         echo "============================================"
         
+        # Dedup gki_defconfig before kconfig runs: fragment appends can repeat
+        
+        # symbols already present, and kconfig emits "override: reassigning to
+        
+        # symbol" for each duplicate. Keeping the LAST occurrence of each symbol
+        
+        # is exactly the semantics kconfig applies — without the warning noise.
+        
+        DF="$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig"
+        
+        if [ -f "$DF" ]; then
+        
+          awk '
+        
+            {
+        
+              line[NR] = $0; sym = ""
+        
+              if (match($0, /^# CONFIG_[A-Za-z0-9_]+ is not set$/)) { s = substr($0, 3); sub(/ is not set$/, "", s); sym = s }
+        
+              else if (match($0, /^CONFIG_[A-Za-z0-9_]+=/)) { sym = substr($0, RSTART, RLENGTH - 1) }
+        
+              if (sym != "") { last[sym] = NR; seen[sym]++ }
+        
+            }
+        
+            END {
+        
+              for (i = 1; i <= NR; i++) {
+        
+                cur = line[i]; s = ""
+        
+                if (match(cur, /^# CONFIG_[A-Za-z0-9_]+ is not set$/)) { t = substr(cur, 3); sub(/ is not set$/, "", t); s = t }
+        
+                else if (match(cur, /^CONFIG_[A-Za-z0-9_]+=/)) { s = substr(cur, RSTART, RLENGTH - 1) }
+        
+                if (s != "" && seen[s] > 1 && last[s] != i) next
+        
+                print cur
+        
+              }
+        
+            }
+        
+          ' "$DF" > "$DF.tmp" && mv "$DF.tmp" "$DF"
+        
+        fi
+        
         make LD="$COMMON_KERNEL_FOLDER/ld-wrapper" HOSTLD="$COMMON_KERNEL_FOLDER/ld-wrapper" O="$OUT" gki_defconfig
         
         # Compiling without an OEM-like release suffix is forbidden (see the branding step).
@@ -4257,7 +4330,10 @@ runs:
         fi
         
         if [ -f "$COMMON_KERNEL_FOLDER/build.log" ]; then
-          WARNINGS_COUNT="$(grep -ciE '\bwarning:' "$COMMON_KERNEL_FOLDER/build.log" || true)"
+          # Compiler diagnostics only (file:line:col: warning: …). The previous
+          # case-insensitive substring grep also swept script/config notices such as
+          # the "Unexpected CONFIG_* value found" self-check into this count.
+          WARNINGS_COUNT="$(grep -cE '^[^ :]+:[0-9]+:[0-9]+: warning: ' "$COMMON_KERNEL_FOLDER/build.log" 2>/dev/null || true)"
           [ -n "$WARNINGS_COUNT" ] || WARNINGS_COUNT="0"
         else
           WARNINGS_COUNT="0"
@@ -4298,7 +4374,7 @@ runs:
         printf 'build_time=%s\n' "$BUILD_TIME" >> "$GITHUB_OUTPUT"
         
         echo "✅ Validation passed:"
-        echo "   - Warnings: $WARNINGS_COUNT"
+        echo "   - C warnings (compiler only): $WARNINGS_COUNT"
         echo "   - Image size: $(numfmt --to=iec-i --suffix=B "$IMG_SIZE")"
         echo "   - SHA256: $IMG_SHA256"
         echo "   - Build time: ${BUILD_TIME}s"
@@ -4434,7 +4510,7 @@ runs:
           echo "Image SHA256: ${{ steps.collect_stats.outputs.image_sha256 }}"
           echo "AnyKernel3 ZIP SHA256: ${{ steps.create_zip.outputs.zip_sha256 }}"
           echo "Compiler: ${CLANG_VERSION:-unknown}"
-          echo "Warnings Count: ${{ steps.collect_stats.outputs.warnings_count }}"
+          echo "C Warnings (compiler only; kconfig/script notices excluded): ${{ steps.collect_stats.outputs.warnings_count }}"
           echo "Build Time: ${{ steps.collect_stats.outputs.build_time }}s"
           if [ "${{ inputs.clean }}" == "false" ]; then
             echo "ccache Hit Rate: ${{ steps.ccache_stats.outputs.hit_rate }}"
