@@ -613,15 +613,14 @@ runs:
                 } else {
                   scanlo = floor + 1; scanhi = n + 1
                 }
+                lead_nb = 0; for (m = 1; m <= nl; m++) if (nonblank(lctx[m])) lead_nb++
+                trail_nb = 0; for (m = 1; m <= nt; m++) if (nonblank(tctx[m])) trail_nb++
                 best = 0; ties = 0; bestpos = 0
                 for (i = scanlo; i <= scanhi; i++) {
                   k = sufmatch(i, nl); t = prefmatch(i, nt)
+                  # full context run on at least one side, else fallbacks decide
+                  if (!((k == nl && k > 0 && lead_nb > 0) || (t == nt && t > 0 && trail_nb > 0))) continue
                   score = k + t
-                  if (score == 0) continue
-                  ok = 0
-                  for (m = 1; m <= k && !ok; m++) if (nonblank(lctx[nl - k + m])) ok = 1
-                  for (m = 1; m <= t && !ok; m++) if (nonblank(tctx[m])) ok = 1
-                  if (!ok) continue
                   if (score > best) { best = score; bestpos = i; ties = 1 }
                   else if (score == best) ties++
                 }
@@ -668,6 +667,7 @@ runs:
                 if (score > best) { best = score; bestj = j; ties = 1 }
                 else if (score == best) ties++
               }
+              if (nsites > 1 && best == 0) fail2("ambiguous removed-block site (" nsites " verbatim, no anchor context to disambiguate)")
               if (nsites > 1 && ties > 1) fail2("ambiguous removed-block site (" nsites " verbatim, " ties " equally good)")
               j = bestj
               for (i = 1; i < j; i++) print fl[i]
@@ -1781,6 +1781,17 @@ runs:
         if [ -n "$KSU_INPUT" ]; then
           git -C KernelSU checkout --detach "$KSU_INPUT" 2>/dev/null \
             || { git -C KernelSU fetch origin "$KSU_INPUT" && git -C KernelSU checkout --detach "$KSU_INPUT"; }
+        fi
+
+        # FinaSU keeps its UAPI headers at the repo root; the driver reaches them via
+        # include/uapi -> ../../uapi, which only resolves in upstream's M= build layout.
+        # In-tree, drivers/kernelsu addresses KernelSU/kernel, so materialize the root
+        # uapi/ inside the driver dir; fail loudly if upstream moves it.
+        if [ ! -e KernelSU/kernel/uapi/app_profile.h ]; then
+          [ -f KernelSU/uapi/app_profile.h ] \
+            || { echo "::error::FinaSU uapi headers not found at KernelSU/uapi (upstream layout changed)"; exit 1; }
+          mkdir -p KernelSU/kernel/uapi
+          cp KernelSU/uapi/*.h KernelSU/kernel/uapi/
         fi
 
         # FinaSU ships no setup.sh for in-tree use - wire it manually:
