@@ -4006,6 +4006,15 @@ runs:
         export PAHOLE="$KERNEL_PLATFORM_FOLDER/prebuilts/kernel-build-tools/linux-x86/bin/pahole"
         export LD=ld.lld HOSTLD=ld.lld AR=llvm-ar NM=llvm-nm 
         export OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
+
+        # FinaSU's Kbuild computes KSU_KERNEL_DIR := $(srctree)/$(src), which
+        # double-prefixes $(src) in O= in-tree builds and breaks both the -I flags
+        # and the preinit runner.elf prerequisite. The `ifndef KSU_KERNEL_DIR`
+        # guard is an override hook: export the absolute path and every KSU_KERNEL_DIR
+        # use (includes, runner rule, wildcard deps) resolves correctly.
+        if [ "${{ inputs.ksu_type }}" = "FinaSU" ] && [ -d "$KERNEL_PLATFORM_FOLDER/KernelSU/kernel" ]; then
+          export KSU_KERNEL_DIR="$KERNEL_PLATFORM_FOLDER/KernelSU/kernel"
+        fi
         
         set +u
         source "$KERNEL_PLATFORM_FOLDER/build/kernel/_setup_env.sh" 2>/dev/null || true
