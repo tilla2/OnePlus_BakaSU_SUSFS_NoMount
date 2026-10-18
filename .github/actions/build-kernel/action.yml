@@ -1288,12 +1288,12 @@ runs:
       if: ${{ inputs.clean == false || inputs.clean == 'false' }}
       with:
         cache_path: ${{ env.CCACHE_DIR }}
-        cache_key: ${{ inputs.ksu_type }}-v3-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-${{ env.KERNEL_FULL_VER }}-${{ env.CLANG_VERSION_SHORT }}
+        cache_key: ${{ inputs.ksu_type }}-v4-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-${{ env.KERNEL_FULL_VER }}-${{ env.CLANG_VERSION_SHORT }}
         cache_bucket: "ccache-cache"
         debug: ${{ inputs.debug }}
         restore_keys: |
-          ${{ inputs.ksu_type }}-v3-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-${{ env.KERNEL_FULL_VER }}-
-          ${{ inputs.ksu_type }}-v3-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-
+          ${{ inputs.ksu_type }}-v4-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-${{ env.KERNEL_FULL_VER }}-
+          ${{ inputs.ksu_type }}-v4-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-
 
     - name: Restore LTO LD cache
       id: restore-lto-ld-cache
@@ -1302,12 +1302,12 @@ runs:
       if: ${{ (inputs.clean == false && env.OP_LTO != 'none') || (inputs.clean == 'false' && env.OP_LTO != 'none') }}
       with:
         cache_path: ${{ env.LDCACHE_DIR }}
-        cache_key: ${{ inputs.ksu_type }}-v3-LTO-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-${{ env.KERNEL_FULL_VER }}-${{ env.CLANG_VERSION_SHORT }}
+        cache_key: ${{ inputs.ksu_type }}-v4-LTO-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-${{ env.KERNEL_FULL_VER }}-${{ env.CLANG_VERSION_SHORT }}
         cache_bucket: "lto-cache"
         debug: ${{ inputs.debug }}
         restore_keys: |
-          ${{ inputs.ksu_type }}-v3-LTO-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-${{ env.KERNEL_FULL_VER }}-
-          ${{ inputs.ksu_type }}-v3-LTO-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-
+          ${{ inputs.ksu_type }}-v4-LTO-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-${{ env.KERNEL_FULL_VER }}-
+          ${{ inputs.ksu_type }}-v4-LTO-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-
     - name: Check and Prepare Caches
       shell: bash
       run: |
@@ -1502,26 +1502,34 @@ runs:
         }
         
         retry_clone "https://github.com/WildKernels/kernel_patches.git" "main" "1"
-        git clone --no-checkout --depth 1 "https://github.com/maxsteeel/nomount.git" nomount
-        NOMOUNT_TARGET="${{ inputs.nomount_commit }}"
-        if [ -n "$NOMOUNT_TARGET" ]; then
-          echo "Using NoMount commit: $NOMOUNT_TARGET"
-          git -C nomount fetch --depth 1 origin "$NOMOUNT_TARGET"
-          git -C nomount checkout --detach "$NOMOUNT_TARGET"
-          NOMOUNT_COMMIT_SHA="$(git -C nomount rev-parse HEAD)"
-          if [ "$NOMOUNT_COMMIT_SHA" != "$NOMOUNT_TARGET" ]; then
-            echo "::error::NoMount checkout mismatch: wanted $NOMOUNT_TARGET, got $NOMOUNT_COMMIT_SHA"
-            exit 1
-          fi
+        if [ "${{ inputs.ksu_type }}" = "FinaSU" ]; then
+          # NoMount ships inside FinaSU's ksud (embedded per KMI, built by LyraVoid/FinaSU).
+          # No kernel-side integration and no upstream module fetch - report native.
+          NOMOUNT_COMMIT_SHA="native (ksud-embedded)"
+          NOMOUNT_REF_SOURCE="FinaSU native"
+          echo "NoMount: native (ksud-embedded, ships with the FinaSU manager)"
         else
-          git -C nomount checkout --detach origin/HEAD 2>/dev/null || git -C nomount checkout --detach
-          NOMOUNT_COMMIT_SHA="$(git -C nomount rev-parse HEAD)"
-          NOMOUNT_REF_SOURCE="upstream latest"
-          echo "::warning::No NoMount commit provided; tracking upstream latest (${NOMOUNT_COMMIT_SHA})"
+          git clone --no-checkout --depth 1 "https://github.com/maxsteeel/nomount.git" nomount
+          NOMOUNT_TARGET="${{ inputs.nomount_commit }}"
+          if [ -n "$NOMOUNT_TARGET" ]; then
+            echo "Using NoMount commit: $NOMOUNT_TARGET"
+            git -C nomount fetch --depth 1 origin "$NOMOUNT_TARGET"
+            git -C nomount checkout --detach "$NOMOUNT_TARGET"
+            NOMOUNT_COMMIT_SHA="$(git -C nomount rev-parse HEAD)"
+            if [ "$NOMOUNT_COMMIT_SHA" != "$NOMOUNT_TARGET" ]; then
+              echo "::error::NoMount checkout mismatch: wanted $NOMOUNT_TARGET, got $NOMOUNT_COMMIT_SHA"
+              exit 1
+            fi
+          else
+            git -C nomount checkout --detach origin/HEAD 2>/dev/null || git -C nomount checkout --detach
+            NOMOUNT_COMMIT_SHA="$(git -C nomount rev-parse HEAD)"
+            NOMOUNT_REF_SOURCE="upstream latest"
+            echo "::warning::No NoMount commit provided; tracking upstream latest (${NOMOUNT_COMMIT_SHA})"
+          fi
+          if [ -z "${NOMOUNT_REF_SOURCE:-}" ]; then NOMOUNT_REF_SOURCE="explicit input pin"; fi
+          git -C nomount log --oneline -1
         fi
-        if [ -z "${NOMOUNT_REF_SOURCE:-}" ]; then NOMOUNT_REF_SOURCE="explicit input pin"; fi
         echo "NOMOUNT_REF_SOURCE=$NOMOUNT_REF_SOURCE" >> "$GITHUB_ENV"
-        git -C nomount log --oneline -1
         echo "NOMOUNT_COMMIT_SHA=$NOMOUNT_COMMIT_SHA" >> "$GITHUB_ENV"
         echo "Using NoMount commit: $NOMOUNT_COMMIT_SHA"
         if [ "${{ env.OP_SUSFS }}" = true ]; then
@@ -2129,6 +2137,19 @@ runs:
       run: |
         set -euo pipefail
         echo "::group::Apply SUSFS kernel patches"
+        # ── Pristine-source guard ────────────────────────────────────────────────────
+        # A restored source cache must NOT already contain fs-side SUSFS. A dirty
+        # snapshot (saved from a mid/post-patch run) surfaces either as a bogus
+        # "already=<most hunks>" classification with a self-verify revert, or as a
+        # single unresolved hunk (task_mmu.c bypass_orig_flow) — both observed on
+        # FinaSU runs restoring a dirty variant-keyed source cache. Fail loud with
+        # the remedy instead of a confusing patchgen cascade.
+        if [ -f "./fs/susfs.c" ] || grep -q "CONFIG_KSU_SUSFS" ./fs/Makefile 2>/dev/null; then
+          echo "::error::Source tree is already SUSFS-patched (fs/susfs.c present or CONFIG_KSU_SUSFS in fs/Makefile) - the restored source cache is dirty. Bump the source cache_key prefix or clear the actions cache for this branch, then re-run."
+          exit 1
+        fi
+
+
         cd "$KERNEL_PLATFORM_FOLDER"
         cd "$COMMON_KERNEL_FOLDER"
         if [ "${{ env.ANDROID_VER }}" = "android15" ] && [ "${{ env.KERNEL_VER }}" = "6.6" ]; then
@@ -2418,6 +2439,7 @@ runs:
         
         echo "::endgroup::"
     - name: Apply NoMount
+      if: ${{ inputs.ksu_type != 'FinaSU' }}
       shell: bash
       run: |
         set -euo pipefail
@@ -4503,7 +4525,11 @@ runs:
           echo "zstd 1.5.7 + tunable level: $(pstat zstd-upgrade)"
           echo "CVE-2026-43499 rtmutex fix: $(pstat rtmutex-cve)"
           echo "Re-Kernel: ${{ inputs.use_rekernel || env.OP_REKERNEL == 'true' }}"
-          echo "NoMount: $(pstat nomount)"
+          if [ "${{ inputs.ksu_type }}" = "FinaSU" ]; then
+            echo "NoMount: native (ksud-embedded, ships with the FinaSU manager)"
+          else
+            echo "NoMount: $(pstat nomount)"
+          fi
           echo "Vendor Module Blacklist: $(pstat vendor-modules-blacklist)"
           echo "WildKernels' Optimisations: $(pstat wk-opt)"
           echo ""
@@ -4587,7 +4613,11 @@ runs:
           echo "| **LZ4 1.10.0 + ARMv8 NEON** | $(pstat lz4) |"
           echo "| **zstd 1.5.7 + tunable level** | $(pstat zstd-upgrade) |"
           echo "| **CVE-2026-43499 rtmutex fix** | $(pstat rtmutex-cve) |"
-          echo "| **NoMount** | $(pstat nomount) (${NOMOUNT_REF_SOURCE:-unknown}) |"
+          if [ "${{ inputs.ksu_type }}" = "FinaSU" ]; then
+            echo "| **NoMount** | Native (ksud-embedded — ships with the FinaSU manager) |"
+          else
+            echo "| **NoMount** | $(pstat nomount) (${NOMOUNT_REF_SOURCE:-unknown}) |"
+          fi
           echo "| **Vendor Module Blacklist** | $(pstat vendor-modules-blacklist) |"
           echo "| **WildKernels' Optimisations** | $(pstat wk-opt) |"
           
@@ -4654,7 +4684,7 @@ runs:
       uses: ./action-source/.github/actions/cache/save
       with:
         cache_path: ${{ env.CCACHE_DIR }}
-        cache_key: ${{ inputs.ksu_type }}-v3-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-${{ env.KERNEL_FULL_VER }}-${{ env.CLANG_VERSION_SHORT }}
+        cache_key: ${{ inputs.ksu_type }}-v4-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-${{ env.KERNEL_FULL_VER }}-${{ env.CLANG_VERSION_SHORT }}
         cache_bucket: "ccache-cache"
         debug: ${{ inputs.debug }}
         github_token: ${{ inputs.github_token }}

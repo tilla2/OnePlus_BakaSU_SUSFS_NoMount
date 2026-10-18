@@ -1047,6 +1047,8 @@ jobs:
   resolve-nomount:
     name: Resolve NoMount commit (locked for all kernels)
     runs-on: ubuntu-24.04
+    # FinaSU ships NoMount inside ksud (embedded per KMI) - nothing to resolve upstream.
+    if: ${{ !cancelled() && inputs.ksu_type != 'FinaSU' }}
     outputs:
       nomount_commit: ${{ steps.resolve.outputs.nomount_commit }}
       nomount_source: ${{ steps.resolve.outputs.nomount_source }}
@@ -1362,7 +1364,7 @@ jobs:
     if: |
       !cancelled() &&
       needs.set-op-model.result == 'success' &&
-      needs.resolve-nomount.result == 'success' &&
+      (needs.resolve-nomount.result == 'success' || needs.resolve-nomount.result == 'skipped') &&
       (needs.mirror_toolchain.result == 'success' || needs.mirror_toolchain.result == 'skipped')
     runs-on: ubuntu-24.04
     strategy:
@@ -1531,7 +1533,11 @@ jobs:
             if [ "${{ matrix.susfs }}" = true ]; then
               echo "  - SUSFS: ${{ steps.build.outputs.susfs_version }}"
             fi
-            echo "  - NoMount dev: ${{ steps.build.outputs.nomount_commit }}"
+            if [ "${{ matrix.ksu_type }}" = "FinaSU" ]; then
+              echo "  - NoMount: native (ksud-embedded, ships with the FinaSU manager)"
+            else
+              echo "  - NoMount dev: ${{ steps.build.outputs.nomount_commit }}"
+            fi
             echo "  - Build time: ${{ steps.build.outputs.build_time }}s"
 
             if [ "${{ contains(inputs.build_profile, 'clean') }}" != "true" ]; then
@@ -1595,7 +1601,11 @@ jobs:
           | **SUSFS** | ${{ steps.build.outputs.susfs_version }} |
           EOF
             fi
-          echo "| **NoMount dev** | \`${{ steps.build.outputs.nomount_commit }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ matrix.ksu_type }}" = "FinaSU" ]; then
+            echo "| **NoMount** | Native (ksud-embedded, ships with the FinaSU manager) |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| **NoMount dev** | \`${{ steps.build.outputs.nomount_commit }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          fi
           cat >> $GITHUB_STEP_SUMMARY << EOF
           | **Build Time** | ${{ steps.build.outputs.build_time }}s |
           EOF
@@ -1696,17 +1706,17 @@ jobs:
           MANAGER_RUN_ID=""
           if [ "$KSU_REF_KIND" = "branch" ] && [ -n "$KSU_REF_NAME" ]; then
             # Branch ref → newest successful manager build ON that branch.
-            MANAGER_RUN_ID=$(gh api "repos/${MANAGER_REPO}/actions/runs?branch=${KSU_REF_NAME}&status=success&per_page=50" \
-              --jq '[.workflow_runs[] | select(.path | test("build-manager(-ci)?\\.yml$"))][0].id // empty' || true)
+            MANAGER_RUN_ID=$(gh api "repos/${MANAGER_REPO}/actions/runs?status=success&per_page=100" \
+              --jq '[.workflow_runs[] | select(.event != "pull_request") | select(.path | test("build-manager(-ci)?\\.yml$"))][0].id // empty' || true)
             if [ -n "$MANAGER_RUN_ID" ]; then
-              echo "✅ Branch-latest manager CI run found on '${KSU_REF_NAME}': ${MANAGER_RUN_ID}"
+              echo "✅ Newest manager CI run found (repo-wide): ${MANAGER_RUN_ID}"
             else
               echo "::warning::No successful manager CI run on branch '${KSU_REF_NAME}' — trying commit-exact match for ${KSU_SHA:0:12}"
             fi
           fi
           if [ -z "$MANAGER_RUN_ID" ]; then
             MANAGER_RUN_ID=$(gh api "repos/${MANAGER_REPO}/actions/runs?head_sha=${KSU_SHA}&status=success&per_page=50" \
-              --jq '[.workflow_runs[] | select(.path | test("build-manager(-ci)?\\.yml$"))][0].id // empty' || true)
+              --jq '[.workflow_runs[] | select(.event != "pull_request") | select(.path | test("build-manager(-ci)?\\.yml$"))][0].id // empty' || true)
           fi
 
           if [ -n "$MANAGER_RUN_ID" ]; then
@@ -1880,8 +1890,8 @@ jobs:
       !cancelled() &&
       contains(inputs.run_mode, 'release') &&
       needs.set-op-model.result == 'success' &&
-      needs.resolve-nomount.result == 'success' &&
-      needs.build-nomount-module.result == 'success'
+      (needs.resolve-nomount.result == 'success' || needs.resolve-nomount.result == 'skipped') &&
+      (needs.build-nomount-module.result == 'success' || needs.build-nomount-module.result == 'skipped')
     env:
       REPO_OWNER: ${{ github.repository_owner }}
       REPO_NAME: ${{ github.event.repository.name }}
@@ -2009,17 +2019,17 @@ jobs:
           MANAGER_RUN_ID=""
           if [ "$KSU_REF_KIND" = "branch" ] && [ -n "$KSU_REF_NAME" ]; then
             # Branch ref → newest successful manager build ON that branch.
-            MANAGER_RUN_ID=$(gh api "repos/${MANAGER_REPO}/actions/runs?branch=${KSU_REF_NAME}&status=success&per_page=50" \
-              --jq '[.workflow_runs[] | select(.path | test("build-manager(-ci)?\\.yml$"))][0].id // empty' || true)
+            MANAGER_RUN_ID=$(gh api "repos/${MANAGER_REPO}/actions/runs?status=success&per_page=100" \
+              --jq '[.workflow_runs[] | select(.event != "pull_request") | select(.path | test("build-manager(-ci)?\\.yml$"))][0].id // empty' || true)
             if [ -n "$MANAGER_RUN_ID" ]; then
-              echo "✅ Branch-latest manager CI run found on '${KSU_REF_NAME}': ${MANAGER_RUN_ID}"
+              echo "✅ Newest manager CI run found (repo-wide): ${MANAGER_RUN_ID}"
             else
               echo "::warning::No successful manager CI run on branch '${KSU_REF_NAME}' — trying commit-exact match for ${KSU_SHA:0:12}"
             fi
           fi
           if [ -z "$MANAGER_RUN_ID" ]; then
             MANAGER_RUN_ID=$(gh api "repos/${MANAGER_REPO}/actions/runs?head_sha=${KSU_SHA}&status=success&per_page=50" \
-              --jq '[.workflow_runs[] | select(.path | test("build-manager(-ci)?\\.yml$"))][0].id // empty' || true)
+              --jq '[.workflow_runs[] | select(.event != "pull_request") | select(.path | test("build-manager(-ci)?\\.yml$"))][0].id // empty' || true)
           fi
 
           if [ -n "$MANAGER_RUN_ID" ]; then
@@ -2067,30 +2077,35 @@ jobs:
           MANAGER_APK_NAMES="$(ls ./*.apk | xargs -n1 basename | paste -sd',' -)"
           echo "MANAGER_APK_NAMES=${MANAGER_APK_NAMES}" >> "$GITHUB_ENV"
 
-          echo "NoMount resolved to $NM_SHA ($NM_MODE) — using the module built from source in this run"
-          MODULE_ZIP="$(find . -type f -name 'NoMount-*.zip' | head -n1)"
-          if [ -z "$MODULE_ZIP" ]; then
-            echo "::error::Built NoMount module zip was not found in ./downloaded-artifacts (build-nomount-module job)"
-            echo "::group::Staging diagnostics"
-            find . -maxdepth 2 -print | head -80
-            echo "::endgroup::"
-            exit 1
+          if [ "${{ inputs.ksu_type }}" = "FinaSU" ]; then
+            echo "NoMount: native (ksud-embedded — ships with the FinaSU manager); no upstream module zip is bundled"
+            sha256sum ./AK3_*.zip ./*.apk > SHA256SUMS.txt
+          else
+            echo "NoMount resolved to $NM_SHA ($NM_MODE) — using the module built from source in this run"
+            MODULE_ZIP="$(find . -type f -name 'NoMount-*.zip' | head -n1)"
+            if [ -z "$MODULE_ZIP" ]; then
+              echo "::error::Built NoMount module zip was not found in ./downloaded-artifacts (build-nomount-module job)"
+              echo "::group::Staging diagnostics"
+              find . -maxdepth 2 -print | head -80
+              echo "::endgroup::"
+              exit 1
+            fi
+            if [ -f "${MODULE_ZIP}.sha256" ]; then
+              sha256sum --check --status "${MODULE_ZIP}.sha256" || { echo "::error::NoMount module zip failed its SHA256 sidecar check"; exit 1; }
+              echo "✅ Built module SHA256 verified (sidecar)"
+            fi
+            unzip -t "$MODULE_ZIP" > /dev/null || { echo "::error::Built NoMount module zip is corrupt"; exit 1; }
+            echo "module.prop name/version line:"
+            unzip -p "$MODULE_ZIP" module.prop | grep -E '^(name|version)='
+            unzip -l "$MODULE_ZIP" | grep -E 'bin/nm-arm64|bin/nm-arm' || { echo "::error::Built module zip is missing the nm binaries"; exit 1; }
+            UNZIP_SHA="$(unzip -p "$MODULE_ZIP" NOMOUNT_SOURCE_COMMIT | tr -d '[:space:]')"
+            if [ "$UNZIP_SHA" != "$NM_SHA" ]; then
+              echo "::error::Provenance mismatch: module was built from $UNZIP_SHA but kernels integrated $NM_SHA"
+              exit 1
+            fi
+            echo "✅ Provenance verified: module source commit == kernel-integrated commit ($NM_SHA)"
+            sha256sum ./AK3_*.zip ./NoMount-*.zip ./*.apk > SHA256SUMS.txt
           fi
-          if [ -f "${MODULE_ZIP}.sha256" ]; then
-            sha256sum --check --status "${MODULE_ZIP}.sha256" || { echo "::error::NoMount module zip failed its SHA256 sidecar check"; exit 1; }
-            echo "✅ Built module SHA256 verified (sidecar)"
-          fi
-          unzip -t "$MODULE_ZIP" > /dev/null || { echo "::error::Built NoMount module zip is corrupt"; exit 1; }
-          echo "module.prop name/version line:"
-          unzip -p "$MODULE_ZIP" module.prop | grep -E '^(name|version)='
-          unzip -l "$MODULE_ZIP" | grep -E 'bin/nm-arm64|bin/nm-arm' || { echo "::error::Built module zip is missing the nm binaries"; exit 1; }
-          UNZIP_SHA="$(unzip -p "$MODULE_ZIP" NOMOUNT_SOURCE_COMMIT | tr -d '[:space:]')"
-          if [ "$UNZIP_SHA" != "$NM_SHA" ]; then
-            echo "::error::Provenance mismatch: module was built from $UNZIP_SHA but kernels integrated $NM_SHA"
-            exit 1
-          fi
-          echo "✅ Provenance verified: module source commit == kernel-integrated commit ($NM_SHA)"
-          sha256sum ./AK3_*.zip ./NoMount-*.zip ./*.apk > SHA256SUMS.txt
 
       - name: 📝 Generate Device List and Final Release Notes
         id: generate-notes
@@ -2334,8 +2349,16 @@ jobs:
           fi
           cat << EOF >> release_notes.md
           - **SUSFS** - Advanced hiding and security features
+          EOF
+          if [ "$ksu_type" == "FinaSU" ]; then
+            cat << EOF >> release_notes.md
+          - **NoMount** - Native (built into FinaSU's ksud, embedded per KMI — ships with the FinaSU manager)
+          EOF
+          else
+            cat << EOF >> release_notes.md
           - **NoMount** - Kernel-side integration from [`$NM_SHA`](https://github.com/maxsteeel/nomount/commit/$NM_SHA) ($NM_MODE)
           EOF
+          fi
           if [[ "${ksu_ver_global:-0}" =~ ^[0-9]+$ ]] && [ "${ksu_ver_global}" -lt 12884 ]; then
             cat << EOF >> release_notes.md
           - **Manual Hooks** - scope_min_manual_hooks_v1.4 for better compatibility
@@ -2504,7 +2527,7 @@ jobs:
     if: |
       !cancelled() &&
       needs.set-op-model.result == 'success' &&
-      needs.resolve-nomount.result == 'success' &&
+      (needs.resolve-nomount.result == 'success' || needs.resolve-nomount.result == 'skipped') &&
       needs.build.result == 'success' &&
       !contains(inputs.run_mode, 'patch') &&
       needs.set-op-model.outputs.device_count != '0'
@@ -2590,7 +2613,9 @@ jobs:
           fi
 
           merged=$(jq -n --argjson new "$new_pins" --argjson old "$old_pins" \
-            '$new + {susfs: (($old.susfs // {}) + ($new.susfs // {})), susfs_src: (($old.susfs_src // {}) + ($new.susfs_src // {}))}')
+            '$new
+             + (if ($new.nomount_commit // "") == "" then {nomount_commit: ($old.nomount_commit // "")} else {} end)
+             + {susfs: (($old.susfs // {}) + ($new.susfs // {})), susfs_src: (($old.susfs_src // {}) + ($new.susfs_src // {}))}')
 
           printf '%s' "$merged" > last-success-pins
           jq -e . last-success-pins >/dev/null || { echo "::error::Generated pin store is not valid JSON"; exit 1; }
@@ -2605,7 +2630,11 @@ jobs:
             jq -r '(.include // [])[] | "- \(.os_version)/\(.model) (\(.android_version)-\(.kernel_version))"' <<<"$MATRIX_JSON"
             echo ""
             echo "**Root manager:** \`${{ inputs.ksu_type }}\` → \`${{ needs.set-op-model.outputs.ksu_resolved_hash }}\`"
-            echo "**NoMount:** → \`${{ needs.resolve-nomount.outputs.nomount_commit }}\`"
+            if [ "${{ inputs.ksu_type }}" = "FinaSU" ]; then
+              echo "**NoMount:** native (ksud-embedded, ships with the FinaSU manager)"
+            else
+              echo "**NoMount:** → \`${{ needs.resolve-nomount.outputs.nomount_commit }}\`"
+            fi
             echo ""
             echo "**SUSFS pins in store (per GKI/KMI):**"
             echo '\`\`\`'
