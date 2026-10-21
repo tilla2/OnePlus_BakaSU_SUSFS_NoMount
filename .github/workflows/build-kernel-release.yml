@@ -87,6 +87,7 @@ on:
           - OP-ACE-5-ULTRA-6.6.50
           - OP-ACE-5.10.209
           - OP-ACE-5.10.226
+          - OP-ACE-PRO
           - OP-ACE-RACE
           - OP-ACE-RACE-5.10.209
           - OP-ACE-RACE-5.10.226
@@ -160,6 +161,7 @@ on:
           - OP-ACE-5-PRO
           - OP-ACE-5-PRO-6.6.89
           - OP-ACE-5-RACE
+          - OP-ACE-5-RACE-6.1.134
           - OP-ACE-5-ULTRA
           - OP-ACE-5-ULTRA-6.6.89
           - OP-ACE-6
@@ -167,6 +169,7 @@ on:
           - OP-ACE-6-ULTRA
           - OP-ACE-6T
           - OP-N6
+          - OP-N6X
           - OP-NORD-3
           - OP-NORD-4
           - OP-NORD-4-6.1.118
@@ -175,8 +178,10 @@ on:
           - OP-NORD-5-6.1.118
           - OP-NORD-6
           - OP-NORD-CE-5
+          - OP-NORD-CE-5-6.1.134
           - OP-NORD-CE4-LITE
           - OP-NORD-CE4-LITE-6.1.118
+          - OP-NORD-CE6
           - OP-NORD-CE6-LITE
           - OP-OPEN
           - OP-OPEN-5.15.167
@@ -214,6 +219,9 @@ on:
           - OP13r-6.1.118
           - OP15
           - OP15-6.12.58
+          - OP15-6.12.69
+          - OP15-6.12.81
+          - OP15-6.12.92
           - OP15T
           - OP15r
           - Myron
@@ -230,6 +238,7 @@ on:
           - KSUN
           - BakaSU
           - KSU
+          - FinaSU
         default: BakaSU
       ksu_branch_or_hash:
         description: 'KSU branch or commit hash'
@@ -340,6 +349,8 @@ jobs:
       susfs_hash_android14_6_1:  ${{ steps.set-matrix-final.outputs.susfs_hash_android14_6_1 }}
       susfs_hash_android15_6_6:  ${{ steps.set-matrix-final.outputs.susfs_hash_android15_6_6 }}
       susfs_hash_android16_6_12: ${{ steps.set-matrix-final.outputs.susfs_hash_android16_6_12 }}
+      ksu_ref_kind: ${{ steps.set-matrix-final.outputs.ksu_ref_kind }}
+      ksu_ref_name: ${{ steps.set-matrix-final.outputs.ksu_ref_name }}
       ksu_resolved_hash:    ${{ steps.set-matrix-final.outputs.ksu_resolved_hash }}
       susfs_base_version: ${{ steps.set-matrix-final.outputs.susfs_base_version }}
     env:
@@ -517,10 +528,13 @@ jobs:
 
           ksu_type="${{ inputs.ksu_type }}"
           ksu_ref="${{ inputs.ksu_branch_or_hash }}"
+          # FinaSU default branch is master; a leftover dispatch default 'main' would not resolve
+          if [ "$ksu_type" = "FinaSU" ] && [ "$ksu_ref" = "main" ]; then ksu_ref="master"; fi
+          KSU_REF_PIN_APPLIED=0
 
           # ── Load "last successful run" pin store (artifact 'last-success-pins') ──
           PINS_JSON="{}"
-          if [ "${{ inputs.pin_last_success }}" != "none" ]; then
+          if true; then  # v10: store is ALWAYS loaded — pin toggles force refs when set
             pins_art="$(gh api "repos/${{ github.repository }}/actions/artifacts?name=last-success-pins&per_page=100" \
               --jq '[.artifacts[] | select(.expired == false)] | sort_by(.id) | last | .id // empty' 2>/dev/null || true)"
             if [ -z "$pins_art" ]; then
@@ -545,8 +559,6 @@ jobs:
             else
               echo "ℹ️  No pins stored yet (no live 'last-success-pins' artifact) — pin toggles fail loudly until a first successful build records one"
             fi
-          else
-            echo "ℹ️  pin_last_success=none — pin store not read"
           fi
 
           # ── Root manager: pin (type-locked to the stored KSU type) > dispatch ref > auto (HEAD of the type default branch) ──
@@ -563,12 +575,35 @@ jobs:
               echo "📌 KSU pin: $ksu_type → $stored_ksu_sha (last successful run)"
               [ -z "$ksu_ref" ] || echo "   ksu_branch_or_hash '$ksu_ref' is moot while the pin applies"
               ksu_ref="$stored_ksu_sha"
+              KSU_REF_PIN_APPLIED=1
             fi
           fi
           if [ -z "$ksu_ref" ]; then
-            ksu_ref="main"
-            echo "ℹ️  No KSU ref at dispatch and no applicable pin — auto: HEAD of 'main' for $ksu_type"
+            case "$ksu_type" in
+              FinaSU) ksu_ref="master" ;;
+              KSUN)   ksu_ref="dev" ;;
+              *)      ksu_ref="main" ;;
+            esac
+            echo "ℹ️  No KSU ref at dispatch and no applicable pin — auto: HEAD of '$ksu_ref' for $ksu_type"
           fi
+
+          # ── Ref kind for downstream fetchers ──
+          # pin    = stored last-success SHA applied  → commit-exact APK
+          # sha    = explicit 40-hex dispatch input   → commit-exact APK
+          # branch = branch/tag ref (incl. auto HEAD) → LATEST successful
+          #          manager CI run on that branch (manager.zip preferred).
+          # Pins are optional overrides, never a hard pin: a branch ref
+          # always tracks that branch's newest successful build.
+          if [ "${KSU_REF_PIN_APPLIED:-0}" = "1" ]; then
+            ksu_ref_kind="pin";    ksu_ref_name=""
+          elif [[ "$ksu_ref" =~ ^[0-9a-f]{40}$ ]]; then
+            ksu_ref_kind="sha";    ksu_ref_name=""
+          else
+            ksu_ref_kind="branch"; ksu_ref_name="$ksu_ref"
+          fi
+          echo "  🔖 KSU ref kind: $ksu_ref_kind${ksu_ref_name:+ ($ksu_ref_name)}"
+          echo "ksu_ref_kind=$ksu_ref_kind" >> "$GITHUB_OUTPUT"
+          echo "ksu_ref_name=$ksu_ref_name" >> "$GITHUB_OUTPUT"
 
           if [ "$ksu_type" == "BakaSU" ]; then
             KSU_REPO_OWNER="Baka-SU"
@@ -576,6 +611,9 @@ jobs:
           elif [ "$ksu_type" == "KSUN" ]; then
             KSU_REPO_OWNER="KernelSU-Next"
             KSU_REPO_NAME="KernelSU-Next"
+          elif [ "$ksu_type" == "FinaSU" ]; then
+            KSU_REPO_OWNER="LyraVoid"
+            KSU_REPO_NAME="FinaSU"
           else
             KSU_REPO_OWNER="tiann"
             KSU_REPO_NAME="KernelSU"
@@ -657,15 +695,23 @@ jobs:
           echo "🔍 Resolving SUSFS hashes for: ${active_keys[*]:-none}"
 
           declare -A susfs_hashes
+          declare -A susfs_srcs
           declare -A susfs_versions_per_key
           SUSFS_CLONE_REPO=""
 
           for key in "${active_keys[@]}"; do
             default_val="${default_branches[$key]}"
             user_val="${user_inputs[$key]:-$default_val}"
+            stored_susfs=""
+            susfs_src=""
             # ── SUSFS: "same as last successful run" for this GKI/KMI ──
-            if [ "${{ (inputs.pin_last_success == 'both' || inputs.pin_last_success == 'susfs') }}" = "true" ] && [ -z "${user_inputs[$key]}" ]; then
+            # The stored ref only applies when the pin toggle
+            # (pin_last_success=susfs|both) forces it below; otherwise the
+            # per-KMI dispatch input or the branch head is used.
+            if [ -z "${user_inputs[$key]}" ]; then
               stored_susfs="$(jq -r --arg k "$key" '.susfs[$k] // empty' <<<"$PINS_JSON")"
+            fi
+            if [ "${{ (inputs.pin_last_success == 'both' || inputs.pin_last_success == 'susfs') }}" = "true" ] && [ -z "${user_inputs[$key]}" ]; then
               if [ -z "$stored_susfs" ]; then
                 echo "::error::SUSFS pin requested but no last-successful pin exists for $key (pin store empty or this KMI never built successfully). Type a ref for this KMI or seed the store with one successful build."
                 exit 1
@@ -673,6 +719,14 @@ jobs:
               echo "  📌 SUSFS pin: $key → $stored_susfs (last successful run)"
               user_val="$stored_susfs"
             fi
+            if [ -n "${user_inputs[$key]}" ]; then
+              susfs_src="explicit input pin"
+            elif [ -n "$stored_susfs" ]; then
+              susfs_src="last-success pin"
+            else
+              susfs_src="branch head (${user_val})"
+            fi
+            susfs_srcs["$key"]="$susfs_src"
 
             HASH_QUERY="{ project(fullPath: \"${GITLAB_PROJECT_PATH}\") { repository { ch: commit(ref: \"${user_val}\") { sha } } } }"
             RELEASE_QUERY="{ project(fullPath: \"${GITLAB_PROJECT_PATH}\") { repository { ch: commit(ref: \"${user_val}\") { sha } blobs(paths: [\"kernel_patches/include/linux/susfs.h\"], ref: \"${user_val}\") { nodes { rawBlob } } } } }"
@@ -759,6 +813,18 @@ jobs:
           echo "susfs_hash_android14_6_1=${susfs_hashes[android14-6.1]:-unknown}"   >> "$GITHUB_OUTPUT"
           echo "susfs_hash_android15_6_6=${susfs_hashes[android15-6.6]:-unknown}"   >> "$GITHUB_OUTPUT"
           echo "susfs_hash_android16_6_12=${susfs_hashes[android16-6.12]:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "susfs_src_android12_5_10=${susfs_srcs[android12-5.10]:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "susfs_src_android13_5_15=${susfs_srcs[android13-5.15]:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "susfs_src_android14_6_1=${susfs_srcs[android14-6.1]:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "susfs_src_android15_6_6=${susfs_srcs[android15-6.6]:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "susfs_src_android16_6_12=${susfs_srcs[android16-6.12]:-unknown}" >> "$GITHUB_OUTPUT"
+          SUSFS_SRCS_JSON=$(jq -n \
+            --arg a12 "${susfs_srcs[android12-5.10]:-unknown}" \
+            --arg a13 "${susfs_srcs[android13-5.15]:-unknown}" \
+            --arg a14 "${susfs_srcs[android14-6.1]:-unknown}" \
+            --arg a15 "${susfs_srcs[android15-6.6]:-unknown}" \
+            --arg a16 "${susfs_srcs[android16-6.12]:-unknown}" \
+            '{"android12-5.10": $a12, "android13-5.15": $a13, "android14-6.1": $a14, "android15-6.6": $a15, "android16-6.12": $a16}')
 
           if [ "${{ contains(inputs.run_mode, 'release') }}" = "true" ]; then
             susfs_base_version="unknown"
@@ -801,14 +867,17 @@ jobs:
             }')
 
           echo "$susfs_hashes_json" > susfs_lookup_temp.json
+          echo "$SUSFS_SRCS_JSON" > susfs_srcs_temp.json
           merged_matrix=$(echo "$merged_matrix" | jq \
             --slurpfile hashes_array susfs_lookup_temp.json \
+            --slurpfile srcs_array susfs_srcs_temp.json \
             '
               ($hashes_array[0]) as $hashes |
-              [.[] | . + {susfs_resolved_hash: ($hashes["\(.android_version)-\(.kernel_version)"] // "unknown")}]
+              ($srcs_array[0]) as $srcs |
+              [.[] | . + {susfs_resolved_hash: ($hashes["\(.android_version)-\(.kernel_version)"] // "unknown"), susfs_resolved_src: ($srcs["\(.android_version)-\(.kernel_version)"] // "unknown")}]
             ')
 
-          rm susfs_lookup_temp.json
+          rm -f susfs_lookup_temp.json susfs_srcs_temp.json
 
           merged_matrix=$(echo "$merged_matrix" | jq '
             sort_by(
@@ -898,7 +967,7 @@ jobs:
           ksu_ref="${{ inputs.ksu_branch_or_hash }}"
 
           ksu_display=""
-          if [ "$ksu_type" = "BakaSU" ] || [ "$ksu_type" = "KSU" ] || [ "$ksu_type" = "KSUN" ]; then
+          if [ "$ksu_type" = "BakaSU" ] || [ "$ksu_type" = "KSU" ] || [ "$ksu_type" = "KSUN" ] || [ "$ksu_type" = "FinaSU" ]; then
             if [[ "$ksu_ref" =~ ^[0-9a-f]{40}$ ]]; then
               ksu_display+="📌 \`$ksu_type\`, \`$ksu_ref\`"
             else
@@ -982,6 +1051,8 @@ jobs:
   resolve-nomount:
     name: Resolve NoMount commit (locked for all kernels)
     runs-on: ubuntu-24.04
+    # FinaSU ships NoMount inside ksud (embedded per KMI) - nothing to resolve upstream.
+    if: ${{ !cancelled() && inputs.ksu_type != 'FinaSU' }}
     outputs:
       nomount_commit: ${{ steps.resolve.outputs.nomount_commit }}
       nomount_source: ${{ steps.resolve.outputs.nomount_source }}
@@ -1297,7 +1368,7 @@ jobs:
     if: |
       !cancelled() &&
       needs.set-op-model.result == 'success' &&
-      needs.resolve-nomount.result == 'success' &&
+      (needs.resolve-nomount.result == 'success' || needs.resolve-nomount.result == 'skipped') &&
       (needs.mirror_toolchain.result == 'success' || needs.mirror_toolchain.result == 'skipped')
     runs-on: ubuntu-24.04
     strategy:
@@ -1419,7 +1490,7 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload patch failure forensics
-        if: always()
+        if: failure()
         uses: actions/upload-artifact@v7
         with:
           name: patch-faillogs-${{ matrix.model }}
@@ -1441,7 +1512,7 @@ jobs:
           echo "OS Version: ${{ matrix.os_version }}"
           echo "Kernel: ${{ matrix.android_version }}-${{ matrix.kernel_version }}"
           if [ "${{ matrix.susfs }}" = true ]; then
-            echo "SUSFS Hash: ${{ matrix.susfs_resolved_hash }}"
+            echo "SUSFS Hash: ${{ matrix.susfs_resolved_hash }} (ref source: ${{ matrix.susfs_resolved_src }})"
           fi
           echo "Status: ${{ job.status }}"
 
@@ -1455,6 +1526,8 @@ jobs:
               echo "  - BakaSU: v${{ steps.build.outputs.ksu_version }}"
             elif [ "${{ matrix.ksu_type }}" = "KSUN" ]; then
               echo "  - KernelSU Next: v${{ steps.build.outputs.ksu_version }}"
+            elif [ "${{ matrix.ksu_type }}" = "FinaSU" ]; then
+              echo "  - FinaSU: v${{ steps.build.outputs.ksu_version }}"
             else
               echo "  - KSU: v${{ steps.build.outputs.ksu_version }}"
             fi
@@ -1464,7 +1537,11 @@ jobs:
             if [ "${{ matrix.susfs }}" = true ]; then
               echo "  - SUSFS: ${{ steps.build.outputs.susfs_version }}"
             fi
-            echo "  - NoMount dev: ${{ steps.build.outputs.nomount_commit }}"
+            if [ "${{ matrix.ksu_type }}" = "FinaSU" ]; then
+              echo "  - NoMount: native (ksud-embedded, ships with the FinaSU manager)"
+            else
+              echo "  - NoMount dev: ${{ steps.build.outputs.nomount_commit }}"
+            fi
             echo "  - Build time: ${{ steps.build.outputs.build_time }}s"
 
             if [ "${{ contains(inputs.build_profile, 'clean') }}" != "true" ]; then
@@ -1495,7 +1572,7 @@ jobs:
 
           if [ "${{ matrix.susfs }}" = true ]; then
             cat >> $GITHUB_STEP_SUMMARY << EOF
-          **SUSFS Hash:** \`${{ matrix.susfs_resolved_hash }}\`
+          **SUSFS Hash:** \`${{ matrix.susfs_resolved_hash }}\` — ref source: ${{ matrix.susfs_resolved_src }}
           EOF
           fi
 
@@ -1513,6 +1590,10 @@ jobs:
                         cat >> $GITHUB_STEP_SUMMARY << EOF
                     | **KernelSU Next** | v${{ steps.build.outputs.ksu_version }} |
           EOF
+                      elif [ "${{ matrix.ksu_type }}" = "FinaSU" ]; then
+                        cat >> $GITHUB_STEP_SUMMARY << EOF
+                    | **FinaSU** | v${{ steps.build.outputs.ksu_version }} |
+          EOF
                       else
               cat >> $GITHUB_STEP_SUMMARY << EOF
           | **KSU** | v${{ steps.build.outputs.ksu_version }} |
@@ -1524,7 +1605,11 @@ jobs:
           | **SUSFS** | ${{ steps.build.outputs.susfs_version }} |
           EOF
             fi
-          echo "| **NoMount dev** | \`${{ steps.build.outputs.nomount_commit }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ matrix.ksu_type }}" = "FinaSU" ]; then
+            echo "| **NoMount** | Native (ksud-embedded, ships with the FinaSU manager) |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| **NoMount dev** | \`${{ steps.build.outputs.nomount_commit }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          fi
           cat >> $GITHUB_STEP_SUMMARY << EOF
           | **Build Time** | ${{ steps.build.outputs.build_time }}s |
           EOF
@@ -1595,6 +1680,8 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       KSU_SHA: ${{ needs.set-op-model.outputs.ksu_resolved_hash }}
+      KSU_REF_KIND: ${{ needs.set-op-model.outputs.ksu_ref_kind }}
+      KSU_REF_NAME: ${{ needs.set-op-model.outputs.ksu_ref_name }}
     outputs:
       manager_repo: ${{ steps.apk-manifest.outputs.manager_repo }}
       apk_names: ${{ steps.apk-manifest.outputs.apk_names }}
@@ -1609,23 +1696,47 @@ jobs:
             KSUN)      MANAGER_REPO="KernelSU-Next/KernelSU-Next" ;;
             BakaSU)  MANAGER_REPO="Baka-SU/BakaSU" ;;
             KSU)       MANAGER_REPO="tiann/KernelSU" ;;
+            FinaSU)    MANAGER_REPO="LyraVoid/FinaSU" ;;
           esac
           echo "MANAGER_REPO=${MANAGER_REPO}" >> "$GITHUB_ENV"
-          echo "Manager repo: $MANAGER_REPO — resolving commit-exact build for ${KSU_SHA}"
+          KSU_REF_KIND="${KSU_REF_KIND:-}"
+          KSU_REF_NAME="${KSU_REF_NAME:-}"
+          if [ "$KSU_REF_KIND" = "branch" ] && [ -n "$KSU_REF_NAME" ]; then
+            echo "Manager repo: $MANAGER_REPO — resolving latest successful manager build on branch '${KSU_REF_NAME}'"
+          else
+            echo "Manager repo: $MANAGER_REPO — resolving commit-exact build for ${KSU_SHA} (ref kind: ${KSU_REF_KIND:-sha})"
+          fi
 
           MANAGER_RUN_ID=""
-          MANAGER_RUN_ID=$(gh api "repos/${MANAGER_REPO}/actions/runs?head_sha=${KSU_SHA}&status=success&per_page=50" \
-            --jq '[.workflow_runs[] | select(.path | test("build-manager(-ci)?\\.yml$"))][0].id // empty' || true)
+          if [ "$KSU_REF_KIND" = "branch" ] && [ -n "$KSU_REF_NAME" ]; then
+            # Branch ref → newest successful manager build ON that branch.
+            MANAGER_RUN_ID=$(gh api "repos/${MANAGER_REPO}/actions/runs?status=success&per_page=100" \
+              --jq '[.workflow_runs[] | select(.event != "pull_request") | select(.path | test("build-manager(-ci)?\\.yml$"))][0].id // empty' || true)
+            if [ -n "$MANAGER_RUN_ID" ]; then
+              echo "✅ Newest manager CI run found (repo-wide): ${MANAGER_RUN_ID}"
+            else
+              echo "::warning::No successful manager CI run on branch '${KSU_REF_NAME}' — trying commit-exact match for ${KSU_SHA:0:12}"
+            fi
+          fi
+          if [ -z "$MANAGER_RUN_ID" ]; then
+            MANAGER_RUN_ID=$(gh api "repos/${MANAGER_REPO}/actions/runs?head_sha=${KSU_SHA}&status=success&per_page=50" \
+              --jq '[.workflow_runs[] | select(.event != "pull_request") | select(.path | test("build-manager(-ci)?\\.yml$"))][0].id // empty' || true)
+          fi
 
           if [ -n "$MANAGER_RUN_ID" ]; then
-            echo "✅ Commit-exact manager CI run found: ${MANAGER_RUN_ID}"
+            echo "✅ Manager CI run found: ${MANAGER_RUN_ID}"
             echo "MANAGER_RUN_URL=https://github.com/${MANAGER_REPO}/actions/runs/${MANAGER_RUN_ID}" >> "$GITHUB_ENV"
+            # Artifact names are not standardized upstream (FinaSU: "manager",
+            # KSU/KSUN: unversioned bundles) - no name filter: order likely
+            # manager bundles first and probe every live artifact; the unzip
+            # probe self-filters and the loop stops at the first APK found.
             ART_ROWS=$(gh api "repos/${MANAGER_REPO}/actions/runs/${MANAGER_RUN_ID}/artifacts?per_page=100" \
-              --jq '.artifacts[] | select(.expired == false) | select(.name | test("release"; "i")) | "\(.id) \(.name)"' || true)
+              --jq '[.artifacts[] | select(.expired == false)] | sort_by((.name | test("manager|release|apk"; "i")) | not) | .[] | "\(.id) \(.name)"' || true)
             while read -r aid aname; do
               [ -z "$aid" ] && continue
+              [ -s apk-map.tsv ] && break
               ls -1 *.apk 2>/dev/null | sort > /tmp/apks-before.txt || true
-              gh api "repos/${MANAGER_REPO}/actions/artifacts/${aid}/zip" > "${aname}.zip"
+              gh api "repos/${MANAGER_REPO}/actions/artifacts/${aid}/zip" > "${aname}.zip" || true
               unzip -o -j "${aname}.zip" '*.apk' -d ./ >/dev/null || true
               rm -f "${aname}.zip"
               ls -1 *.apk 2>/dev/null | sort > /tmp/apks-after.txt || true
@@ -1637,7 +1748,7 @@ jobs:
           fi
 
           if ! ls ./*.apk >/dev/null 2>&1; then
-            echo "::warning::No live commit-exact manager build for ${KSU_SHA} (artifact expired or CI absent) — falling back to the latest upstream release"
+            echo "::warning::No live manager CI build matched (ref kind ${KSU_REF_KIND:-sha}${KSU_REF_NAME:+, branch '${KSU_REF_NAME}'}, sha ${KSU_SHA:0:12}) — falling back to the latest upstream release (last resort only)"
             LATEST_TAG="$(gh api "repos/${MANAGER_REPO}/releases/latest" --jq '.tag_name' 2>/dev/null || true)"
             if [ -z "$LATEST_TAG" ]; then
               echo "::error::No manager APK could be fetched from ${MANAGER_REPO} for ${KSU_SHA}"
@@ -1664,7 +1775,7 @@ jobs:
 
           echo "Manager APKs fetched:"
           ls -l ./*.apk
-          echo "✅ Manager APKs fetched (${MANAGER_REPO} @ ${KSU_SHA:0:12})"
+          echo "✅ Manager APKs fetched (${MANAGER_REPO}, ref kind ${KSU_REF_KIND:-sha}${KSU_REF_NAME:+, branch '${KSU_REF_NAME}'}, kernel-side sha ${KSU_SHA:0:12})"
 
       - name: 📃 Emit APK manifest for per-file upload
         id: apk-manifest
@@ -1783,14 +1894,16 @@ jobs:
       !cancelled() &&
       contains(inputs.run_mode, 'release') &&
       needs.set-op-model.result == 'success' &&
-      needs.resolve-nomount.result == 'success' &&
-      needs.build-nomount-module.result == 'success'
+      (needs.resolve-nomount.result == 'success' || needs.resolve-nomount.result == 'skipped') &&
+      (needs.build-nomount-module.result == 'success' || needs.build-nomount-module.result == 'skipped')
     env:
       REPO_OWNER: ${{ github.repository_owner }}
       REPO_NAME: ${{ github.event.repository.name }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       SUSFS_BASE_VERSION: ${{ needs.set-op-model.outputs.susfs_base_version }}
       KSU_SHA: ${{ needs.set-op-model.outputs.ksu_resolved_hash }}
+      KSU_REF_KIND: ${{ needs.set-op-model.outputs.ksu_ref_kind }}
+      KSU_REF_NAME: ${{ needs.set-op-model.outputs.ksu_ref_name }}
       NM_SHA: ${{ needs.resolve-nomount.outputs.nomount_commit }}
       NM_MODE: ${{ needs.resolve-nomount.outputs.nomount_source }}
       NM_BUILT: ${{ needs.build-nomount-module.outputs.built }}
@@ -1814,6 +1927,9 @@ jobs:
               ;;
             KSU)
               root_display="KernelSU"
+              ;;
+            FinaSU)
+              root_display="FinaSU"
               ;;
             *)
               echo "::error::Unsupported root implementation '${{ inputs.ksu_type }}'."
@@ -1894,28 +2010,53 @@ jobs:
             KSUN)      MANAGER_REPO="KernelSU-Next/KernelSU-Next" ;;
             BakaSU)  MANAGER_REPO="Baka-SU/BakaSU" ;;
             KSU)       MANAGER_REPO="tiann/KernelSU" ;;
+            FinaSU)    MANAGER_REPO="LyraVoid/FinaSU" ;;
           esac
-          echo "Manager repo: $MANAGER_REPO — resolving commit-exact build for ${KSU_SHA}"
+          KSU_REF_KIND="${KSU_REF_KIND:-}"
+          KSU_REF_NAME="${KSU_REF_NAME:-}"
+          if [ "$KSU_REF_KIND" = "branch" ] && [ -n "$KSU_REF_NAME" ]; then
+            echo "Manager repo: $MANAGER_REPO — resolving latest successful manager build on branch '${KSU_REF_NAME}'"
+          else
+            echo "Manager repo: $MANAGER_REPO — resolving commit-exact build for ${KSU_SHA} (ref kind: ${KSU_REF_KIND:-sha})"
+          fi
 
           MANAGER_RUN_ID=""
-          MANAGER_RUN_ID=$(gh api "repos/${MANAGER_REPO}/actions/runs?head_sha=${KSU_SHA}&status=success&per_page=50" \
-            --jq '[.workflow_runs[] | select(.path | test("build-manager(-ci)?\\.yml$"))][0].id // empty' || true)
+          if [ "$KSU_REF_KIND" = "branch" ] && [ -n "$KSU_REF_NAME" ]; then
+            # Branch ref → newest successful manager build ON that branch.
+            MANAGER_RUN_ID=$(gh api "repos/${MANAGER_REPO}/actions/runs?status=success&per_page=100" \
+              --jq '[.workflow_runs[] | select(.event != "pull_request") | select(.path | test("build-manager(-ci)?\\.yml$"))][0].id // empty' || true)
+            if [ -n "$MANAGER_RUN_ID" ]; then
+              echo "✅ Newest manager CI run found (repo-wide): ${MANAGER_RUN_ID}"
+            else
+              echo "::warning::No successful manager CI run on branch '${KSU_REF_NAME}' — trying commit-exact match for ${KSU_SHA:0:12}"
+            fi
+          fi
+          if [ -z "$MANAGER_RUN_ID" ]; then
+            MANAGER_RUN_ID=$(gh api "repos/${MANAGER_REPO}/actions/runs?head_sha=${KSU_SHA}&status=success&per_page=50" \
+              --jq '[.workflow_runs[] | select(.event != "pull_request") | select(.path | test("build-manager(-ci)?\\.yml$"))][0].id // empty' || true)
+          fi
 
           if [ -n "$MANAGER_RUN_ID" ]; then
-            echo "✅ Commit-exact manager CI run found: ${MANAGER_RUN_ID}"
+            echo "✅ Manager CI run found: ${MANAGER_RUN_ID}"
             echo "MANAGER_RUN_URL=https://github.com/${MANAGER_REPO}/actions/runs/${MANAGER_RUN_ID}" >> "$GITHUB_ENV"
             mkdir -p /tmp/mgr
+            # Same non-standardized upstream artifact names - no name filter,
+            # priority-ordered probe (see fetch-manager-apks).
             ART_ROWS=$(gh api "repos/${MANAGER_REPO}/actions/runs/${MANAGER_RUN_ID}/artifacts?per_page=100" \
-              --jq '.artifacts[] | select(.expired == false) | select(.name | test("release"; "i")) | "\(.id) \(.name)"' || true)
+              --jq '[.artifacts[] | select(.expired == false)] | sort_by((.name | test("manager|release|apk"; "i")) | not) | .[] | "\(.id) \(.name)"' || true)
             while read -r aid aname; do
               [ -z "$aid" ] && continue
-              gh api "repos/${MANAGER_REPO}/actions/artifacts/${aid}/zip" > "/tmp/mgr/${aname}.zip"
+              ls -1 *.apk 2>/dev/null | sort > /tmp/mgr/apks-before.txt || true
+              gh api "repos/${MANAGER_REPO}/actions/artifacts/${aid}/zip" > "/tmp/mgr/${aname}.zip" || true
               unzip -o -j "/tmp/mgr/${aname}.zip" '*.apk' -d ./ >/dev/null || true
+              ls -1 *.apk 2>/dev/null | sort > /tmp/mgr/apks-after.txt || true
+              comm -13 /tmp/mgr/apks-before.txt /tmp/mgr/apks-after.txt > /tmp/mgr/new.txt
+              [ -s /tmp/mgr/new.txt ] && break
             done <<< "$ART_ROWS"
           fi
 
           if ! ls ./*.apk >/dev/null 2>&1; then
-            echo "::warning::No live commit-exact manager build for ${KSU_SHA} (artifact expired or CI absent) — falling back to the latest upstream release"
+            echo "::warning::No live manager CI build matched (ref kind ${KSU_REF_KIND:-sha}${KSU_REF_NAME:+, branch '${KSU_REF_NAME}'}, sha ${KSU_SHA:0:12}) — falling back to the latest upstream release (last resort only)"
             LATEST_TAG="$(gh api "repos/${MANAGER_REPO}/releases/latest" --jq '.tag_name' 2>/dev/null || true)"
             if [ -z "$LATEST_TAG" ]; then
               echo "::error::No manager APK could be fetched from ${MANAGER_REPO} for ${KSU_SHA}"
@@ -1940,30 +2081,35 @@ jobs:
           MANAGER_APK_NAMES="$(ls ./*.apk | xargs -n1 basename | paste -sd',' -)"
           echo "MANAGER_APK_NAMES=${MANAGER_APK_NAMES}" >> "$GITHUB_ENV"
 
-          echo "NoMount resolved to $NM_SHA ($NM_MODE) — using the module built from source in this run"
-          MODULE_ZIP="$(find . -type f -name 'NoMount-*.zip' | head -n1)"
-          if [ -z "$MODULE_ZIP" ]; then
-            echo "::error::Built NoMount module zip was not found in ./downloaded-artifacts (build-nomount-module job)"
-            echo "::group::Staging diagnostics"
-            find . -maxdepth 2 -print | head -80
-            echo "::endgroup::"
-            exit 1
+          if [ "${{ inputs.ksu_type }}" = "FinaSU" ]; then
+            echo "NoMount: native (ksud-embedded — ships with the FinaSU manager); no upstream module zip is bundled"
+            sha256sum ./AK3_*.zip ./*.apk > SHA256SUMS.txt
+          else
+            echo "NoMount resolved to $NM_SHA ($NM_MODE) — using the module built from source in this run"
+            MODULE_ZIP="$(find . -type f -name 'NoMount-*.zip' | head -n1)"
+            if [ -z "$MODULE_ZIP" ]; then
+              echo "::error::Built NoMount module zip was not found in ./downloaded-artifacts (build-nomount-module job)"
+              echo "::group::Staging diagnostics"
+              find . -maxdepth 2 -print | head -80
+              echo "::endgroup::"
+              exit 1
+            fi
+            if [ -f "${MODULE_ZIP}.sha256" ]; then
+              sha256sum --check --status "${MODULE_ZIP}.sha256" || { echo "::error::NoMount module zip failed its SHA256 sidecar check"; exit 1; }
+              echo "✅ Built module SHA256 verified (sidecar)"
+            fi
+            unzip -t "$MODULE_ZIP" > /dev/null || { echo "::error::Built NoMount module zip is corrupt"; exit 1; }
+            echo "module.prop name/version line:"
+            unzip -p "$MODULE_ZIP" module.prop | grep -E '^(name|version)='
+            unzip -l "$MODULE_ZIP" | grep -E 'bin/nm-arm64|bin/nm-arm' || { echo "::error::Built module zip is missing the nm binaries"; exit 1; }
+            UNZIP_SHA="$(unzip -p "$MODULE_ZIP" NOMOUNT_SOURCE_COMMIT | tr -d '[:space:]')"
+            if [ "$UNZIP_SHA" != "$NM_SHA" ]; then
+              echo "::error::Provenance mismatch: module was built from $UNZIP_SHA but kernels integrated $NM_SHA"
+              exit 1
+            fi
+            echo "✅ Provenance verified: module source commit == kernel-integrated commit ($NM_SHA)"
+            sha256sum ./AK3_*.zip ./NoMount-*.zip ./*.apk > SHA256SUMS.txt
           fi
-          if [ -f "${MODULE_ZIP}.sha256" ]; then
-            sha256sum --check --status "${MODULE_ZIP}.sha256" || { echo "::error::NoMount module zip failed its SHA256 sidecar check"; exit 1; }
-            echo "✅ Built module SHA256 verified (sidecar)"
-          fi
-          unzip -t "$MODULE_ZIP" > /dev/null || { echo "::error::Built NoMount module zip is corrupt"; exit 1; }
-          echo "module.prop name/version line:"
-          unzip -p "$MODULE_ZIP" module.prop | grep -E '^(name|version)='
-          unzip -l "$MODULE_ZIP" | grep -E 'bin/nm-arm64|bin/nm-arm' || { echo "::error::Built module zip is missing the nm binaries"; exit 1; }
-          UNZIP_SHA="$(unzip -p "$MODULE_ZIP" NOMOUNT_SOURCE_COMMIT | tr -d '[:space:]')"
-          if [ "$UNZIP_SHA" != "$NM_SHA" ]; then
-            echo "::error::Provenance mismatch: module was built from $UNZIP_SHA but kernels integrated $NM_SHA"
-            exit 1
-          fi
-          echo "✅ Provenance verified: module source commit == kernel-integrated commit ($NM_SHA)"
-          sha256sum ./AK3_*.zip ./NoMount-*.zip ./*.apk > SHA256SUMS.txt
 
       - name: 📝 Generate Device List and Final Release Notes
         id: generate-notes
@@ -2005,6 +2151,23 @@ jobs:
             ["android14-6.1"]="${{ needs.set-op-model.outputs.susfs_hash_android14_6_1 }}"
             ["android15-6.6"]="${{ needs.set-op-model.outputs.susfs_hash_android15_6_6 }}"
             ["android16-6.12"]="${{ needs.set-op-model.outputs.susfs_hash_android16_6_12 }}"
+          )
+
+
+          # Provenance per KMI: where each SUSFS pin actually came from, so the
+          # release notes never imply "latest upstream" when a pin was honored.
+          pin_last="${{ inputs.pin_last_success }}"
+          susfs_src_of() {
+            if [ -n "$1" ]; then echo "workflow input pin"
+            elif [ "$pin_last" = "both" ] || [ "$pin_last" = "susfs" ]; then echo "pin store (last successful)"
+            else echo "kmi-default branch"; fi
+          }
+          declare -A susfs_src=(
+            ["android12-5.10"]="$(susfs_src_of "${{ inputs.android12-5_10_susfs_branch_or_commit }}")"
+            ["android13-5.15"]="$(susfs_src_of "${{ inputs.android13-5_15_susfs_branch_or_commit }}")"
+            ["android14-6.1"]="$(susfs_src_of "${{ inputs.android14-6_1_susfs_branch_or_commit }}")"
+            ["android15-6.6"]="$(susfs_src_of "${{ inputs.android15-6_6_susfs_branch_or_commit }}")"
+            ["android16-6.12"]="$(susfs_src_of "${{ inputs.android16-6_12_susfs_branch_or_commit }}")"
           )
 
           IFS=',' read -ra active_gki_keys \
@@ -2138,6 +2301,11 @@ jobs:
           | **BakaSU Branch/Hash** | \`$ksu_display\` |
           | **BakaSU Version** | \`$ksu_ver_global\` |
           EOF
+          elif [ "$ksu_type" = "FinaSU" ]; then
+            cat << EOF >> release_notes.md
+          | **FinaSU Branch/Hash** | \`$ksu_display\` |
+          | **FinaSU Version** | \`$ksu_ver_global\` |
+          EOF
           elif [ "$ksu_type" == "KSU" ]; then
             cat << EOF >> release_notes.md
           | **KernelSU Branch** | \`$ksu_display\` |
@@ -2153,10 +2321,10 @@ jobs:
 
           ### 📌 SUSFS Branch Mapping
 
-          | Kernel Version | SUSFS Commit |
-          |----------------|--------------|
+          | Kernel Version | SUSFS Commit | Source |
+          |----------------|--------------|--------|
           $(for key in "${active_gki_keys[@]}"; do
-            echo "| $key | \`${susfs_map[$key]:-unknown}\` |"
+            echo "| $key | \`${susfs_map[$key]:-unknown}\` | ${susfs_src[$key]:-unknown} |"
           done)
           EOF
           cat << EOF >> release_notes.md
@@ -2175,6 +2343,10 @@ jobs:
             cat << EOF >> release_notes.md
           - **BakaSU** - Kernel-based Android root integration
           EOF
+          elif [ "$ksu_type" == "FinaSU" ]; then
+            cat << EOF >> release_notes.md
+          - **FinaSU** - Kernel-based Android root integration
+          EOF
           elif [ "$ksu_type" == "KSU" ]; then
             cat << EOF >> release_notes.md
           - **KernelSU** - Kernel-level root solution
@@ -2182,8 +2354,16 @@ jobs:
           fi
           cat << EOF >> release_notes.md
           - **SUSFS** - Advanced hiding and security features
+          EOF
+          if [ "$ksu_type" == "FinaSU" ]; then
+            cat << EOF >> release_notes.md
+          - **NoMount** - Native (built into FinaSU's ksud, embedded per KMI — ships with the FinaSU manager)
+          EOF
+          else
+            cat << EOF >> release_notes.md
           - **NoMount** - Kernel-side integration from [`$NM_SHA`](https://github.com/maxsteeel/nomount/commit/$NM_SHA) ($NM_MODE)
           EOF
+          fi
           if [[ "${ksu_ver_global:-0}" =~ ^[0-9]+$ ]] && [ "${ksu_ver_global}" -lt 12884 ]; then
             cat << EOF >> release_notes.md
           - **Manual Hooks** - scope_min_manual_hooks_v1.4 for better compatibility
@@ -2265,6 +2445,10 @@ jobs:
           elif [ "$ksu_type" == "BakaSU" ]; then
             cat << EOF >> release_notes.md
           - **[BakaSU Team](https://github.com/Baka-SU/BakaSU)** - Root solution
+          EOF
+          elif [ "$ksu_type" == "FinaSU" ]; then
+            cat << EOF >> release_notes.md
+          - **[FinaSU Team](https://github.com/LyraVoid/FinaSU)** - Root solution
           EOF
           elif [ "$ksu_type" == "KSU" ]; then
             cat << EOF >> release_notes.md
@@ -2348,7 +2532,7 @@ jobs:
     if: |
       !cancelled() &&
       needs.set-op-model.result == 'success' &&
-      needs.resolve-nomount.result == 'success' &&
+      (needs.resolve-nomount.result == 'success' || needs.resolve-nomount.result == 'skipped') &&
       needs.build.result == 'success' &&
       !contains(inputs.run_mode, 'patch') &&
       needs.set-op-model.outputs.device_count != '0'
@@ -2371,18 +2555,26 @@ jobs:
             --arg run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             --arg ksu_type "${{ inputs.ksu_type }}" \
             --arg ksu_sha "${{ needs.set-op-model.outputs.ksu_resolved_hash }}" \
+            --arg ksu_ref_kind "${{ needs.set-op-model.outputs.ksu_ref_kind }}" \
+            --arg ksu_ref_name "${{ needs.set-op-model.outputs.ksu_ref_name }}" \
             --arg nomount "${{ needs.resolve-nomount.outputs.nomount_commit }}" \
             --arg a12 "${{ needs.set-op-model.outputs.susfs_hash_android12_5_10 }}" \
             --arg a13 "${{ needs.set-op-model.outputs.susfs_hash_android13_5_15 }}" \
             --arg a14 "${{ needs.set-op-model.outputs.susfs_hash_android14_6_1 }}" \
             --arg a15 "${{ needs.set-op-model.outputs.susfs_hash_android15_6_6 }}" \
             --arg a16 "${{ needs.set-op-model.outputs.susfs_hash_android16_6_12 }}" \
+            --arg a12s "${{ needs.set-op-model.outputs.susfs_src_android12_5_10 }}" \
+            --arg a13s "${{ needs.set-op-model.outputs.susfs_src_android13_5_15 }}" \
+            --arg a14s "${{ needs.set-op-model.outputs.susfs_src_android14_6_1 }}" \
+            --arg a15s "${{ needs.set-op-model.outputs.susfs_src_android15_6_6 }}" \
+            --arg a16s "${{ needs.set-op-model.outputs.susfs_src_android16_6_12 }}" \
             '{
               recorded_at: $ts,
               run_id: $run_id,
               run_url: $run_url,
               ksu_type: $ksu_type,
               ksu_sha: $ksu_sha,
+              ksu_ref_source: (if $ksu_ref_kind == "branch" then ("branch " + $ksu_ref_name) else $ksu_ref_kind end),
               nomount_commit: $nomount,
               susfs: (
                 {}
@@ -2391,7 +2583,14 @@ jobs:
                 + (if ($a14 | test("^[0-9a-f]{40}$")) then {"android14-6.1":  $a14} else {} end)
                 + (if ($a15 | test("^[0-9a-f]{40}$")) then {"android15-6.6":  $a15} else {} end)
                 + (if ($a16 | test("^[0-9a-f]{40}$")) then {"android16-6.12": $a16} else {} end)
-              )
+              ),
+              susfs_src: {
+                "android12-5.10": (if ($a12 | test("^[0-9a-f]{40}$")) then $a12s else "" end),
+                "android13-5.15": (if ($a13 | test("^[0-9a-f]{40}$")) then $a13s else "" end),
+                "android14-6.1":  (if ($a14 | test("^[0-9a-f]{40}$")) then $a14s else "" end),
+                "android15-6.6":  (if ($a15 | test("^[0-9a-f]{40}$")) then $a15s else "" end),
+                "android16-6.12": (if ($a16 | test("^[0-9a-f]{40}$")) then $a16s else "" end)
+              }
             }')
 
           old_pins="{}"
@@ -2419,7 +2618,9 @@ jobs:
           fi
 
           merged=$(jq -n --argjson new "$new_pins" --argjson old "$old_pins" \
-            '$new + {susfs: (($old.susfs // {}) + ($new.susfs // {}))}')
+            '$new
+             + (if ($new.nomount_commit // "") == "" then {nomount_commit: ($old.nomount_commit // "")} else {} end)
+             + {susfs: (($old.susfs // {}) + ($new.susfs // {})), susfs_src: (($old.susfs_src // {}) + ($new.susfs_src // {}))}')
 
           printf '%s' "$merged" > last-success-pins
           jq -e . last-success-pins >/dev/null || { echo "::error::Generated pin store is not valid JSON"; exit 1; }
@@ -2434,11 +2635,21 @@ jobs:
             jq -r '(.include // [])[] | "- \(.os_version)/\(.model) (\(.android_version)-\(.kernel_version))"' <<<"$MATRIX_JSON"
             echo ""
             echo "**Root manager:** \`${{ inputs.ksu_type }}\` → \`${{ needs.set-op-model.outputs.ksu_resolved_hash }}\`"
-            echo "**NoMount:** → \`${{ needs.resolve-nomount.outputs.nomount_commit }}\`"
+            if [ "${{ inputs.ksu_type }}" = "FinaSU" ]; then
+              echo "**NoMount:** native (ksud-embedded, ships with the FinaSU manager)"
+            else
+              echo "**NoMount:** → \`${{ needs.resolve-nomount.outputs.nomount_commit }}\`"
+            fi
             echo ""
             echo "**SUSFS pins in store (per GKI/KMI):**"
             echo '\`\`\`'
             jq -r '.susfs | to_entries[] | "\(.key) → \(.value)"' <<<"$merged"
+            echo ""
+            echo "**SUSFS ref sources (this run):**"
+            echo '\`\`\`'
+            jq -r '(.susfs_src // {}) | to_entries[] | select(.value != "") | "\(.key) → \(.value)"' <<<"$merged"
+            echo '\`\`\`'
+            echo "**Root manager ref source:** ${{ needs.set-op-model.outputs.ksu_ref_kind }}${{ needs.set-op-model.outputs.ksu_ref_name != '' && ' (' }}${{ needs.set-op-model.outputs.ksu_ref_name }}${{ needs.set-op-model.outputs.ksu_ref_name != '' && ')' }}"
             echo '\`\`\`'
             echo ""
             echo "> Next run with a **\"Same as last successful run\"** toggle ON reuses exactly these refs."
