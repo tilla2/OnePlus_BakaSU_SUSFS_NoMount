@@ -171,6 +171,11 @@ runs:
         if ! jq -e 'has("rtmutex_cve")' /tmp/config.json >/dev/null; then
           echo "OP_RTMUTEX_CVE=true" >> "$GITHUB_ENV"
         fi
+        # Same defaulting rule for the vendor-modules blacklist: when the config
+        # omits "blacklist_apply", keep it disabled (blacklisting is opt-in).
+        if ! jq -e 'has("blacklist_apply")' /tmp/config.json >/dev/null; then
+          echo "OP_BLACKLIST_APPLY=false" >> "$GITHUB_ENV"
+        fi
         echo "Parsed config:"
         jq '.' /tmp/config.json
         jq -e . /tmp/config.json >/dev/null
@@ -349,7 +354,7 @@ runs:
           *) errors+=("optimize_level must be O2 or O3. Got: '$optimize'"); ;;
         esac
         
-        for bool_opt in OP_LZ4_UPGRADE OP_ZSTD_UPGRADE OP_ADIOS OP_RTMUTEX_CVE OP_BBR3 OP_BORE; do
+        for bool_opt in OP_LZ4_UPGRADE OP_ZSTD_UPGRADE OP_ADIOS OP_RTMUTEX_CVE OP_BBR3 OP_BORE OP_BLACKLIST_APPLY; do
           val="${!bool_opt:-}"
           if [[ -n "$val" && "$val" != "true" && "$val" != "false" ]]; then
             errors+=("$bool_opt must be true or false if set. Got: '$val'")
@@ -3826,6 +3831,7 @@ runs:
         echo "✅ Fake config.gz patched (KCONFIG_CONFIG_PATCHED verified in kernel/Makefile; CONFIG_FAKE_DISABLE=${CONFIG_STRING:-none})"
 
     - name: Disable Vendor / Kernel Modules
+      if: ${{ env.OP_BLACKLIST_APPLY == 'true' }}
       shell: bash
       run: |
         set -euo pipefail
