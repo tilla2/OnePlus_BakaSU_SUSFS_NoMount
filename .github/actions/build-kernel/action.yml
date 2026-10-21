@@ -652,6 +652,25 @@ runs:
                   }
                   if (bestpos > 0) { best = 0; ties = 0 }
                 }
+                if (ties > 1) {
+                  # split joint anchor: full lead run ends at li, full trail run starts
+                  # at tj > li; the gap holds only lines this hunk never mentions
+                  li = 0; tj = 0
+                  for (i = scanlo; i <= scanhi && li == 0; i++) {
+                    k = sufmatch(i, nl); t = prefmatch(i, nt)
+                    if (k == nl && k > 0 && lead_nb > 0 && t < nt) li = i
+                  }
+                  for (j = scanlo; j <= scanhi && tj == 0; j++) {
+                    k = sufmatch(j, nl); t = prefmatch(j, nt)
+                    if (t == nt && t > 0 && trail_nb > 0 && k < nl) tj = j
+                  }
+                  okwin = (li > 0 && tj > li && tj - li <= 4)
+                  for (p = li; okwin && p < tj; p++) {
+                    for (m = 1; m <= nl && okwin; m++) if (fl[p] == lctx[m]) okwin = 0
+                    for (m = 1; m <= nt && okwin; m++) if (fl[p] == tctx[m]) okwin = 0
+                  }
+                  if (okwin) { gap = tj - li; bestpos = li; ties = 0; how = "split joint anchor (drift window " gap " line(s))" }
+                }
                 if (best == 0 && bestpos == 0) fail2("no recognizable anchor context in target")
                 if (ties > 1) fail2("ambiguous anchor (" ties " equally-good sites)")
                 for (i = 1; i < bestpos; i++) print fl[i]
