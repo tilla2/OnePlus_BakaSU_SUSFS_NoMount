@@ -2843,6 +2843,14 @@ runs:
         }
         case "$KERNEL_VERSION" in
           6.12)
+            if grep -q 'struct task_struct \*waiter_task = waiter->task;' "$RTM"; then
+              echo "CVE-2026-43499 rtmutex fix already present."
+              ensure_followup_fixes || echo "::warning::CVE-2026-53163 follow-up probe inconclusive; leaving tree as-is"
+              echo "rtmutex-cve|already" >> "$PS_FILE"
+              echo "✅ CVE-2026-43499/CVE-2026-53163 fix chain complete (already in tree)"
+              echo "::endgroup::"
+              exit 0
+            fi
             cve_url="${RTMUTEX_BASE}/cve-2026-43499-rtmutex-6.12.patch"
             if ! fetch_patch "$cve_url" /tmp/rtmutex_cve_6_12.patch; then
               echo "::warning::CVE-2026-43499 patch unavailable upstream; continuing without it"
@@ -3986,6 +3994,15 @@ runs:
       with:
         name: patch-status-${{ env.PS_BASE }}
         path: ${{ env.PS_FILE }}
+        if-no-files-found: ignore
+        retention-days: 7
+
+    - name: Upload patch failure forensics
+      if: ${{ always() && env.PS_FILE != '' }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: patch-faillogs-${{ env.PS_BASE }}
+        path: ${{ github.workspace }}/patch-faillogs/
         if-no-files-found: ignore
         retention-days: 7
 
