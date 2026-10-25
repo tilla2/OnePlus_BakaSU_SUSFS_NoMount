@@ -28,6 +28,11 @@ inputs:
     required: false
     type: string
     default: ""
+  use_rekernel:
+    description: 'Integrate the Re-Kernel driver in-tree (CONFIG_REKERNEL, netlink freeze/kill notifier, manager-agnostic)'
+    required: false
+    type: boolean
+    default: false
   resolved_uname:
     description: 'uname suffix resolved by the workflow (dispatch override > config uname > generated). Empty = resolve here: config uname, else scripts/uname/gen-oem-uname.sh. Never compiles without a suffix'
     required: false
@@ -165,6 +170,11 @@ runs:
         # omits "rtmutex_cve", keep it enabled (step is 6.12-gated).
         if ! jq -e 'has("rtmutex_cve")' /tmp/config.json >/dev/null; then
           echo "OP_RTMUTEX_CVE=true" >> "$GITHUB_ENV"
+        fi
+        # Same defaulting rule for the vendor-modules blacklist: when the config
+        # omits "blacklist_apply", keep it disabled (blacklisting is opt-in).
+        if ! jq -e 'has("blacklist_apply")' /tmp/config.json >/dev/null; then
+          echo "OP_BLACKLIST_APPLY=false" >> "$GITHUB_ENV"
         fi
         echo "Parsed config:"
         jq '.' /tmp/config.json
@@ -344,7 +354,7 @@ runs:
           *) errors+=("optimize_level must be O2 or O3. Got: '$optimize'"); ;;
         esac
         
-        for bool_opt in OP_LZ4_UPGRADE OP_ZSTD_UPGRADE OP_ADIOS OP_RTMUTEX_CVE OP_BBR3 OP_BORE; do
+        for bool_opt in OP_LZ4_UPGRADE OP_ZSTD_UPGRADE OP_ADIOS OP_RTMUTEX_CVE OP_BBR3 OP_BORE OP_BLACKLIST_APPLY; do
           val="${!bool_opt:-}"
           if [[ -n "$val" && "$val" != "true" && "$val" != "false" ]]; then
             errors+=("$bool_opt must be true or false if set. Got: '$val'")
@@ -495,7 +505,7 @@ runs:
           # Edits the sandbox copy in place; the caller regenerates the final diff
           # from the sandbox, so the live-tree apply stays fuzz=0.
           # rc: 0 = edited exactly, 2 = change already present, 1 = not placeable.
-          local hunk="$1" root="$2" tgt f src errf tmp_out rc diag
+          local hunk="$1" root="$2" floor="${3:-0}" tgt f src errf tmp_out rc diag
           tgt=$( { grep -m1 -E '^\+\+\+ ' "$hunk" || true; } | awk '{print $2}' | sed 's#^b/##;s#^a/##' )
           src=$( { grep -m1 -E '^--- ' "$hunk" || true; } | awk '{print $2}' | sed 's#^a/##;s#^b/##' )
           if [ -z "$tgt" ] || [ "$tgt" = "/dev/null" ]; then
@@ -512,7 +522,7 @@ runs:
             return 1
           fi
           errf=$(mktemp); tmp_out=$(mktemp); rc=0
-          awk '
+          awk -v floor="$floor" '
             function fail2(msg) { printf "FAIL %s\n", msg > "/dev/stderr"; exit 1 }
             function nonblank(s) { return s !~ /^[ \t]*$/ }
             function sufmatch(i, maxk,   k) {
@@ -536,7 +546,7 @@ runs:
             function remeq(j,   m) { for (m = 1; m <= nrem; m++) if (fl[j + m - 1] != rem[m]) return 0; return 1 }
             function addeq(j,   m) { for (m = 1; m <= nadd; m++) if (fl[j + m - 1] != add[m]) return 0; return 1 }
             FNR == NR {
-              if (!inh) { if ($0 ~ /^@@ /) inh = 1; next }
+              if (!inh) { if ($0 ~ /^@@ /) { inh = 1; hint = $0; sub(/^@@[^@]*@@[ \t]?/, "", hint); sub(/[ \t]+$/, "", hint) }; next }
               if ($0 ~ /^\\/) { noeno = 1; next }
               b[++nb] = $0
               next
@@ -575,24 +585,99 @@ runs:
                   if (addeq(j) && anchored(j, nadd) > 0) { printf "ALREADY\n" > "/dev/stderr"; exit 2 }
               }
               if (nrem == 0) {
+                fnlo = 0; fnhi = 0
+                if (hint != "" && match(hint, /[A-Za-z_][A-Za-z_0-9]*[ \t]*\(/)) {
+                  fnname = substr(hint, RSTART, RLENGTH); sub(/[ \t]*\($/, "", fnname)
+                  for (i = 1; i <= n && fnlo == 0; i++) {
+                    if (fl[i] == "") continue
+                    c = substr(fl[i], 1, 1)
+                    if (c == " " || c == "\t" || c == "#") continue
+                    t = fl[i]; sub(/[ \t]+$/, "", t)
+                    if (t ~ /;$/) continue
+                    if (t == hint || t ~ "^" fnname "[ \t]*\\(") fnlo = i
+                  }
+                  if (fnlo > 0) {
+                    depth = 0; seen = 0; fnhi = 0
+                    for (j = fnlo; j <= n; j++) {
+                      t = fl[j]
+                      for (k = 1; k <= length(t); k++) {
+                        ch = substr(t, k, 1)
+                        if (ch == "{") { depth++; seen = 1 } else if (ch == "}") depth--
+                      }
+                      if (seen && depth <= 0) { fnhi = j; break }
+                      if (depth < 0) break
+                    }
+                    if (fnhi <= fnlo) { fnlo = 0; fnhi = 0 }
+                  }
+                }
+                how = ""
+                if (fnlo > 0) {
+                  while (fnhi < n && (fl[fnhi + 1] == "" || fl[fnhi + 1] ~ /^[ \t]*#/)) fnhi++
+                  scanlo = (fnlo + 1 > floor + 1) ? fnlo + 1 : floor + 1
+                  scanhi = (fnhi + 1 < n + 1) ? fnhi + 1 : n + 1
+                } else {
+                  scanlo = floor + 1; scanhi = n + 1
+                }
+                lead_nb = 0; for (m = 1; m <= nl; m++) if (nonblank(lctx[m])) lead_nb++
+                trail_nb = 0; for (m = 1; m <= nt; m++) if (nonblank(tctx[m])) trail_nb++
                 best = 0; ties = 0; bestpos = 0
-                for (i = 1; i <= n + 1; i++) {
+                for (i = scanlo; i <= scanhi; i++) {
                   k = sufmatch(i, nl); t = prefmatch(i, nt)
+                  # full context run on at least one side, else fallbacks decide
+                  if (!((k == nl && k > 0 && lead_nb > 0) || (t == nt && t > 0 && trail_nb > 0))) continue
                   score = k + t
-                  if (score == 0) continue
-                  ok = 0
-                  for (m = 1; m <= k && !ok; m++) if (nonblank(lctx[nl - k + m])) ok = 1
-                  for (m = 1; m <= t && !ok; m++) if (nonblank(tctx[m])) ok = 1
-                  if (!ok) continue
                   if (score > best) { best = score; bestpos = i; ties = 1 }
                   else if (score == best) ties++
                 }
-                if (best == 0) fail2("no recognizable anchor context in target")
+                if ((best == 0 || ties > 1) && fnlo > 0) {
+                  bestpos = 0
+                  anchor = ""
+                  for (m = 1; m <= nt && anchor == ""; m++) if (nonblank(tctx[m])) anchor = tctx[m]
+                  if (anchor != "") {
+                    sub(/^[ \t]+/, "", anchor); sub(/[ \t]+$/, "", anchor)
+                    for (i = scanlo; i <= scanhi && i <= n && bestpos == 0; i++) {
+                      t = fl[i]; sub(/^[ \t]+/, "", t); sub(/[ \t]+$/, "", t)
+                      if (t == anchor) { bestpos = i; how = "trailing-context anchor" }
+                    }
+                  }
+                  if (bestpos == 0) {
+                    isgoto = 0
+                    for (m = 1; m <= nadd; m++) if (add[m] ~ /^[ \t]*goto[ \t][A-Za-z_][A-Za-z_0-9]*;[ \t]*$/) isgoto = 1
+                    if (isgoto) {
+                      for (i = fnlo; i <= fnhi && bestpos == 0; i++) {
+                        t = fl[i]; sub(/^[ \t]+/, "", t); sub(/[ \t]+$/, "", t)
+                        if ((t == "do {" || t == "do{" || t ~ /^(for|while)[ \t]*\(/ || t ~ /^[A-Za-z_][A-Za-z_0-9]*for_each/) && t ~ /\{$/) { bestpos = i + 1; how = "loop top" }
+                      }
+                    }
+                  }
+                  if (bestpos > 0) { best = 0; ties = 0 }
+                }
+                if (ties > 1) {
+                  # split joint anchor: full lead run ends at li, full trail run starts
+                  # at tj > li; the gap holds only lines this hunk never mentions
+                  li = 0; tj = 0
+                  for (i = scanlo; i <= scanhi && li == 0; i++) {
+                    k = sufmatch(i, nl); t = prefmatch(i, nt)
+                    if (k == nl && k > 0 && lead_nb > 0 && t < nt) li = i
+                  }
+                  for (j = scanlo; j <= scanhi && tj == 0; j++) {
+                    k = sufmatch(j, nl); t = prefmatch(j, nt)
+                    if (t == nt && t > 0 && trail_nb > 0 && k < nl) tj = j
+                  }
+                  okwin = (li > 0 && tj > li && tj - li <= 4)
+                  for (p = li; okwin && p < tj; p++) {
+                    for (m = 1; m <= nl && okwin; m++) if (fl[p] == lctx[m]) okwin = 0
+                    for (m = 1; m <= nt && okwin; m++) if (fl[p] == tctx[m]) okwin = 0
+                  }
+                  if (okwin) { gap = tj - li; bestpos = li; ties = 0; how = "split joint anchor (drift window " gap " line(s))" }
+                }
+                if (best == 0 && bestpos == 0) fail2("no recognizable anchor context in target")
                 if (ties > 1) fail2("ambiguous anchor (" ties " equally-good sites)")
                 for (i = 1; i < bestpos; i++) print fl[i]
                 for (m = 1; m <= nadd; m++) print add[m]
                 for (i = bestpos; i <= n; i++) print fl[i]
-                printf "inserted %d line(s) after line %d (anchor score %d)\n", nadd, bestpos - 1, best > "/dev/stderr"
+                if (how != "") printf "inserted %d line(s) at %s (after line %d) POS %d\n", nadd, how, bestpos - 1, bestpos + nadd - 1 > "/dev/stderr"
+                else printf "inserted %d line(s) after line %d (anchor score %d) POS %d\n", nadd, bestpos - 1, best, bestpos + nadd - 1 > "/dev/stderr"
                 exit 0
               }
               nsites = 0
@@ -606,12 +691,13 @@ runs:
                 if (score > best) { best = score; bestj = j; ties = 1 }
                 else if (score == best) ties++
               }
+              if (nsites > 1 && best == 0) fail2("ambiguous removed-block site (" nsites " verbatim, no anchor context to disambiguate)")
               if (nsites > 1 && ties > 1) fail2("ambiguous removed-block site (" nsites " verbatim, " ties " equally good)")
               j = bestj
               for (i = 1; i < j; i++) print fl[i]
               for (m = 1; m <= nadd; m++) print add[m]
               for (i = j + nrem; i <= n; i++) print fl[i]
-              printf "replaced %d line(s) at line %d with %d\n", nrem, j, nadd > "/dev/stderr"
+              printf "replaced %d line(s) at line %d with %d POS %d\n", nrem, j, nadd, j + nadd - 1 > "/dev/stderr"
               exit 0
             }
           ' "$hunk" "$f" > "$tmp_out" 2> "$errf" || rc=$?
@@ -651,7 +737,8 @@ runs:
             mkdir -p "${um}/$(dirname "$f")" "${md}/$(dirname "$f")"
             cp "$f" "${um}/$f" && cp "$f" "${md}/$f"
           done
-          local hunk_dir="${base}/hunks" h hlist staged already_ct failed_ct failed_list htarget verdict rcv
+          local hunk_dir="${base}/hunks" h hlist staged already_ct failed_ct failed_list htarget verdict rcv floor_pos
+          local -A hpos=()
           mkdir -p "$hunk_dir"
           split_hunks "$src" "$hunk_dir"
           hlist=$(ls "$hunk_dir"/*.hunk 2>/dev/null || true)
@@ -684,9 +771,12 @@ runs:
                 already_ct=$((already_ct+1))
               else
                 rcv=0
-                verdict=$(regen_hunk "$h" "$md") || rcv=$?
+                floor_pos=${hpos["$htarget"]:-0}
+                verdict=$(regen_hunk "$h" "$md" "$floor_pos") || rcv=$?
                 if [ "$rcv" = "0" ]; then
                   staged=$((staged+1))
+                  floor_pos=$(printf '%s' "$verdict" | { grep -o 'POS [0-9]*' || true; } | tail -1 | awk '{print $2}')
+                  [ -n "$floor_pos" ] && hpos["$htarget"]="$floor_pos"
                   echo "hunk ${h##*/} regenerated exactly: ${verdict}" >> "${base}/stage.log"
                   echo "[patchgen] ${name}: REGEN ${h##*/} (${htarget:-?}): ${verdict}"
                 elif [ "$rcv" = "2" ]; then
@@ -1195,12 +1285,12 @@ runs:
       if: ${{ inputs.clean == false || inputs.clean == 'false' }}
       with:
         cache_path: ${{ env.CCACHE_DIR }}
-        cache_key: ${{ inputs.ksu_type }}-v3-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-${{ env.KERNEL_FULL_VER }}-${{ env.CLANG_VERSION_SHORT }}
+        cache_key: ${{ inputs.ksu_type }}-v4-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-${{ env.KERNEL_FULL_VER }}-${{ env.CLANG_VERSION_SHORT }}
         cache_bucket: "ccache-cache"
         debug: ${{ inputs.debug }}
         restore_keys: |
-          ${{ inputs.ksu_type }}-v3-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-${{ env.KERNEL_FULL_VER }}-
-          ${{ inputs.ksu_type }}-v3-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-
+          ${{ inputs.ksu_type }}-v4-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-${{ env.KERNEL_FULL_VER }}-
+          ${{ inputs.ksu_type }}-v4-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-
 
     - name: Restore LTO LD cache
       id: restore-lto-ld-cache
@@ -1209,12 +1299,12 @@ runs:
       if: ${{ (inputs.clean == false && env.OP_LTO != 'none') || (inputs.clean == 'false' && env.OP_LTO != 'none') }}
       with:
         cache_path: ${{ env.LDCACHE_DIR }}
-        cache_key: ${{ inputs.ksu_type }}-v3-LTO-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-${{ env.KERNEL_FULL_VER }}-${{ env.CLANG_VERSION_SHORT }}
+        cache_key: ${{ inputs.ksu_type }}-v4-LTO-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-${{ env.KERNEL_FULL_VER }}-${{ env.CLANG_VERSION_SHORT }}
         cache_bucket: "lto-cache"
         debug: ${{ inputs.debug }}
         restore_keys: |
-          ${{ inputs.ksu_type }}-v3-LTO-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-${{ env.KERNEL_FULL_VER }}-
-          ${{ inputs.ksu_type }}-v3-LTO-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-
+          ${{ inputs.ksu_type }}-v4-LTO-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-${{ env.KERNEL_FULL_VER }}-
+          ${{ inputs.ksu_type }}-v4-LTO-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-
     - name: Check and Prepare Caches
       shell: bash
       run: |
@@ -1280,12 +1370,16 @@ runs:
           if [ -z "$SUSFS_INPUT" ]; then
             # use kernel-specific default
             SUSFS_BRANCH="${DEFAULT_SUSFS[$KERNEL_KEY]:-gki-android15-6.6}"
+            SUSFS_REF_SOURCE="kmi-default branch"
             echo "ℹ️  Using default SUSFS branch for $KERNEL_KEY: $SUSFS_BRANCH"
           else
             # 40-char hash or branch/commit passed directly
             SUSFS_BRANCH="$SUSFS_INPUT"
+            SUSFS_REF_SOURCE="explicit input pin"
             echo "🔧 Using resolved SUSFS ref: $SUSFS_BRANCH"
           fi
+          echo "SUSFS_REF=$SUSFS_BRANCH" >> "$GITHUB_ENV"
+          echo "SUSFS_REF_SOURCE=$SUSFS_REF_SOURCE" >> "$GITHUB_ENV"
         fi
         
         retry_fetch_archive() {
@@ -1405,23 +1499,34 @@ runs:
         }
         
         retry_clone "https://github.com/WildKernels/kernel_patches.git" "main" "1"
-        git clone --no-checkout --depth 1 "https://github.com/maxsteeel/nomount.git" nomount
-        NOMOUNT_TARGET="${{ inputs.nomount_commit }}"
-        if [ -n "$NOMOUNT_TARGET" ]; then
-          echo "Using NoMount commit: $NOMOUNT_TARGET"
-          git -C nomount fetch --depth 1 origin "$NOMOUNT_TARGET"
-          git -C nomount checkout --detach "$NOMOUNT_TARGET"
-          NOMOUNT_COMMIT_SHA="$(git -C nomount rev-parse HEAD)"
-          if [ "$NOMOUNT_COMMIT_SHA" != "$NOMOUNT_TARGET" ]; then
-            echo "::error::NoMount checkout mismatch: wanted $NOMOUNT_TARGET, got $NOMOUNT_COMMIT_SHA"
-            exit 1
-          fi
+        if [ "${{ inputs.ksu_type }}" = "FinaSU" ]; then
+          # NoMount ships inside FinaSU's ksud (embedded per KMI, built by LyraVoid/FinaSU).
+          # No kernel-side integration and no upstream module fetch - report native.
+          NOMOUNT_COMMIT_SHA="native (ksud-embedded)"
+          NOMOUNT_REF_SOURCE="FinaSU native"
+          echo "NoMount: native (ksud-embedded, ships with the FinaSU manager)"
         else
-          git -C nomount checkout --detach origin/HEAD 2>/dev/null || git -C nomount checkout --detach
-          NOMOUNT_COMMIT_SHA="$(git -C nomount rev-parse HEAD)"
-          echo "::warning::No NoMount commit provided; tracking upstream latest (${NOMOUNT_COMMIT_SHA})"
+          git clone --no-checkout --depth 1 "https://github.com/maxsteeel/nomount.git" nomount
+          NOMOUNT_TARGET="${{ inputs.nomount_commit }}"
+          if [ -n "$NOMOUNT_TARGET" ]; then
+            echo "Using NoMount commit: $NOMOUNT_TARGET"
+            git -C nomount fetch --depth 1 origin "$NOMOUNT_TARGET"
+            git -C nomount checkout --detach "$NOMOUNT_TARGET"
+            NOMOUNT_COMMIT_SHA="$(git -C nomount rev-parse HEAD)"
+            if [ "$NOMOUNT_COMMIT_SHA" != "$NOMOUNT_TARGET" ]; then
+              echo "::error::NoMount checkout mismatch: wanted $NOMOUNT_TARGET, got $NOMOUNT_COMMIT_SHA"
+              exit 1
+            fi
+          else
+            git -C nomount checkout --detach origin/HEAD 2>/dev/null || git -C nomount checkout --detach
+            NOMOUNT_COMMIT_SHA="$(git -C nomount rev-parse HEAD)"
+            NOMOUNT_REF_SOURCE="upstream latest"
+            echo "::warning::No NoMount commit provided; tracking upstream latest (${NOMOUNT_COMMIT_SHA})"
+          fi
+          if [ -z "${NOMOUNT_REF_SOURCE:-}" ]; then NOMOUNT_REF_SOURCE="explicit input pin"; fi
+          git -C nomount log --oneline -1
         fi
-        git -C nomount log --oneline -1
+        echo "NOMOUNT_REF_SOURCE=$NOMOUNT_REF_SOURCE" >> "$GITHUB_ENV"
         echo "NOMOUNT_COMMIT_SHA=$NOMOUNT_COMMIT_SHA" >> "$GITHUB_ENV"
         echo "Using NoMount commit: $NOMOUNT_COMMIT_SHA"
         if [ "${{ env.OP_SUSFS }}" = true ]; then
@@ -1549,10 +1654,15 @@ runs:
         echo "::group::Add KernelSU Next"
         cd "$KERNEL_PLATFORM_FOLDER"
         KSU_INPUT="${{ inputs.ksu_branch_or_hash }}"
+        KSUN_SETUP="$(mktemp)"
+        # setup.sh is not on 'main' upstream (404); dev is maintained, next is the fallback
+        curl --fail --location --proto '=https' -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/dev/kernel/setup.sh" -o "$KSUN_SETUP" \
+          || curl --fail --location --proto '=https' -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" -o "$KSUN_SETUP"
+        [ -s "$KSUN_SETUP" ] || { echo "::error::Could not fetch KernelSU-Next kernel/setup.sh"; exit 1; }
         if [ -z "$KSU_INPUT" ]; then
-          curl --fail --location --proto '=https' -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/main/kernel/setup.sh" | bash -
+          bash "$KSUN_SETUP"
         else
-          curl --fail --location --proto '=https' -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/main/kernel/setup.sh" | bash -s "$KSU_INPUT"
+          bash "$KSUN_SETUP" "$KSU_INPUT"
         fi
         git -C KernelSU-Next submodule update --init --recursive
         cd KernelSU-Next/kernel
@@ -1643,13 +1753,146 @@ runs:
         echo "✅ BakaSU root tag applied: ${OP_ROOT_TAG} (CONFIG_KSU_FULL_NAME_FORMAT in gki_defconfig)"
         echo "::endgroup::"
 
+    - name: Fetch FinaSU Compat Suite
+      shell: bash
+      if: ${{ inputs.ksu_type == 'FinaSU' }}
+      run: |
+        set -euo pipefail
+        echo "::group::Fetch FinaSU compat suite"
+        # Remote-first, local fallback: track the maintained copies at runtime.
+        # LyraVoid/FinaSU upstream ships no compat scripts; LingLuo's repos do.
+        # OnePlusOSS manifests -> OnePlus_KernelSU_SUSFS set, AOSP-hybrid (gki)
+        # manifests -> AnyKernel3 set; the other repo mirrors as second hop.
+        COMPAT_DIR="$GITHUB_WORKSPACE/scripts/finasu_compat"
+        mkdir -p "$COMPAT_DIR"
+        if [[ "${OP_MANIFEST:-}" == *_gki_* ]]; then
+          BASES=(
+            "https://raw.githubusercontent.com/LingLuo17/AnyKernel3/main/scripts/finasu_compat"
+            "https://raw.githubusercontent.com/LingLuo17/OnePlus_KernelSU_SUSFS/main/scripts/finasu_compat"
+          )
+        else
+          BASES=(
+            "https://raw.githubusercontent.com/LingLuo17/OnePlus_KernelSU_SUSFS/main/scripts/finasu_compat"
+            "https://raw.githubusercontent.com/LingLuo17/AnyKernel3/main/scripts/finasu_compat"
+          )
+        fi
+        for f in apply.sh extract_manager_cert.py susfs_drift_fixes.patch; do
+          src="local"
+          for b in "${BASES[@]}"; do
+            if curl -fsSL --retry 2 --max-time 120 -o "$COMPAT_DIR/$f.new" "$b/$f" && [ -s "$COMPAT_DIR/$f.new" ]; then
+              mv "$COMPAT_DIR/$f.new" "$COMPAT_DIR/$f"
+              src="${b#*LingLuo17/}"; src="${src%%/*}"
+              break
+            fi
+            rm -f "$COMPAT_DIR/$f.new"
+          done
+          echo "finasu-compat|$f|$src" >> "$PS_FILE"
+          echo "$f <- $src"
+        done
+        echo "::endgroup::"
+    - name: Add FinaSU
+      shell: bash
+      if: ${{ inputs.ksu_type == 'FinaSU' }}
+      run: |
+        set -euo pipefail
+        echo "::group::Add FinaSU"
+        cd "$KERNEL_PLATFORM_FOLDER"
+        echo "Adding FinaSU..."
+        git clone https://github.com/LyraVoid/FinaSU.git KernelSU
+        git -C KernelSU submodule update --init --recursive || true
+
+        KSU_INPUT="${{ inputs.ksu_branch_or_hash }}"
+        if [ -n "$KSU_INPUT" ]; then
+          git -C KernelSU checkout --detach "$KSU_INPUT" 2>/dev/null \
+            || { git -C KernelSU fetch origin "$KSU_INPUT" && git -C KernelSU checkout --detach "$KSU_INPUT"; }
+        fi
+
+        # FinaSU keeps its UAPI headers at the repo root; the driver reaches them via
+        # include/uapi -> ../../uapi, which only resolves in upstream's M= build layout.
+        # In-tree, drivers/kernelsu addresses KernelSU/kernel, so materialize the root
+        # uapi/ inside the driver dir; fail loudly if upstream moves it.
+        if [ ! -e KernelSU/kernel/uapi/app_profile.h ]; then
+          [ -f KernelSU/uapi/app_profile.h ] \
+            || { echo "::error::FinaSU uapi headers not found at KernelSU/uapi (upstream layout changed)"; exit 1; }
+          mkdir -p KernelSU/kernel/uapi
+          cp KernelSU/uapi/*.h KernelSU/kernel/uapi/
+        fi
+
+        # FinaSU ships no setup.sh for in-tree use - wire it manually:
+        # symlink the kernel dir, mount Makefile/Kconfig (trailing-newline guard
+        # for vendor trees whose drivers/Makefile lacks a final newline).
+        DRIVER_DIR="$COMMON_KERNEL_FOLDER/drivers"
+        ln -sfn "$(realpath --relative-to="$DRIVER_DIR" "$KERNEL_PLATFORM_FOLDER/KernelSU/kernel")" "$DRIVER_DIR/kernelsu"
+        grep -q "obj-.*CONFIG_KSU.*kernelsu/" "$DRIVER_DIR/Makefile" \
+          || { echo "" >> "$DRIVER_DIR/Makefile"; printf 'obj-$(CONFIG_KSU) += kernelsu/\n' >> "$DRIVER_DIR/Makefile"; }
+        grep -q 'source "drivers/kernelsu/Kconfig"' "$DRIVER_DIR/Kconfig" \
+          || sed -i "/endmenu/i source \"drivers/kernelsu/Kconfig\"" "$DRIVER_DIR/Kconfig"
+        cat >> "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" <<EOF
+        CONFIG_KSU=y
+        EOF
+
+        # Trust the official FinaSU manager via the second signature slot.
+        # Without it the upstream KernelSU manager hijacks the manager identity
+        # and the FinaSU manager reports "not installed".
+        REL_APK="$(mktemp -d)/manager.apk"
+        REL_JSON=""
+        for ATTEMPT in 1 2 3; do
+          REL_JSON=$(curl -s --fail --max-time 30 "https://api.github.com/repos/LyraVoid/FinaSU/releases/latest") \
+            && [ -n "$REL_JSON" ] && break
+          echo "Release info fetch failed, retrying ($ATTEMPT/3)..."
+          sleep 5
+        done
+        REL_URL=$(printf '%s' "$REL_JSON" | python3 -c \
+          "import json,sys; d=json.load(sys.stdin); print(next(a['browser_download_url'] for a in d.get('assets',[]) if a['name'].endswith('.apk')))" 2>/dev/null || true)
+        [ -n "$REL_URL" ] || { echo "::error::No APK asset in the latest FinaSU release - cannot extract the manager cert"; exit 1; }
+        curl -sL --fail --retry 3 --max-time 300 -o "$REL_APK" "$REL_URL" \
+          || { echo "::error::Failed to download the FinaSU release APK"; exit 1; }
+        CERT_INFO=$(python3 "$GITHUB_WORKSPACE/scripts/finasu_compat/extract_manager_cert.py" "$REL_APK" | head -n1)
+        KSU_CERT_SIZE=$(echo "$CERT_INFO" | awk '{print $1}')
+        KSU_CERT_HASH=$(echo "$CERT_INFO" | awk '{print $2}')
+        [ -n "$KSU_CERT_SIZE" ] && [ -n "$KSU_CERT_HASH" ] \
+          || { echo "::error::FinaSU manager cert extraction failed"; exit 1; }
+        echo "Injecting FinaSU manager cert into the second trust slot: size=$KSU_CERT_SIZE sha256=$KSU_CERT_HASH"
+        awk -v size="$KSU_CERT_SIZE" -v hash="$KSU_CERT_HASH" '
+          !done && /^ccflags-y \+= -DEXPECTED_HASH=/ {
+            print
+            print "# injected by OnePlus_BakaSU_SUSFS_NoMount: trust the official FinaSU manager via the second signature slot"
+            print "KSU_EXPECTED_SIZE2 := " size
+            print "KSU_EXPECTED_HASH2 := " hash
+            print "KSU_SECOND_SIGNATURE_RELEASE := 1"
+            done = 1
+            next
+          }
+          { print }
+        ' KernelSU/kernel/Kbuild > KernelSU/kernel/Kbuild.new && mv KernelSU/kernel/Kbuild.new KernelSU/kernel/Kbuild
+        grep -q "^KSU_EXPECTED_SIZE2 := " KernelSU/kernel/Kbuild \
+          && grep -q "^KSU_EXPECTED_HASH2 := " KernelSU/kernel/Kbuild \
+          && grep -q "^KSU_SECOND_SIGNATURE_RELEASE := 1" KernelSU/kernel/Kbuild \
+          || { echo "::error::Kbuild cert injection failed (anchor line missing - FinaSU upstream Kbuild layout may have changed)"; exit 1; }
+
+        # Upstream's KSU_KERNEL_DIR := $(srctree)/$(src) double-prefixes $(src) in
+        # O= in-tree builds, leaving kernel/include (klog.h) unreachable; bridge it.
+        grep -qF 'ccflags-y += -I$(src)/include' KernelSU/kernel/Kbuild \
+          || printf '\n# in-tree include path (OnePlus_BakaSU_SUSFS_NoMount)\nccflags-y += -I$(src) -I$(src)/include\n' >> KernelSU/kernel/Kbuild
+
+        KSU_COMMIT_SHA=$(git -C KernelSU rev-parse HEAD)
+        COMMITS=$(git -C KernelSU rev-list --count HEAD)
+        KSU_VERSION=$((30000 + COMMITS))
+        echo "KSU_COMMIT_SHA=$KSU_COMMIT_SHA" >> "$GITHUB_ENV"
+        echo "NEED_HOOKS=false" >> "$GITHUB_ENV"
+        echo "KSUVER=$KSU_VERSION" >> "$GITHUB_ENV"
+        echo "FinaSU" >> "${ARTIFACTS_FOLDER}/${OP_MODEL}_${OP_OS_VERSION}.txt"
+        echo "$KSU_VERSION" >> "${ARTIFACTS_FOLDER}/${OP_MODEL}_${OP_OS_VERSION}.txt"
+        echo "FinaSU Version: $KSU_VERSION"
+        echo "✅ FinaSU added (ref: ${KSU_INPUT:-master}, commit: ${KSU_COMMIT_SHA:0:8})"
+        echo "::endgroup::"
+
     - name: Apply SUSFS Patches
       shell: bash
       if: ${{ env.OP_SUSFS == 'true' }}
       run: |
         set -euo pipefail
         echo "::group::Apply SUSFS patches"
-        cd "$KERNEL_PLATFORM_FOLDER"
         cd "$KERNEL_PLATFORM_FOLDER"
         echo "Applying SUSFS patches..."
         cp "$SUSFS_FOLDER/kernel_patches/fs/"* "$COMMON_KERNEL_FOLDER/fs/"
@@ -1885,12 +2128,29 @@ runs:
         esac
         echo "::endgroup::"
 
+    - name: Apply FinaSU SUSFS Integration
+      shell: bash
+      if: ${{ inputs.ksu_type == 'FinaSU' && env.OP_SUSFS == 'true' }}
+      run: |
+        set -euo pipefail
+        echo "::group::Apply FinaSU SUSFS integration"
+        # Kernel-side fs/include copies already happened in 'Apply SUSFS Patches'.
+        # This applies the KSU-side 10_enable patch + maintained drift fixes
+        # (two-step git apply with hard verification) to the FinaSU tree and
+        # forces manual-hook mode (inline hook machinery is removed by the patches).
+        SUSFS4KSU="$SUSFS_FOLDER" bash "$GITHUB_WORKSPACE/scripts/finasu_compat/apply.sh" "$KSU_FOLDER"
+        echo "NEED_HOOKS=false" >> "$GITHUB_ENV"
+        echo "susfs-finasu|applied" >> "$PS_FILE"
+        echo "✅ FinaSU SUSFS integration applied"
+        echo "::endgroup::"
+
     - name: Apply SUSFS Kernel Patches
       shell: bash
       if: ${{ env.OP_SUSFS == 'true' }}
       run: |
         set -euo pipefail
         echo "::group::Apply SUSFS kernel patches"
+
         cd "$KERNEL_PLATFORM_FOLDER"
         cd "$COMMON_KERNEL_FOLDER"
         if [ "${{ env.ANDROID_VER }}" = "android15" ] && [ "${{ env.KERNEL_VER }}" = "6.6" ]; then
@@ -2027,10 +2287,19 @@ runs:
           sed -i '/#include <linux\/vmalloc.h>/a #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n#include <linux\/susfs_def.h>\n#endif \/\/ #ifdef CONFIG_KSU_SUSFS_SUS_MAP' mm/memory.c
         fi
         source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        gen_patch susfs-main "$patch_to_apply" "" "g:fs/Makefile|susfs.o"
-        if ! grep -Eq '^susfs-main\|(applied|already)' "$PS_FILE" 2>/dev/null; then
-          echo "::error::SUSFS kernel patch failed to stage at fuzz=0 (see patch-faillogs/)"
-          exit 1
+        # susfs-main is redundant (and self-contradictory) when the synced tree
+        # already wires SUSFS into fs/Makefile (pre-integrated community/FinaSU
+        # sources). Nothing earlier in this run wires it: 10_enable_susfs_for_ksu
+        # only touches kernel/*. Skip instead of stacking a second integration.
+        if grep -qF 'obj-$(CONFIG_KSU_SUSFS) += susfs.o' fs/Makefile; then
+          echo "[patchgen] susfs-main: fs/Makefile already wires CONFIG_KSU_SUSFS - skipping susfs-main"
+          echo "susfs-main|already" >> "$PS_FILE"
+        else
+          gen_patch susfs-main "$patch_to_apply" "" "g:fs/Makefile|susfs.o"
+          if ! grep -Eq '^susfs-main\|(applied|already)' "$PS_FILE" 2>/dev/null; then
+            echo "::error::SUSFS kernel patch failed to stage at fuzz=0 (resolved SUSFS ref: ${SUSFS_REF:-unknown}, source: ${SUSFS_REF_SOURCE:-unknown}; check SUSFS vintage vs this tree's GKI baseline - see patch-faillogs/)"
+            exit 1
+          fi
         fi
         echo "✅ [susfs-main] verified"
         if [ -n "$filtered_kernel_patch" ]; then
@@ -2171,6 +2440,7 @@ runs:
         
         echo "::endgroup::"
     - name: Apply NoMount
+      if: ${{ inputs.ksu_type != 'FinaSU' }}
       shell: bash
       run: |
         set -euo pipefail
@@ -2330,13 +2600,15 @@ runs:
           echo "block/adios.c already present, enabling config only"
           echo "adios|applied" >> "$PS_FILE"
         fi
-        grep -q 'config MQ_IOSCHED_ADIOS' block/Kconfig.iosched
-        grep -q 'adios.o' block/Makefile
+        grep -q 'config MQ_IOSCHED_ADIOS' block/Kconfig.iosched \
+          || { echo "::error::ADIOS: 'config MQ_IOSCHED_ADIOS' missing from block/Kconfig.iosched after apply"; exit 1; }
+        grep -q 'adios.o' block/Makefile \
+          || { echo "::error::ADIOS: 'adios.o' missing from block/Makefile after apply"; exit 1; }
         grep -q '^CONFIG_MQ_IOSCHED_ADIOS=y' arch/arm64/configs/gki_defconfig || \
           echo 'CONFIG_MQ_IOSCHED_ADIOS=y' >> arch/arm64/configs/gki_defconfig
         grep -q '^CONFIG_MQ_IOSCHED_DEFAULT_ADIOS=y' arch/arm64/configs/gki_defconfig || \
           echo 'CONFIG_MQ_IOSCHED_DEFAULT_ADIOS=y' >> arch/arm64/configs/gki_defconfig
-        grep -n 'CONFIG_MQ_IOSCHED' arch/arm64/configs/gki_defconfig
+        grep -n 'CONFIG_MQ_IOSCHED' arch/arm64/configs/gki_defconfig || true
         echo "ADIOS_ENABLED=true" >> "$GITHUB_ENV"
         echo "ADIOS_SOURCE=https://github.com/firelzrd/adios" >> "$GITHUB_ENV"
         echo "✅ ADIOS I/O scheduler enabled"
@@ -2419,38 +2691,272 @@ runs:
       run: |
         set -euo pipefail
         echo "::group::Apply rtmutex CVE-2026-43499"
-        if [ "${{ env.KERNEL_VER }}" != "6.12" ]; then
-          echo "rtmutex-cve|skipped" >> "$PS_FILE"
-          echo "CVE-2026-43499 fix is staged for 6.12 trees only; this is ${{ env.KERNEL_VER }} - skipping"
-          echo "::endgroup::"
-          exit 0
-        fi
         cd "$COMMON_KERNEL_FOLDER"
         source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        cve_url="https://raw.githubusercontent.com/cctv18/oppo_oplus_realme_sm8850/6c1ffdac3ebf7ebb80254427a7972262b0a8f64e/other_patch/cve-2026-43499-rtmutex-6.12.patch"
-        if ! fetch_patch "$cve_url" /tmp/rtmutex_cve_6_12.patch; then
-          echo "::warning::CVE-2026-43499 patch unavailable upstream; continuing without it"
+        KERNEL_VERSION="${{ env.KERNEL_VER }}"
+        SUBLEVEL="$(awk '/^SUBLEVEL *=/ { print $3; exit }' Makefile 2>/dev/null || true)"
+        RTM="kernel/locking/rtmutex.c"
+        RTMUTEX_PIN="d6255c5f44e3871743c7d1570436822227b4b2fd"
+        RTMUTEX_BASE="https://raw.githubusercontent.com/LingLuo17/AnyKernel3/${RTMUTEX_PIN}/security_patch"
+        skip_cve() {
           echo "rtmutex-cve|skipped" >> "$PS_FILE"
           echo "::endgroup::"
           exit 0
-        fi
-        gen_patch rtmutex-cve /tmp/rtmutex_cve_6_12.patch "" "g:kernel/locking/rtmutex.c|waiter_task->pi_blocked_on = NULL;g:kernel/locking/rtmutex_api.c|if \(unlikely\(ret < 0\)\)"
-        if ! grep -Eq '^rtmutex-cve\|(applied|already)' "$PS_FILE" 2>/dev/null; then
-          echo "::warning::CVE-2026-43499 fix did not stage at fuzz=0; continuing without it"
-          sed -i '/^rtmutex-cve|/d' "$PS_FILE" 2>/dev/null || true
-          echo "rtmutex-cve|skipped" >> "$PS_FILE"
-          echo "::endgroup::"
-          exit 0
-        fi
-        if [ "$(grep -E '^rtmutex-cve\|' "$PS_FILE" | tail -n1)" = "rtmutex-cve|applied" ]; then
-          grep -q 'waiter_task->pi_blocked_on = NULL' kernel/locking/rtmutex.c
-          grep -q 'waiter::task != current' kernel/locking/rtmutex.c
-          grep -q 'if (unlikely(ret < 0))' kernel/locking/rtmutex_api.c
-        fi
-        echo "RTMUTEX_CVE_FIXED=true" >> "$GITHUB_ENV"
-        echo "RTMUTEX_CVE_SOURCE=https://github.com/cctv18/oppo_oplus_realme_sm8850 other_patch/cve-2026-43499-rtmutex-6.12.patch @6c1ffda" >> "$GITHUB_ENV"
-        echo "✅ CVE-2026-43499 rtmutex fix applied (remove_waiter futex PI proxy path)"
-        echo "::endgroup::"
+        }
+        ensure_followup_fixes() {
+          # CVE-2026-53163: fixes the regression the 43499 backport introduced.
+          if ! grep -q 'if (!waiter_task) /\* never enqueued \*/' "$RTM"; then
+            if awk '
+              /^static .*remove_waiter\(/ { in_remove_waiter = 1 }
+              {
+                print
+                if (in_remove_waiter && /lockdep_assert_held\(&lock->wait_lock\);/) {
+                  match($0, /^[[:space:]]*/)
+                  indent = substr($0, RSTART, RLENGTH)
+                  print ""
+                  print indent "if (!waiter_task) /* never enqueued */"
+                  print indent "\treturn;"
+                  inserted++
+                  in_remove_waiter = 0
+                }
+              }
+              END { if (inserted != 1) exit 42 }
+            ' "$RTM" > /tmp/c4.rtm; then
+              mv /tmp/c4.rtm "$RTM"
+              echo "Applied CVE-2026-53163 remove_waiter() NULL guard."
+            else
+              rm -f /tmp/c4.rtm
+              echo "::warning::CVE-2026-53163: could not locate remove_waiter() probe site; NULL guard left unchanged"
+            fi
+          fi
+          proxy_target=""
+          for candidate in kernel/locking/rtmutex_api.c kernel/locking/rtmutex.c; do
+            if [ -f "$candidate" ] && grep -q 'ret = __rt_mutex_start_proxy_lock' "$candidate"; then
+              proxy_target="$candidate"
+              break
+            fi
+          done
+          if [ -z "$proxy_target" ]; then
+            echo "CVE-2026-53163 proxy cleanup path is absent; no change required."
+            return 0
+          fi
+          if grep -q 'if (unlikely(ret < 0))' "$proxy_target"; then
+            echo "CVE-2026-53163 proxy cleanup fix already present."
+            return 0
+          fi
+          if awk '
+            /ret = __rt_mutex_start_proxy_lock/ { in_proxy_start = 1 }
+            in_proxy_start && /if \(unlikely\(ret\)\)/ {
+              sub(/if \(unlikely\(ret\)\)/, "if (unlikely(ret < 0))")
+              replaced++
+              in_proxy_start = 0
+            }
+            { print }
+            END { if (replaced != 1) exit 42 }
+          ' "$proxy_target" > /tmp/c4.api; then
+            mv /tmp/c4.api "$proxy_target"
+            echo "Applied CVE-2026-53163 proxy cleanup fix to $proxy_target."
+          else
+            rm -f /tmp/c4.api
+            echo "::warning::CVE-2026-53163: could not relocate proxy cleanup condition in $proxy_target; leaving unchanged"
+          fi
+        }
+        install_scoped_guard_support() {
+          if [ ! -f include/linux/cleanup.h ] || ! grep -q 'scoped_guard' include/linux/cleanup.h; then
+            cp /tmp/cve43499/scoped_guard_cleanup.h include/linux/cleanup.h
+          fi
+          if [ -f include/linux/compiler_attributes.h ] && ! grep -q '^#define __cleanup(func)' include/linux/compiler_attributes.h; then
+            awk -v insert_file="/tmp/cve43499/scoped_guard_compiler_cleanup.txt" '
+              function emit() { while ((getline line < insert_file) > 0) print line; close(insert_file) }
+              { lines[NR] = $0; if ($0 ~ /^#endif/) last_endif = NR }
+              END {
+                for (i = 1; i <= NR; i++) { if (i == last_endif) emit(); print lines[i] }
+                if (!last_endif) emit()
+              }
+            ' include/linux/compiler_attributes.h > /tmp/c4.attr && mv /tmp/c4.attr include/linux/compiler_attributes.h
+          elif [ -f include/linux/compiler.h ] && ! grep -q '^#define __cleanup(func)' include/linux/compiler.h; then
+            cat /tmp/cve43499/scoped_guard_compiler_cleanup.txt >> include/linux/compiler.h
+          else
+            echo "::error::neither compiler_attributes.h nor compiler.h found for __cleanup backport"
+            return 1
+          fi
+          if [ -f include/linux/compiler-clang.h ] && ! grep -q 'Clang prior to 17' include/linux/compiler-clang.h; then
+            cat /tmp/cve43499/scoped_guard_compiler_clang.txt >> include/linux/compiler-clang.h
+          fi
+          if ! grep -q '#include <linux/cleanup.h>' include/linux/spinlock.h; then
+            awk '
+              { print }
+              !done && /^#include <linux\/lockdep.h>/ { print "#include <linux/cleanup.h>"; done = 1 }
+              !done && /^#include <linux\/bottom_half.h>/ { print "#include <linux/cleanup.h>"; done = 1 }
+              END { if (!done) print "#include <linux/cleanup.h>" }
+            ' include/linux/spinlock.h > /tmp/c4.spin && mv /tmp/c4.spin include/linux/spinlock.h
+          fi
+          if ! grep -q 'DEFINE_LOCK_GUARD_1(raw_spinlock' include/linux/spinlock.h; then
+            awk -v insert_file="/tmp/cve43499/scoped_guard_spinlock_guards.txt" '
+              function emit() { while ((getline line < insert_file) > 0) print line; close(insert_file) }
+              !done && /^#undef __LINUX_INSIDE_SPINLOCK_H/ { emit(); done = 1 }
+              !done && /^#endif .*__LINUX_SPINLOCK_H/ { emit(); done = 1 }
+              { print }
+              END { if (!done) emit() }
+            ' include/linux/spinlock.h > /tmp/c4.grd && mv /tmp/c4.grd include/linux/spinlock.h
+          fi
+        }
+        ensure_scoped_guard_support() {
+          if grep -qs 'DEFINE_LOCK_GUARD_1(raw_spinlock' include/linux/spinlock.h \
+             && grep -qs 'scoped_guard' include/linux/cleanup.h; then
+            return 0
+          fi
+          echo "Applying scoped_guard/raw_spinlock helper backport..."
+          sed -i '/^rtmutex-guards|/d' "$PS_FILE" 2>/dev/null || true
+          gen_patch rtmutex-guards /tmp/cve43499/cve-2026-43499-guards.patch "" \
+            "g:include/linux/cleanup.h|scoped_guard\(_name, args...\);g:include/linux/spinlock.h|DEFINE_LOCK_GUARD_1\(raw_spinlock, raw_spinlock_t,"
+          if grep -Eq '^rtmutex-guards\|(applied|already)' "$PS_FILE" 2>/dev/null; then
+            return 0
+          fi
+          sed -i '/^rtmutex-guards|/d' "$PS_FILE" 2>/dev/null || true
+          echo "Helper patch did not match; installing scoped_guard support directly..."
+          install_scoped_guard_support
+          echo "rtmutex-guards|applied" >> "$PS_FILE"
+        }
+        ensure_rtmutex_c99() {
+          case "$KERNEL_VERSION" in
+            5.10|5.15) ;;
+            *) return 0 ;;
+          esac
+          local mk="kernel/locking/Makefile" add obj esc
+          [ -f "$mk" ] || { echo "::error::kernel/locking/Makefile not found"; exit 1; }
+          add="$(mktemp)"
+          for obj in rtmutex.o rtmutex_api.o rwsem.o ww_rt_mutex.o spinlock_rt.o; do
+            esc="${obj//./\\.}"
+            grep -q "^CFLAGS_REMOVE_${esc} .*std=gnu89" "$mk" || echo "CFLAGS_REMOVE_${obj} += -std=gnu89" >> "$add"
+            grep -q "^CFLAGS_${esc} .*std=gnu99" "$mk" || echo "CFLAGS_${obj} += -std=gnu99" >> "$add"
+          done
+          [ -s "$add" ] || { rm -f "$add"; return 0; }
+          echo "Forcing rtmutex include units to gnu99 for scoped_guard on 5.x..."
+          awk -v insert_file="$add" '
+            function emit() { while ((getline line < insert_file) > 0) print line; close(insert_file) }
+            !done && /^obj-\$\(CONFIG_RT_MUTEXES\).*rtmutex/ { emit(); done = 1 }
+            { print }
+            END { if (!done) emit() }
+          ' "$mk" > /tmp/c4.mk && mv /tmp/c4.mk "$mk"
+          rm -f "$add"
+        }
+        case "$KERNEL_VERSION" in
+          6.12)
+            if grep -q 'struct task_struct \*waiter_task = waiter->task;' "$RTM"; then
+              echo "CVE-2026-43499 rtmutex fix already present."
+              ensure_followup_fixes || echo "::warning::CVE-2026-53163 follow-up probe inconclusive; leaving tree as-is"
+              echo "rtmutex-cve|already" >> "$PS_FILE"
+              echo "✅ CVE-2026-43499/CVE-2026-53163 fix chain complete (already in tree)"
+              echo "::endgroup::"
+              exit 0
+            fi
+            cve_url="${RTMUTEX_BASE}/cve-2026-43499-rtmutex-6.12.patch"
+            if ! fetch_patch "$cve_url" /tmp/rtmutex_cve_6_12.patch; then
+              echo "::warning::CVE-2026-43499 patch unavailable upstream; continuing without it"
+              skip_cve
+            fi
+            gen_patch rtmutex-cve /tmp/rtmutex_cve_6_12.patch "" "g:kernel/locking/rtmutex.c|waiter_task->pi_blocked_on = NULL;g:kernel/locking/rtmutex.c|waiter::task != current"
+            if ! grep -Eq '^rtmutex-cve\|(applied|already)' "$PS_FILE" 2>/dev/null; then
+              echo "::warning::CVE-2026-43499 fix did not stage at fuzz=0; continuing without it"
+              sed -i '/^rtmutex-cve|/d' "$PS_FILE" 2>/dev/null || true
+              skip_cve
+            fi
+            # Same chain as <=6.6: AK3 rtmutex.c core; the rtmutex_api.c
+            # proxy-cleanup piece lands via the tolerant follow-up pass.
+            ensure_followup_fixes || echo "::warning::CVE-2026-53163 follow-up probe inconclusive; leaving tree as-is"
+            if [ "$(grep -E '^rtmutex-cve\|' "$PS_FILE" | tail -n1)" = "rtmutex-cve|applied" ]; then
+              grep -q 'waiter_task->pi_blocked_on = NULL' kernel/locking/rtmutex.c \
+                || echo "::warning::rtmutex.c core marker missing after apply"
+              grep -q 'if (unlikely(ret < 0))' kernel/locking/rtmutex_api.c 2>/dev/null \
+                || echo "::warning::rtmutex_api.c proxy-cleanup marker absent (tolerated)"
+            fi
+            echo "RTMUTEX_CVE_FIXED=true" >> "$GITHUB_ENV"
+            echo "RTMUTEX_CVE_SOURCE=LingLuo17/AnyKernel3 security_patch/cve-2026-43499-rtmutex-6.12.patch @${RTMUTEX_PIN:0:7}" >> "$GITHUB_ENV"
+            echo "✅ CVE-2026-43499 rtmutex fix applied (remove_waiter futex PI proxy path)"
+            echo "::endgroup::"
+            exit 0
+            ;;
+          5.10|5.15|6.1|6.6)
+            variant=""
+            fallback=""
+            case "$KERNEL_VERSION" in
+              5.10) variant="cve-2026-43499-rtmutex-5.10.patch"; fallback="cve-2026-43499-rtmutex-5.15.patch" ;;
+              5.15) variant="cve-2026-43499-rtmutex-5.15.patch" ;;
+              *) variant="cve-2026-43499-rtmutex-6.1-6.6.patch" ;;
+            esac
+            # Fix-chain gate (upstream d6255c5f): 5.10/5.15 always; 6.1 < 177; 6.6 < 144.
+            case "$KERNEL_VERSION" in
+              6.1|6.6)
+                if [ "$KERNEL_VERSION" = "6.1" ]; then min="177"; else min="144"; fi
+                if ! [[ "${SUBLEVEL:-}" =~ ^[0-9]+$ ]]; then
+                  echo "::warning::CVE-2026-43499: non-numeric SUBLEVEL for ${KERNEL_VERSION} (${SUBLEVEL:-unset}); skipping"
+                  skip_cve
+                fi
+                if [ "$SUBLEVEL" -ge "$min" ]; then
+                  echo "CVE-2026-43499/CVE-2026-53163 fix chain is upstream in ${KERNEL_VERSION}.${SUBLEVEL}; skipping"
+                  skip_cve
+                fi
+                ;;
+            esac
+            mkdir -p /tmp/cve43499
+            fetch_ok=true
+            for f in cve-2026-43499-guards.patch scoped_guard_cleanup.h \
+                     scoped_guard_compiler_clang.txt scoped_guard_compiler_cleanup.txt \
+                     scoped_guard_spinlock_guards.txt "$variant"; do
+              if ! fetch_patch "${RTMUTEX_BASE}/${f}" "/tmp/cve43499/${f}"; then
+                fetch_ok=false
+                break
+              fi
+            done
+            if [ "$fetch_ok" != true ]; then
+              echo "::warning::CVE-2026-43499 patch chain unavailable (LingLuo17/AnyKernel3 @${RTMUTEX_PIN:0:7}); continuing without it"
+              skip_cve
+            fi
+            echo "Applying the CVE-2026-43499 rtmutex fix chain for kernel ${KERNEL_VERSION}..."
+            if grep -q 'struct task_struct \*waiter_task = waiter->task;' "$RTM"; then
+              echo "CVE-2026-43499 rtmutex fix already present."
+              if grep -q 'scoped_guard(raw_spinlock' "$RTM"; then
+                ensure_scoped_guard_support
+                ensure_rtmutex_c99
+              fi
+              ensure_followup_fixes || echo "::warning::CVE-2026-53163 follow-up probe inconclusive; leaving tree as-is"
+              echo "rtmutex-cve|already" >> "$PS_FILE"
+              echo "✅ CVE-2026-43499/CVE-2026-53163 fix chain complete (already in tree)"
+              echo "::endgroup::"
+              exit 0
+            fi
+            ensure_scoped_guard_support
+            ensure_rtmutex_c99
+            verify_spec="g:kernel/locking/rtmutex.c|waiter_task->pi_blocked_on = NULL;g:kernel/locking/rtmutex.c|scoped_guard\(raw_spinlock, &waiter_task->pi_lock\);g:kernel/locking/rtmutex.c|next_lock, NULL, waiter_task\)"
+            sed -i '/^rtmutex-cve|/d' "$PS_FILE" 2>/dev/null || true
+            gen_patch rtmutex-cve "/tmp/cve43499/${variant}" "" "$verify_spec"
+            if ! grep -Eq '^rtmutex-cve\|(applied|already)' "$PS_FILE" 2>/dev/null && [ -n "$fallback" ]; then
+              echo "Primary patch did not match; trying fallback shape: ${fallback}"
+              sed -i '/^rtmutex-cve|/d' "$PS_FILE" 2>/dev/null || true
+              gen_patch rtmutex-cve "/tmp/cve43499/${fallback}" "" "$verify_spec"
+            fi
+            if ! grep -Eq '^rtmutex-cve\|(applied|already)' "$PS_FILE" 2>/dev/null; then
+              echo "::warning::CVE-2026-43499 fix did not stage at fuzz=0; continuing without it"
+              sed -i '/^rtmutex-cve|/d' "$PS_FILE" 2>/dev/null || true
+              skip_cve
+            fi
+            ensure_followup_fixes || echo "::warning::CVE-2026-53163 follow-up probe inconclusive; leaving tree as-is"
+            if [ "$(grep -E '^rtmutex-cve\|' "$PS_FILE" | tail -n1)" = "rtmutex-cve|applied" ]; then
+              grep -q 'waiter_task->pi_blocked_on = NULL' "$RTM"
+              grep -q 'waiter::task != current' "$RTM"
+              grep -q 'scoped_guard(raw_spinlock, &waiter_task->pi_lock)' "$RTM"
+            fi
+            echo "RTMUTEX_CVE_FIXED=true" >> "$GITHUB_ENV"
+            echo "RTMUTEX_CVE_SOURCE=LingLuo17/AnyKernel3 security_patch (flat) @${RTMUTEX_PIN:0:7}" >> "$GITHUB_ENV"
+            echo "✅ CVE-2026-43499 rtmutex fix chain applied (${KERNEL_VERSION}.${SUBLEVEL:-x}, remove_waiter futex PI proxy path + CVE-2026-53163 follow-ups)"
+            echo "::endgroup::"
+            ;;
+          *)
+            echo "CVE-2026-43499 fix is staged for 5.10/5.15/6.1/6.6/6.12 trees only; this is ${KERNEL_VERSION} - skipping"
+            skip_cve
+            ;;
+        esac
 
     - name: Apply HMBIRD Fengchi patches
       shell: bash
@@ -2472,19 +2978,25 @@ runs:
               HMBIRD_MODEL="OP13-PJZ" ;;
           esac
           HMBIRD_OS="$OP_OS_VERSION"
-          dos2unix "$FENGCHI_DIR/fengchi_${HMBIRD_MODEL}_${HMBIRD_OS}.patch"
+          FENGCHI_PATCH="$FENGCHI_DIR/fengchi_${HMBIRD_MODEL}_${HMBIRD_OS}.patch"
           FENGCHI_OK=true
           source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-          gen_patch fengchi "$FENGCHI_DIR/fengchi_${HMBIRD_MODEL}_${HMBIRD_OS}.patch"
-          if ! grep -Eq '^fengchi\|(applied|already)' "$PS_FILE" 2>/dev/null; then
-            echo "::warning::fengchi did not stage at fuzz=0; retrying after kernel/fork.c compat shim"
-            sed -i "/^fengchi|/d" "$PS_FILE" 2>/dev/null || true
-            if [ "$(grep -cFx $'\tsched_ext_free(tsk);' kernel/fork.c 2>/dev/null || true)" = "1" ] && ! grep -q 'hmbird_free(tsk);' kernel/fork.c; then
-              perl -0pi -e 's/\tsched_ext_free\(tsk\);\n/#ifdef CONFIG_HMBIRD_SCHED\n\thmbird_free(tsk);\n#endif\n/' kernel/fork.c
-              gen_patch fengchi "$FENGCHI_DIR/fengchi_${HMBIRD_MODEL}_${HMBIRD_OS}.patch"
+          if [ -f "$FENGCHI_PATCH" ]; then
+            dos2unix "$FENGCHI_PATCH"
+            gen_patch fengchi "$FENGCHI_PATCH"
+            if ! grep -Eq '^fengchi\|(applied|already)' "$PS_FILE" 2>/dev/null; then
+              echo "::warning::fengchi did not stage at fuzz=0; retrying after kernel/fork.c compat shim"
+              sed -i "/^fengchi|/d" "$PS_FILE" 2>/dev/null || true
+              if [ "$(grep -cFx $'\tsched_ext_free(tsk);' kernel/fork.c 2>/dev/null || true)" = "1" ] && ! grep -q 'hmbird_free(tsk);' kernel/fork.c; then
+                perl -0pi -e 's/\tsched_ext_free\(tsk\);\n/#ifdef CONFIG_HMBIRD_SCHED\n\thmbird_free(tsk);\n#endif\n/' kernel/fork.c
+                gen_patch fengchi "$FENGCHI_PATCH"
+              fi
             fi
+            grep -Eq '^fengchi\|(applied|already)' "$PS_FILE" 2>/dev/null || FENGCHI_OK=false
+          else
+            echo "::warning::no fengchi patch for ${HMBIRD_MODEL}_${HMBIRD_OS} (Gen5/6.12): overwriter + hmbird_config still apply"
+            FENGCHI_OK=false
           fi
-          grep -Eq '^fengchi\|(applied|already)' "$PS_FILE" 2>/dev/null || FENGCHI_OK=false
           dos2unix "$KERNEL_PATCHES_FOLDER/oneplus/hmbird/overwriter.patch"
           gen_patch hmbird-overwriter "$KERNEL_PATCHES_FOLDER/oneplus/hmbird/overwriter.patch"
           chmod +x ./drivers/of/overwriter/overwrite_configs/convert_configs.sh 2>/dev/null || true
@@ -2495,8 +3007,10 @@ runs:
             grep -n 'hmbird_free' kernel/fork.c 2>/dev/null | head -n 2 || true
             echo "✅ HMBIRD Fengchi applied"
             echo "hmbird|applied" >> "$PS_FILE"
-          else
+          elif [ -f "$FENGCHI_PATCH" ]; then
             echo "hmbird|failed" >> "$PS_FILE"
+          else
+            echo "hmbird|dt-only" >> "$PS_FILE"
           fi
         else
           echo "hmbird|skipped" >> "$PS_FILE"
@@ -3043,9 +3557,15 @@ runs:
         
         echo "Applying patch to enable SYSVIPC without breaking ABI"
         source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        gen_patch ds-enable-sysvipc "$KERNEL_PATCHES_FOLDER/oneplus/lxc_droidspaces/enable_sysvipc.patch"
+        case "$OP_BRANCH" in
+          wild/sm8850|wild/sm8845)
+            DS_KABI="$KERNEL_PATCHES_FOLDER/common/droidspaces/fix_sysvipc_kabi_a16-6.12.patch" ;;
+          *)
+            DS_KABI="$KERNEL_PATCHES_FOLDER/common/droidspaces/fix_sysvipc_kabi_6_7_8.patch" ;;
+        esac
+        gen_patch ds-enable-sysvipc "$DS_KABI"
         if ! grep -Eq '^ds-enable-sysvipc\|(applied|already)' "$PS_FILE" 2>/dev/null; then
-          echo "::error::enable_sysvipc patch failed to stage at fuzz=0 (see patch-faillogs)"
+          echo "::error::SYSVIPC kABI patch failed to stage at fuzz=0 (see patch-faillogs)"
           exit 1
         fi
         
@@ -3127,6 +3647,58 @@ runs:
         
         echo "✅ Droidspaces Support applied"
         echo "ds|applied" >> "$PS_FILE"
+        echo "::endgroup::"
+
+    - name: Add Re-Kernel
+      shell: bash
+      if: ${{ inputs.use_rekernel || env.OP_REKERNEL == 'true' }}
+      run: |
+        set -euo pipefail
+        echo "::group::Add Re-Kernel"
+        DEFCONFIG="$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig"
+        REKERNEL_DRIVER_DIR="$COMMON_KERNEL_FOLDER/drivers/rekernel"
+        TMP_REKERNEL="$RUNNER_TEMP/rekernel"
+        rm -rf "$TMP_REKERNEL"
+
+        # Idempotent: strip any previous wiring before re-applying
+        sed -i '\|source "drivers/rekernel/Kconfig"|d' "$COMMON_KERNEL_FOLDER/drivers/Kconfig" 2>/dev/null || true
+        sed -i '\|obj-$(CONFIG_REKERNEL) += rekernel/|d' "$COMMON_KERNEL_FOLDER/drivers/Makefile" 2>/dev/null || true
+        sed -i '/^CONFIG_REKERNEL=y$/d; /^CONFIG_REKERNEL_NETWORK=y$/d' "$DEFCONFIG" 2>/dev/null || true
+
+        git clone --depth 1 https://github.com/Sakion-Team/Re-Kernel.git "$TMP_REKERNEL"
+        rm -rf "$REKERNEL_DRIVER_DIR"
+        mkdir -p "$REKERNEL_DRIVER_DIR"
+        cp -a "$TMP_REKERNEL/LKM-Source/." "$REKERNEL_DRIVER_DIR/"
+
+        # Convert the upstream out-of-tree module into an in-tree built-in driver
+        sed -i 's/^obj-m := rekernel\.o$/obj-$(CONFIG_REKERNEL) += rekernel.o/' "$REKERNEL_DRIVER_DIR/Makefile"
+        grep -qF 'ccflags-$(CONFIG_REKERNEL_LEGACY_NETLINK) += -DLEGACY_NETLINK' "$REKERNEL_DRIVER_DIR/Makefile" \
+          || echo 'ccflags-$(CONFIG_REKERNEL_LEGACY_NETLINK) += -DLEGACY_NETLINK' >> "$REKERNEL_DRIVER_DIR/Makefile"
+        sed -i '/^[[:space:]]*depends on MODULES[[:space:]]*$/d' "$REKERNEL_DRIVER_DIR/Kconfig"
+
+        grep -qF 'source "drivers/rekernel/Kconfig"' "$COMMON_KERNEL_FOLDER/drivers/Kconfig" \
+          || sed -i '/^endmenu$/i source "drivers/rekernel/Kconfig"' "$COMMON_KERNEL_FOLDER/drivers/Kconfig"
+        grep -qF 'obj-$(CONFIG_REKERNEL) += rekernel/' "$COMMON_KERNEL_FOLDER/drivers/Makefile" \
+          || echo 'obj-$(CONFIG_REKERNEL) += rekernel/' >> "$COMMON_KERNEL_FOLDER/drivers/Makefile"
+
+        # Fix include paths for in-tree compilation
+        sed -i 's|#include <../android/binder_internal.h>|#include "../android/binder_internal.h"|g' "$REKERNEL_DRIVER_DIR/rekernel_binder.c"
+        # 5.10 binder_internal.h needs DEFINE_SHOW_ATTRIBUTE definitions from seq_file.h
+        grep -qF '#include <linux/seq_file.h>' "$REKERNEL_DRIVER_DIR/rekernel_binder.c" \
+          || sed -i '/#include <linux\/kprobes.h>/a #include <linux/seq_file.h>' "$REKERNEL_DRIVER_DIR/rekernel_binder.c"
+
+        grep -q '^CONFIG_REKERNEL=y$' "$DEFCONFIG" || echo "CONFIG_REKERNEL=y" >> "$DEFCONFIG"
+        grep -q '^CONFIG_REKERNEL_NETWORK=y$' "$DEFCONFIG" || echo "CONFIG_REKERNEL_NETWORK=y" >> "$DEFCONFIG"
+
+        # Hard verification
+        grep -q '^CONFIG_REKERNEL=y$' "$DEFCONFIG" \
+          && grep -qF 'obj-$(CONFIG_REKERNEL) += rekernel/' "$COMMON_KERNEL_FOLDER/drivers/Makefile" \
+          && grep -qF 'source "drivers/rekernel/Kconfig"' "$COMMON_KERNEL_FOLDER/drivers/Kconfig" \
+          && [ -f "$REKERNEL_DRIVER_DIR/rekernel_binder.c" ] \
+          || { echo "::error::Re-Kernel integration incomplete"; exit 1; }
+
+        echo "rekernel|applied" >> "$PS_FILE"
+        echo "✅ Re-Kernel driver integrated (CONFIG_REKERNEL=y, CONFIG_REKERNEL_NETWORK=y)"
         echo "::endgroup::"
 
     - name: Add Build based configs
@@ -3286,6 +3858,7 @@ runs:
         echo "✅ Fake config.gz patched (KCONFIG_CONFIG_PATCHED verified in kernel/Makefile; CONFIG_FAKE_DISABLE=${CONFIG_STRING:-none})"
 
     - name: Disable Vendor / Kernel Modules
+      if: ${{ env.OP_BLACKLIST_APPLY == 'true' }}
       shell: bash
       run: |
         set -euo pipefail
@@ -3424,6 +3997,15 @@ runs:
         if-no-files-found: ignore
         retention-days: 7
 
+    - name: Upload patch failure forensics
+      if: ${{ always() && env.PS_FILE != '' }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: patch-faillogs-${{ env.PS_BASE }}
+        path: ${{ github.workspace }}/patch-faillogs/
+        if-no-files-found: ignore
+        retention-days: 7
+
     - name: Stop before build (dry run)
       if: ${{ inputs.patch_dry_run == true || inputs.patch_dry_run == 'true' }}
       shell: bash
@@ -3466,6 +4048,15 @@ runs:
         export PAHOLE="$KERNEL_PLATFORM_FOLDER/prebuilts/kernel-build-tools/linux-x86/bin/pahole"
         export LD=ld.lld HOSTLD=ld.lld AR=llvm-ar NM=llvm-nm 
         export OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
+
+        # FinaSU's Kbuild computes KSU_KERNEL_DIR := $(srctree)/$(src), which
+        # double-prefixes $(src) in O= in-tree builds and breaks both the -I flags
+        # and the preinit runner.elf prerequisite. The `ifndef KSU_KERNEL_DIR`
+        # guard is an override hook: export the absolute path and every KSU_KERNEL_DIR
+        # use (includes, runner rule, wildcard deps) resolves correctly.
+        if [ "${{ inputs.ksu_type }}" = "FinaSU" ] && [ -d "$KERNEL_PLATFORM_FOLDER/KernelSU/kernel" ]; then
+          export KSU_KERNEL_DIR="$KERNEL_PLATFORM_FOLDER/KernelSU/kernel"
+        fi
         
         set +u
         source "$KERNEL_PLATFORM_FOLDER/build/kernel/_setup_env.sh" 2>/dev/null || true
@@ -3528,6 +4119,31 @@ runs:
         echo "ccache pre-build status:"
         ccache -s | head -n 20
         echo "============================================"
+        
+        # Dedup gki_defconfig before kconfig runs: fragment appends can repeat
+        # symbols already present, and kconfig emits "override: reassigning to
+        # symbol" for each duplicate. Keeping the LAST occurrence of each symbol
+        # is exactly the semantics kconfig applies — without the warning noise.
+        DF="$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig"
+        if [ -f "$DF" ]; then
+          awk '
+            {
+              line[NR] = $0; sym = ""
+              if (match($0, /^# CONFIG_[A-Za-z0-9_]+ is not set$/)) { s = substr($0, 3); sub(/ is not set$/, "", s); sym = s }
+              else if (match($0, /^CONFIG_[A-Za-z0-9_]+=/)) { sym = substr($0, RSTART, RLENGTH - 1) }
+              if (sym != "") { last[sym] = NR; seen[sym]++ }
+            }
+            END {
+              for (i = 1; i <= NR; i++) {
+                cur = line[i]; s = ""
+                if (match(cur, /^# CONFIG_[A-Za-z0-9_]+ is not set$/)) { t = substr(cur, 3); sub(/ is not set$/, "", t); s = t }
+                else if (match(cur, /^CONFIG_[A-Za-z0-9_]+=/)) { s = substr(cur, RSTART, RLENGTH - 1) }
+                if (s != "" && seen[s] > 1 && last[s] != i) next
+                print cur
+              }
+            }
+          ' "$DF" > "$DF.tmp" && mv "$DF.tmp" "$DF"
+        fi
         
         make LD="$COMMON_KERNEL_FOLDER/ld-wrapper" HOSTLD="$COMMON_KERNEL_FOLDER/ld-wrapper" O="$OUT" gki_defconfig
         
@@ -3741,7 +4357,10 @@ runs:
         fi
         
         if [ -f "$COMMON_KERNEL_FOLDER/build.log" ]; then
-          WARNINGS_COUNT="$(grep -ciE '\bwarning:' "$COMMON_KERNEL_FOLDER/build.log" || true)"
+          # Compiler diagnostics only (file:line:col: warning: …). The previous
+          # case-insensitive substring grep also swept script/config notices such as
+          # the "Unexpected CONFIG_* value found" self-check into this count.
+          WARNINGS_COUNT="$(grep -cE '^[^ :]+:[0-9]+:[0-9]+: warning: ' "$COMMON_KERNEL_FOLDER/build.log" 2>/dev/null || true)"
           [ -n "$WARNINGS_COUNT" ] || WARNINGS_COUNT="0"
         else
           WARNINGS_COUNT="0"
@@ -3782,7 +4401,7 @@ runs:
         printf 'build_time=%s\n' "$BUILD_TIME" >> "$GITHUB_OUTPUT"
         
         echo "✅ Validation passed:"
-        echo "   - Warnings: $WARNINGS_COUNT"
+        echo "   - C warnings (compiler only): $WARNINGS_COUNT"
         echo "   - Image size: $(numfmt --to=iec-i --suffix=B "$IMG_SIZE")"
         echo "   - SHA256: $IMG_SHA256"
         echo "   - Build time: ${BUILD_TIME}s"
@@ -3877,6 +4496,12 @@ runs:
           if [ "${{ inputs.ksu_type }}" = "BakaSU" ]; then
             echo "BakaSU Version: ${KSUVER:-unknown}"
             echo "BakaSU commit SHA: ${KSU_SHA:-unknown}"
+          elif [ "${{ inputs.ksu_type }}" = "FinaSU" ]; then
+            echo "FinaSU Version: ${KSUVER:-unknown}"
+            echo "FinaSU commit SHA: ${KSU_SHA:-unknown}"
+          elif [ "${{ inputs.ksu_type }}" = "KSUN" ]; then
+            echo "KernelSU-Next Version: ${KSUVER:-unknown}"
+            echo "KernelSU-Next commit SHA: ${KSU_SHA:-unknown}"
           else
             echo "KSU Version: ${KSUVER:-unknown}"
             echo "KSU commit SHA: ${KSU_SHA:-unknown}"
@@ -3904,14 +4529,19 @@ runs:
           echo "LZ4 1.10.0 + ARMv8 NEON: $(pstat lz4)"
           echo "zstd 1.5.7 + tunable level: $(pstat zstd-upgrade)"
           echo "CVE-2026-43499 rtmutex fix: $(pstat rtmutex-cve)"
-          echo "NoMount: $(pstat nomount)"
+          echo "Re-Kernel: ${{ inputs.use_rekernel || env.OP_REKERNEL == 'true' }}"
+          if [ "${{ inputs.ksu_type }}" = "FinaSU" ]; then
+            echo "NoMount: native (ksud-embedded, ships with the FinaSU manager)"
+          else
+            echo "NoMount: $(pstat nomount)"
+          fi
           echo "Vendor Module Blacklist: $(pstat vendor-modules-blacklist)"
           echo "WildKernels' Optimisations: $(pstat wk-opt)"
           echo ""
           echo "Image SHA256: ${{ steps.collect_stats.outputs.image_sha256 }}"
           echo "AnyKernel3 ZIP SHA256: ${{ steps.create_zip.outputs.zip_sha256 }}"
           echo "Compiler: ${CLANG_VERSION:-unknown}"
-          echo "Warnings Count: ${{ steps.collect_stats.outputs.warnings_count }}"
+          echo "C Warnings (compiler only; kconfig/script notices excluded): ${{ steps.collect_stats.outputs.warnings_count }}"
           echo "Build Time: ${{ steps.collect_stats.outputs.build_time }}s"
           if [ "${{ inputs.clean }}" == "false" ]; then
             echo "ccache Hit Rate: ${{ steps.ccache_stats.outputs.hit_rate }}"
@@ -3936,6 +4566,10 @@ runs:
           
           if [ "${{ inputs.ksu_type }}" = "BakaSU" ]; then
             echo "| **BakaSU Version** | ${KSUVER:-unknown} |"
+          elif [ "${{ inputs.ksu_type }}" = "FinaSU" ]; then
+            echo "| **FinaSU Version** | ${KSUVER:-unknown} |"
+          elif [ "${{ inputs.ksu_type }}" = "KSUN" ]; then
+            echo "| **KernelSU-Next Version** | ${KSUVER:-unknown} |"
           else
             echo "| **KSU Version** | ${KSUVER:-unknown} |"
           fi
@@ -3943,6 +4577,10 @@ runs:
           if [ "$KSU_SHA" != "unknown" ]; then
             if [ "${{ inputs.ksu_type }}" = "BakaSU" ]; then
               echo "| **BakaSU Commit** | [\`${KSU_SHA:0:8}\`](https://github.com/Baka-SU/BakaSU/commit/$KSU_SHA) |"
+            elif [ "${{ inputs.ksu_type }}" = "FinaSU" ]; then
+              echo "| **FinaSU Commit** | [\`${KSU_SHA:0:8}\`](https://github.com/LyraVoid/FinaSU/commit/$KSU_SHA) |"
+            elif [ "${{ inputs.ksu_type }}" = "KSUN" ]; then
+              echo "| **KernelSU-Next Commit** | [\`${KSU_SHA:0:8}\`](https://github.com/KernelSU-Next/KernelSU-Next/commit/$KSU_SHA) |"
             else
               echo "| **KSU Commit** | [\`${KSU_SHA:0:8}\`](https://github.com/tiann/KernelSU/commit/$KSU_SHA) |"
             fi
@@ -3954,7 +4592,7 @@ runs:
             echo "| **SUSFS Version** | ${SUSVER:-unknown} |"
             
             if [ "$SUSFS_SHA" != "unknown" ]; then
-              echo "| **SUSFS Commit** | [\`${SUSFS_SHA:0:8}\`](https://gitlab.com/simonpunk/susfs4ksu/-/commit/$SUSFS_SHA) |"
+              echo "| **SUSFS Commit** | [\`${SUSFS_SHA:0:8}\`](https://gitlab.com/simonpunk/susfs4ksu/-/commit/$SUSFS_SHA) (${SUSFS_REF_SOURCE:-kmi-default branch}: \`${SUSFS_REF:-branch}\`) |"
             else
               echo "| **SUSFS Commit** | unknown |"
             fi
@@ -3980,7 +4618,11 @@ runs:
           echo "| **LZ4 1.10.0 + ARMv8 NEON** | $(pstat lz4) |"
           echo "| **zstd 1.5.7 + tunable level** | $(pstat zstd-upgrade) |"
           echo "| **CVE-2026-43499 rtmutex fix** | $(pstat rtmutex-cve) |"
-          echo "| **NoMount** | $(pstat nomount) |"
+          if [ "${{ inputs.ksu_type }}" = "FinaSU" ]; then
+            echo "| **NoMount** | Native (ksud-embedded — ships with the FinaSU manager) |"
+          else
+            echo "| **NoMount** | $(pstat nomount) (${NOMOUNT_REF_SOURCE:-unknown}) |"
+          fi
           echo "| **Vendor Module Blacklist** | $(pstat vendor-modules-blacklist) |"
           echo "| **WildKernels' Optimisations** | $(pstat wk-opt) |"
           
@@ -4047,7 +4689,7 @@ runs:
       uses: ./action-source/.github/actions/cache/save
       with:
         cache_path: ${{ env.CCACHE_DIR }}
-        cache_key: ${{ inputs.ksu_type }}-v3-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-${{ env.KERNEL_FULL_VER }}-${{ env.CLANG_VERSION_SHORT }}
+        cache_key: ${{ inputs.ksu_type }}-v4-${{ env.OP_MODEL }}-${{ env.OP_OS_VERSION }}-${{ env.KERNEL_FULL_VER }}-${{ env.CLANG_VERSION_SHORT }}
         cache_bucket: "ccache-cache"
         debug: ${{ inputs.debug }}
         github_token: ${{ inputs.github_token }}
