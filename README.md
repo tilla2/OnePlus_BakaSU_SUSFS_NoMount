@@ -149,11 +149,16 @@ You can also find Installation instructions in the release notes.
 | 🧩 **Module** | 👨‍💻 **Developer** | 🔗 **Link** |
 |:---------------:|:----------------:|:-----------:|
 | **NoMount** — bundled in this repo's release artifacts; always flash the bundled copy, do not update separately | maxsteeel | [![GitHub](https://img.shields.io/badge/GitHub-maxsteeel-blue?style=flat-square&logo=github)](https://github.com/maxsteeel/nomount) |
-| **BRENE** (at upstream) | rrr333nnn333 | [![GitHub](https://img.shields.io/badge/GitHub-rrr333nnn333-blue?style=flat-square&logo=github)](https://github.com/rrr333nnn333/BRENE) |
+| **BRENE** | rrr333nnn333 | [![GitHub](https://img.shields.io/badge/GitHub-rrr333nnn333-blue?style=flat-square&logo=github)](https://github.com/rrr333nnn333/BRENE) |
+| **ReZygisk** | ThePedroo at PerformanC | [![GitHub](https://img.shields.io/badge/GitHub-rrr333nnn333-blue?style=flat-square&logo=github)]([https://github.com/rrr333nnn333/BRENE](https://github.com/PerformanC/ReZygisk)) |
+| **BreZygisk** | rrr333nnn333 | [![GitHub](https://img.shields.io/badge/GitHub-rrr333nnn333-blue?style=flat-square&logo=github)]([https://github.com/rrr333nnn333/BRENE](https://github.com/rrr333nnn333/BreZygisk)) |
+| **Treat-Wheel-Zygisk** | ThePedroo at PerformanC | [![GitHub](https://img.shields.io/badge/GitHub-rrr333nnn333-blue?style=flat-square&logo=github)]([https://github.com/rrr333nnn333/BRENE](https://github.com/PerformanC/Treat-Wheel-Zygisk)) |
+| **BreWheel** | rrr333nnn333 | [![GitHub](https://img.shields.io/badge/GitHub-rrr333nnn333-blue?style=flat-square&logo=github)]([https://github.com/rrr333nnn333/BRENE](https://github.com/rrr333nnn333/BreWheel)) |
+| **Sui** | XiaoTong6666 | [![GitHub](https://img.shields.io/badge/GitHub-rrr333nnn333-blue?style=flat-square&logo=github)]([https://github.com/rrr333nnn333/BRENE](https://github.com/XiaoTong6666/Sui)) |
 | **TCP Optimiser** (BBRv3) | fatalcoder524 | [![GitHub](https://img.shields.io/badge/GitHub-fatalcoder524-blue?style=flat-square&logo=github)](https://github.com/fatalcoder524/TCP_Optimiser_Module) |
 | **Bootloop Protector** (AshLooper) | AshReXcue | [![GitHub](https://img.shields.io/badge/GitHub-AshLooper-blue?style=flat-square&logo=github)](https://github.com/RipperHybrid/AshLooper) |
 | **Play Integrity Fork** | osm0sis | [![GitHub](https://img.shields.io/badge/GitHub-osm0sis-blue?style=flat-square&logo=github)](https://github.com/osm0sis/PlayIntegrityFork) |
-| **PIF--Inject** | KOWX712 | [![GitHub](https://img.shields.io/badge/GitHub-KOWX712-blue?style=flat-square&logo=github)](https://github.com/KOWX712/PlayIntegrityFix) |
+| **PIF-Inject** | KOWX712 | [![GitHub](https://img.shields.io/badge/GitHub-KOWX712-blue?style=flat-square&logo=github)](https://github.com/KOWX712/PlayIntegrityFix) |
 | **TEESimulator** | JingMatrix | [![GitHub](https://img.shields.io/badge/GitHub-JingMatrix-blue?style=flat-square&logo=github)](https://github.com/JingMatrix/TEESimulator) |
 | **OhMyKeymint** | qwq233 | [![GitHub](https://img.shields.io/badge/GitHub-qwq233-blue?style=flat-square&logo=github)](https://github.com/qwq233/OhMyKeymint) |
 | **TrickyStoreOSS** | beakthoven | [![GitHub](https://img.shields.io/badge/GitHub-beakthoven-blue?style=flat-square&logo=github)](https://github.com/beakthoven/TrickyStoreOSS) |
@@ -194,7 +199,7 @@ You can also find Installation instructions in the release notes.
 | **Baseband Guard** | vc-teahouse | [![GitHub](https://img.shields.io/badge/GitHub-vc--teahouse-blue?style=flat-square&logo=github)](https://github.com/vc-teahouse/Baseband-guard.git) |
 | **Droidspaces** | ravindu644 | [![GitHub](https://img.shields.io/badge/GitHub-ravindu644-blue?style=flat-square&logo=github)](https://github.com/ravindu644/Droidspaces-OSS.git) |
 | **Oplus patchsets** (zstd & rtmutex zram, CVE fix) | cctv18 | [![GitHub](https://img.shields.io/badge/GitHub-cctv18-blue?style=flat-square&logo=github)](https://github.com/cctv18/oppo_oplus_realme_sm8850) |
-| **Adiós patches & device manifests** | Bouteillepleine | [![GitHub](https://img.shields.io/badge/GitHub-Bouteillepleine-blue?style=flat-square&logo=github)](https://github.com/Bouteillepleine/kernel_patches) |
+| **ADIOS patches & some device manifests** | Bouteillepleine | [![GitHub](https://img.shields.io/badge/GitHub-Bouteillepleine-blue?style=flat-square&logo=github)](https://github.com/Bouteillepleine/kernel_patches) |
 
 </div>
 
