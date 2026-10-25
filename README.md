@@ -150,11 +150,11 @@ You can also find Installation instructions in the release notes.
 |:---------------:|:----------------:|:-----------:|
 | **NoMount** — bundled in this repo's release artifacts; always flash the bundled copy, do not update separately | maxsteeel | [![GitHub](https://img.shields.io/badge/GitHub-maxsteeel-blue?style=flat-square&logo=github)](https://github.com/maxsteeel/nomount) |
 | **BRENE** | rrr333nnn333 | [![GitHub](https://img.shields.io/badge/GitHub-rrr333nnn333-blue?style=flat-square&logo=github)](https://github.com/rrr333nnn333/BRENE) |
-| **ReZygisk** | ThePedroo at PerformanC | [![GitHub](https://img.shields.io/badge/GitHub-rrr333nnn333-blue?style=flat-square&logo=github)]([https://github.com/rrr333nnn333/BRENE](https://github.com/PerformanC/ReZygisk)) |
-| **BreZygisk** | rrr333nnn333 | [![GitHub](https://img.shields.io/badge/GitHub-rrr333nnn333-blue?style=flat-square&logo=github)]([https://github.com/rrr333nnn333/BRENE](https://github.com/rrr333nnn333/BreZygisk)) |
-| **Treat-Wheel-Zygisk** | ThePedroo at PerformanC | [![GitHub](https://img.shields.io/badge/GitHub-rrr333nnn333-blue?style=flat-square&logo=github)]([https://github.com/rrr333nnn333/BRENE](https://github.com/PerformanC/Treat-Wheel-Zygisk)) |
-| **BreWheel** | rrr333nnn333 | [![GitHub](https://img.shields.io/badge/GitHub-rrr333nnn333-blue?style=flat-square&logo=github)]([https://github.com/rrr333nnn333/BRENE](https://github.com/rrr333nnn333/BreWheel)) |
-| **Sui** | XiaoTong6666 | [![GitHub](https://img.shields.io/badge/GitHub-rrr333nnn333-blue?style=flat-square&logo=github)]([https://github.com/rrr333nnn333/BRENE](https://github.com/XiaoTong6666/Sui)) |
+| **ReZygisk** | ThePedroo at PerformanC | [![GitHub](https://img.shields.io/badge/GitHub-PerformanC-blue?style=flat-square&logo=github)](https://github.com/PerformanC/ReZygisk) |
+| **BreZygisk** | rrr333nnn333 | [![GitHub](https://img.shields.io/badge/GitHub-rrr333nnn333-blue?style=flat-square&logo=github)](https://github.com/rrr333nnn333/BreZygisk) |
+| **Treat-Wheel-Zygisk** | ThePedroo at PerformanC | [![GitHub](https://img.shields.io/badge/GitHub-PerformanC-blue?style=flat-square&logo=github)](https://github.com/PerformanC/Treat-Wheel-Zygisk) |
+| **BreWheel** | rrr333nnn333 | [![GitHub](https://img.shields.io/badge/GitHub-rrr333nnn333-blue?style=flat-square&logo=github)](https://github.com/rrr333nnn333/BreWheel) |
+| **Sui** | XiaoTong6666 | [![GitHub](https://img.shields.io/badge/GitHub-XiaoTong6666-blue?style=flat-square&logo=github)](https://github.com/XiaoTong6666/Sui) |
 | **TCP Optimiser** (BBRv3) | fatalcoder524 | [![GitHub](https://img.shields.io/badge/GitHub-fatalcoder524-blue?style=flat-square&logo=github)](https://github.com/fatalcoder524/TCP_Optimiser_Module) |
 | **Bootloop Protector** (AshLooper) | AshReXcue | [![GitHub](https://img.shields.io/badge/GitHub-AshLooper-blue?style=flat-square&logo=github)](https://github.com/RipperHybrid/AshLooper) |
 | **Play Integrity Fork** | osm0sis | [![GitHub](https://img.shields.io/badge/GitHub-osm0sis-blue?style=flat-square&logo=github)](https://github.com/osm0sis/PlayIntegrityFork) |
