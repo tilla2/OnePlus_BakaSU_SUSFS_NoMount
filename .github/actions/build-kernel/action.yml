@@ -1368,8 +1368,12 @@ runs:
           # Determine which SUSFS ref to use
           KERNEL_KEY="${{ env.ANDROID_VER }}-${{ env.KERNEL_VER }}"
           if [ -z "$SUSFS_INPUT" ]; then
-            # use kernel-specific default
-            SUSFS_BRANCH="${DEFAULT_SUSFS[$KERNEL_KEY]:-gki-android15-6.6}"
+            # use kernel-specific default; refuse to guess on unknown KMIs
+            if [ -z "${DEFAULT_SUSFS[$KERNEL_KEY]:-}" ]; then
+              echo "::error::No default SUSFS branch mapped for KMI '$KERNEL_KEY'. Add it to DEFAULT_SUSFS or pass an explicit susfs_commit_hash_or_branch input; refusing to silently build against a mismatched SUSFS branch."
+              exit 1
+            fi
+            SUSFS_BRANCH="${DEFAULT_SUSFS[$KERNEL_KEY]}"
             SUSFS_REF_SOURCE="kmi-default branch"
             echo "ℹ️  Using default SUSFS branch for $KERNEL_KEY: $SUSFS_BRANCH"
           else
@@ -2117,8 +2121,99 @@ runs:
               # Keep v3.2.5's existing reboot kprobe for KSU fd installation;
               # the SUSFS dispatch commands remain in the surrounding switch.
               sed -i '/^    if (magic2 == KSU_INSTALL_MAGIC2)$/,+1d' "$dispatch_source"
+            elif [ "${{ inputs.ksu_type }}" = "BakaSU" ]; then
+              # Upstream 10_enable targets KSU/KSUN dispatcher layouts, so for
+              # BakaSU graft the susfs supercall wiring directly, mirroring
+              # upstream susfs commit 97cbbaf (priority uid filter). Gated on
+              # the staged susfs_def.h declaring the command so older susfs
+              # versions skip cleanly.
+              susfs_def_h="$COMMON_KERNEL_FOLDER/include/linux/susfs_def.h"
+              if ! grep -q 'CMD_SUSFS_SET_PRIORITY_UID_FILTER' "$susfs_def_h" 2>/dev/null; then
+                echo "ℹ️ Staged susfs does not declare CMD_SUSFS_SET_PRIORITY_UID_FILTER; skipping BakaSU dispatcher graft"
+              else
+                cd "$KSU_FOLDER"
+                graft_hit=0
+                graft_applied=0
+                for graft_source in $(grep -rl 'case CMD_SUSFS_' ./kernel 2>/dev/null || true); do
+                  if grep -q 'CMD_SUSFS_SET_PRIORITY_UID_FILTER' "$graft_source"; then
+                    echo "✅ $graft_source already handles CMD_SUSFS_SET_PRIORITY_UID_FILTER (upstream synced)"
+                    graft_hit=1
+                    continue
+                  fi
+                  grep -q 'case CMD_SUSFS_SHOW_VERSION' "$graft_source" || continue
+                  tmp_dispatch="$(mktemp)"
+                  if ! awk '
+                    /^    case CMD_SUSFS_SHOW_VERSION:/ { in_show = 1 }
+                    in_show && !done && /^    }$/ {
+                      print
+                      print "    case CMD_SUSFS_SET_PRIORITY_UID_FILTER: {"
+                      print "        susfs_set_priority_uid_filter(arg);"
+                      print "        return 0;"
+                      print "    }"
+                      done = 1
+                      next
+                    }
+                    { print }
+                    END { exit (done ? 0 : 42) }
+                  ' "$graft_source" > "$tmp_dispatch"; then
+                    rm -f "$tmp_dispatch"
+                    continue
+                  fi
+                  mv "$tmp_dispatch" "$graft_source"
+                  if ! grep -q '#include <linux/susfs.h>' "$graft_source"; then
+                    sed -i '0,/^#include <linux\/version.h>$/{s|^#include <linux/version.h>$|#include <linux/version.h>\n#include <linux/susfs.h>|}' "$graft_source"
+                  fi
+                  if ! grep -q 'case CMD_SUSFS_SET_PRIORITY_UID_FILTER' "$graft_source"; then
+                    echo "::error::BakaSU dispatcher graft did not verify in $graft_source"
+                    exit 1
+                  fi
+                  grep -q '^#include <linux/susfs\.h>$' "$graft_source" || { echo "::error::susfs.h include missing after graft in $graft_source"; exit 1; }
+                  echo "✅ Grafted CMD_SUSFS_SET_PRIORITY_UID_FILTER into $graft_source"
+                  graft_hit=1
+                  graft_applied=1
+                done
+                if [ "$graft_hit" -ne 1 ]; then
+                  echo "::error::BakaSU dispatcher with susfs cases not found under ./kernel; cannot graft CMD_SUSFS_SET_PRIORITY_UID_FILTER"
+                  exit 1
+                fi
+                observer_source=./kernel/manager/pkg_observer.c
+                if [ -f "$observer_source" ] && ! grep -q 'susfs_parse_priority_app_strings' "$observer_source"; then
+                  tmp_observer="$(mktemp)"
+                  if ! awk '
+                    /^static void ksu_defer_track_throne\(void\)$/ { in_fn = 1 }
+                    in_fn && !done && /^    struct callback_head \*cb;$/ {
+                      print
+                      print ""
+                      print "    // Renew the getpriority uid bitmap filter"
+                      print "    susfs_parse_priority_app_strings();"
+                      done = 1
+                      next
+                    }
+                    { print }
+                    END { exit (done ? 0 : 42) }
+                  ' "$observer_source" > "$tmp_observer"; then
+                    rm -f "$tmp_observer"
+                    echo "::error::Could not locate ksu_defer_track_throne() body in $observer_source"
+                    exit 1
+                  fi
+                  mv "$tmp_observer" "$observer_source"
+                  if ! grep -q '#include <linux/susfs.h>' "$observer_source"; then
+                    sed -i '0,/^#include <linux\/version.h>$/{s|^#include <linux/version.h>$|#include <linux/version.h>\n#include <linux/susfs.h>|}' "$observer_source"
+                  fi
+                  if ! grep -q 'susfs_parse_priority_app_strings' "$observer_source"; then
+                    echo "::error::BakaSU observer renewal hook did not verify in $observer_source"
+                    exit 1
+                  fi
+                  grep -q '^#include <linux/susfs\.h>$' "$observer_source" || { echo "::error::susfs.h include missing after observer hook in $observer_source"; exit 1; }
+                  echo "✅ Hooked susfs_parse_priority_app_strings() into ksu_defer_track_throne()"
+                  graft_applied=1
+                fi
+                if [ "$graft_applied" -eq 1 ]; then
+                  echo "susfs-bakasu-graft|applied" >> "$PS_FILE"
+                fi
+              fi
             else
-              echo "ℹ️ Skipping KernelSU folder patch for BakaSU"
+              echo "ℹ️ Skipping KernelSU folder patch for ${{ inputs.ksu_type }}"
             fi
             ;;
           *)
@@ -2536,11 +2631,24 @@ runs:
         fi
         cd "$COMMON_KERNEL_FOLDER"
         source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        ZSTD_REPO="cctv18/oppo_oplus_realme_sm8850"
         if grep -Eq 'ZSTD_VERSION_RELEASE[[:space:]]+7' include/linux/zstd_lib.h && grep -q 'compression_level' crypto/zstd.c; then
           echo "zstd already at 1.5.7 with tunable level, skipping"
           echo "zstd-upgrade|already" >> "$PS_FILE"
         else
-          zstd_url="https://raw.githubusercontent.com/cctv18/oppo_oplus_realme_sm8850/6c1ffdac3ebf7ebb80254427a7972262b0a8f64e/zram_patch/002-zstd.patch"
+          ZSTD_REF="$(git ls-remote "https://github.com/${ZSTD_REPO}.git" refs/heads/main 2>/dev/null | awk '{print $1}')" || true
+          if [ -z "$ZSTD_REF" ]; then
+            echo "::warning::Could not resolve ${ZSTD_REPO}@main via ls-remote; falling back to previous commit via API"
+            ZSTD_REF="$(curl -fsSL "https://api.github.com/repos/${ZSTD_REPO}/commits?per_page=2" 2>/dev/null | jq -r '.[1].sha // empty' 2>/dev/null)" || true
+          fi
+          if [ -z "$ZSTD_REF" ]; then
+            echo "::warning::Could not resolve ${ZSTD_REPO}@main nor previous commit; continuing without the zstd upgrade"
+            echo "zstd-upgrade|skipped" >> "$PS_FILE"
+            echo "::endgroup::"
+            exit 0
+          fi
+          echo "zstd patch source: ${ZSTD_REPO}@main (${ZSTD_REF:0:7}), live head-tracking"
+          zstd_url="https://raw.githubusercontent.com/${ZSTD_REPO}/${ZSTD_REF}/zram_patch/002-zstd.patch"
           if ! fetch_patch "$zstd_url" /tmp/zstd_157.patch; then
             echo "::warning::zstd 1.5.7 patch unavailable upstream; continuing without it"
             echo "zstd-upgrade|skipped" >> "$PS_FILE"
@@ -2560,7 +2668,9 @@ runs:
         grep -q 'module_param(compression_level' crypto/zstd.c
         grep -n 'ZSTD_VERSION_RELEASE' include/linux/zstd_lib.h || true
         echo "ZSTD_UPGRADED=true" >> "$GITHUB_ENV"
-        echo "ZSTD_SOURCE=https://github.com/cctv18/oppo_oplus_realme_sm8850 zram_patch/002-zstd.patch @6c1ffda" >> "$GITHUB_ENV"
+        ZSTD_SRC_LABEL="https://github.com/${ZSTD_REPO} zram_patch/002-zstd.patch"
+        if [ -n "${ZSTD_REF:-}" ]; then ZSTD_SRC_LABEL="${ZSTD_SRC_LABEL} @${ZSTD_REF:0:7}"; fi
+        echo "ZSTD_SOURCE=${ZSTD_SRC_LABEL}" >> "$GITHUB_ENV"
         echo "✅ zstd upgraded to 1.5.7 with tunable crypto compression level"
         echo "::endgroup::"
 
@@ -2696,13 +2806,25 @@ runs:
         KERNEL_VERSION="${{ env.KERNEL_VER }}"
         SUBLEVEL="$(awk '/^SUBLEVEL *=/ { print $3; exit }' Makefile 2>/dev/null || true)"
         RTM="kernel/locking/rtmutex.c"
-        RTMUTEX_PIN="d6255c5f44e3871743c7d1570436822227b4b2fd"
-        RTMUTEX_BASE="https://raw.githubusercontent.com/LingLuo17/AnyKernel3/${RTMUTEX_PIN}/security_patch"
         skip_cve() {
           echo "rtmutex-cve|skipped" >> "$PS_FILE"
           echo "::endgroup::"
           exit 0
         }
+        # No hard pin, no config override: live-track LingLuo17/AnyKernel3@main.
+        # If main is unresolvable, fall back to the previous commit via the API.
+        RTMUTEX_REPO="LingLuo17/AnyKernel3"
+        RTMUTEX_PIN="$(git ls-remote "https://github.com/${RTMUTEX_REPO}.git" refs/heads/main 2>/dev/null | awk '{print $1}')" || true
+        if [ -z "$RTMUTEX_PIN" ]; then
+          echo "::warning::Could not resolve ${RTMUTEX_REPO}@main via ls-remote; falling back to previous commit via API"
+          RTMUTEX_PIN="$(curl -fsSL "https://api.github.com/repos/${RTMUTEX_REPO}/commits?per_page=2" 2>/dev/null | jq -r '.[1].sha // empty' 2>/dev/null)" || true
+        fi
+        if [ -z "$RTMUTEX_PIN" ]; then
+          echo "::warning::Could not resolve ${RTMUTEX_REPO}@main nor previous commit; continuing without the CVE-2026-43499 fix"
+          skip_cve
+        fi
+        echo "rtmutex CVE chain source: ${RTMUTEX_REPO}@main (${RTMUTEX_PIN:0:7}), live head-tracking"
+        RTMUTEX_BASE="https://raw.githubusercontent.com/${RTMUTEX_REPO}/${RTMUTEX_PIN}/security_patch"
         ensure_followup_fixes() {
           # CVE-2026-53163: fixes the regression the 43499 backport introduced.
           if ! grep -q 'if (!waiter_task) /\* never enqueued \*/' "$RTM"; then
@@ -3936,6 +4058,46 @@ runs:
         grep -n 'CONFIG_DEBLOAT_VENDOR_MODULES' kernel/module/main.c kernel/module.c 2>/dev/null || true
         grep -n '^CONFIG_DEBLOAT_VENDOR_MODULES=' arch/arm64/configs/gki_defconfig
         echo "✅ [vendor-modules-blacklist] verified"
+        echo "::endgroup::"
+
+    - name: SUSFS Command Parity Gate
+      if: ${{ env.OP_SUSFS == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::SUSFS command parity gate"
+        susfs_def_h="$COMMON_KERNEL_FOLDER/include/linux/susfs_def.h"
+        if [ ! -f "$susfs_def_h" ]; then
+          echo "::error::Staged susfs_def.h not found at $susfs_def_h"
+          exit 1
+        fi
+        # Commands declared by the staged SUSFS headers
+        grep -oE 'CMD_SUSFS_[A-Z0-9_]+' "$susfs_def_h" | sort -u > /tmp/susfs_declared.txt
+        # Legacy sus_su/sus_mount-era commands the roots handle out of band
+        printf '%s\n' CMD_SUSFS_SUS_SU CMD_SUSFS_IS_SUS_SU_READY \
+          CMD_SUSFS_SHOW_SUS_SU_WORKING_MODE CMD_SUSFS_ADD_SUS_MOUNT \
+          CMD_SUSFS_ADD_TRY_UMOUNT CMD_SUSFS_UMOUNT_FOR_ZYGOTE_ISO_SERVICE \
+          CMD_SUSFS_SET_ANDROID_DATA_ROOT_PATH CMD_SUSFS_SET_SDCARD_ROOT_PATH \
+          > /tmp/susfs_legacy.txt
+        parity_fail=0
+        for parity_root in "$KSU_FOLDER" "$KSUN_FOLDER"; do
+          [ -d "$parity_root/kernel" ] || continue
+          sort -u /tmp/susfs_declared.txt -o /tmp/susfs_declared.txt
+          grep -rhoE 'case CMD_SUSFS_[A-Z0-9_]+' "$parity_root/kernel" 2>/dev/null \
+            | sed 's/^case //' | sort -u > /tmp/susfs_impl_"$(basename "$parity_root")".txt || true
+          parity_missing="$(comm -23 /tmp/susfs_declared.txt /tmp/susfs_impl_"$(basename "$parity_root")".txt \
+            | grep -Fvx -f /tmp/susfs_legacy.txt || true)"
+          if [ -n "$parity_missing" ]; then
+            parity_list="$(printf '%s ' $parity_missing)"
+            echo "::error::SUSFS parity gate: dispatcher under $parity_root/kernel does not implement commands declared by the staged susfs headers: $parity_list"
+            parity_fail=1
+          fi
+        done
+        if [ "$parity_fail" -ne 0 ]; then
+          echo "::endgroup::"
+          exit 1
+        fi
+        echo "✅ SUSFS parity gate passed ($(wc -l < /tmp/susfs_declared.txt) declared commands, all implemented or legacy-exempt)"
         echo "::endgroup::"
 
     - name: Patch dry-run verdict
