@@ -32,6 +32,7 @@ on:
           - A16
           - A15
           - A14
+          - A17
           - android16-6.12
           - android15-6.6
           - android14-6.1
@@ -141,7 +142,7 @@ on:
           - OP13r
           - OP13r-6.1.75
       device_a16:
-        description: 'Device menu (optional): pick ONE config from configs/a16/; "none" = unused. Any explicit device selection (menus and/or config_paths) overrides the op_model tree filter'
+        description: 'Device menu (optional): pick ONE config - a16 options from configs/a16/ plus myron_oss_6.12.81 from configs/a17/; "none" = unused. Any explicit device selection (menus and/or config_paths) overrides the op_model tree filter'
         required: false
         type: choice
         default: none
@@ -225,6 +226,7 @@ on:
           - OP15T
           - OP15r
           - Myron
+          - myron_oss_6.12.81
       config_paths:
         description: 'Optional extra device config path(s) for multi-device builds — comma, semicolon or space separated, e.g. a16/OP15.json, a15/OP13.json (full configs/… paths also accepted, .json optional). Deduplicated and combined with the device menus'
         required: false
@@ -396,7 +398,11 @@ jobs:
             dev="${spec#*|}"
             if [ -z "$dev" ]; then dev="none"; fi
             if [ "$dev" != "none" ]; then
-              selected+=("configs/${tree}/${dev}.json")
+              cfg="configs/${tree}/${dev}.json"
+              if [ "$tree" = "a16" ] && [ ! -f "$cfg" ] && [ -f "configs/a17/${dev}.json" ]; then
+                cfg="configs/a17/${dev}.json"
+              fi
+              selected+=("$cfg")
             fi
           done
           if [ -n "$config_paths" ]; then
@@ -443,6 +449,7 @@ jobs:
             EXPLICIT_SELECTION)
               ;;
             A14+A15+A16)
+              jq_filter="map(select(.os_version != \"A17\"))"
               ;;
             A15+A16)
               jq_filter="map(select(.os_version == \"A15\" or .os_version == \"A16\"))"
@@ -452,6 +459,9 @@ jobs:
               ;;
             A16)
               jq_filter="map(select(.os_version == \"A16\"))"
+              ;;
+            A17)
+              jq_filter="map(select(.os_version == \"A17\"))"
               ;;
             A15)
               jq_filter="map(select(.os_version == \"A15\"))"
