@@ -2507,16 +2507,36 @@ runs:
         CONFIG_KSU_SUSFS_SUS_MAP=y
         CONFIG_KSU_SUSFS_SUS_SU=n
         EOF
-        # Priority UID filter: enable the Kconfig only when the staged susfs
-        # declares it, mirroring upstream susfs commit 2557ea25 (priority uid
-        # filter). Gated on susfs_def.h so older susfs versions skip cleanly -
-        # same gating contract as the BakaSU dispatcher graft.
-        susfs_def_h="$COMMON_KERNEL_FOLDER/include/linux/susfs_def.h"
-        if grep -q 'CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER' "$susfs_def_h" 2>/dev/null; then
+        # Priority UID filter (susfs upstream 2557ea25/68f62fae): declare the
+        # Kconfig symbol in the grafted KSU driver's kernel/Kconfig when the
+        # driver predates it (BakaSU stock block does; KSU/KSUN get it from
+        # the 10_enable graft), then enable it in defconfig. Gate surface is
+        # susfs.h - susfs_def.h only carries the CMD_ supercall id, which is
+        # why the v1 gate here always skipped and the vmlinux link died on
+        # undefined susfs_set_priority_uid_filter. Over-enabling is harmless
+        # (olddefconfig drops symbols with no declaration); under-enabling
+        # breaks the link.
+        susfs_h="$COMMON_KERNEL_FOLDER/include/linux/susfs.h"
+        if grep -q 'CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER' "$susfs_h" 2>/dev/null; then
+          kconfig_declared=0
+          for ksu_root in "$KSU_FOLDER" "$KSUN_FOLDER"; do
+            [ -d "$ksu_root" ] || continue
+            kcfg="$ksu_root/kernel/Kconfig"
+            [ -f "$kcfg" ] || continue
+            if ! grep -q '^config KSU_SUSFS_PRIORITY_UID_FILTER' "$kcfg"; then
+              printf '\nconfig KSU_SUSFS_PRIORITY_UID_FILTER\n\tbool "SUSFS: Priority UID filter"\n\tdepends on KSU_SUSFS\n\tdefault y\n' >> "$kcfg"
+              echo "✅ Declared KSU_SUSFS_PRIORITY_UID_FILTER in $kcfg (driver Kconfig predates susfs 2557ea25)"
+            fi
+            kconfig_declared=1
+          done
+          if [ "$kconfig_declared" -ne 1 ]; then
+            echo "::error::No KSU driver Kconfig found to declare KSU_SUSFS_PRIORITY_UID_FILTER"
+            exit 1
+          fi
           echo 'CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER=y' >> "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig"
-          echo "✅ CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER=y (staged susfs declares priority uid filter)"
+          echo "✅ CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER=y (staged susfs implements priority uid filter)"
         else
-          echo "ℹ️ Staged susfs does not declare CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER; skipping"
+          echo "ℹ️ Staged susfs does not implement CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER; skipping"
         fi
         grep -nE '^CONFIG_KSU_SUSFS' "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" | head -n 20 || true
         if [ -f "$COMMON_KERNEL_FOLDER/fs/susfs.c" ]; then
@@ -4472,6 +4492,7 @@ runs:
           ${{ env.COMMON_KERNEL_FOLDER }}/build.log
           ${{ env.COMMON_KERNEL_FOLDER }}/out/.config
         if-no-files-found: ignore
+        include-hidden-files: true
         retention-days: 7
 
     - name: 📊 ccache Post-Build Statistics
