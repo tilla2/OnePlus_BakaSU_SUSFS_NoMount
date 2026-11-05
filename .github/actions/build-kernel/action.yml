@@ -2507,6 +2507,17 @@ runs:
         CONFIG_KSU_SUSFS_SUS_MAP=y
         CONFIG_KSU_SUSFS_SUS_SU=n
         EOF
+        # Priority UID filter: enable the Kconfig only when the staged susfs
+        # declares it, mirroring upstream susfs commit 2557ea25 (priority uid
+        # filter). Gated on susfs_def.h so older susfs versions skip cleanly -
+        # same gating contract as the BakaSU dispatcher graft.
+        susfs_def_h="$COMMON_KERNEL_FOLDER/include/linux/susfs_def.h"
+        if grep -q 'CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER' "$susfs_def_h" 2>/dev/null; then
+          echo 'CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER=y' >> "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig"
+          echo "✅ CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER=y (staged susfs declares priority uid filter)"
+        else
+          echo "ℹ️ Staged susfs does not declare CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER; skipping"
+        fi
         grep -nE '^CONFIG_KSU_SUSFS' "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" | head -n 20 || true
         if [ -f "$COMMON_KERNEL_FOLDER/fs/susfs.c" ]; then
           echo "susfs|applied" >> "$PS_FILE"
@@ -4431,6 +4442,37 @@ runs:
         echo "============================================"
         echo "✅ Kernel build completed"
         echo "::endgroup::"
+
+    - name: ❌ Compile failure summary
+      if: ${{ failure() && steps.build_kernel_step.conclusion == 'failure' }}
+      shell: bash
+      run: |
+        {
+          echo "## ❌ Kernel compilation failed"
+          echo ""
+          echo "| Field | Value |"
+          echo "| --- | --- |"
+          echo "| **Model** | \`${{ env.OP_MODEL }}_${{ env.OP_OS_VERSION }}\` |"
+          echo "| **Fail log artifact** | \`fail_compile-${{ env.PS_BASE }}\` |"
+          echo ""
+          echo "<details><summary>Last 100 lines of build.log</summary>"
+          echo ''
+          echo '```text'
+          tail -n 100 "$COMMON_KERNEL_FOLDER/build.log" 2>/dev/null || echo "build.log not available"
+          echo '```'
+          echo "</details>"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Upload compile failure log
+      if: ${{ failure() && steps.build_kernel_step.conclusion == 'failure' }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: fail_compile-${{ env.PS_BASE }}
+        path: |
+          ${{ env.COMMON_KERNEL_FOLDER }}/build.log
+          ${{ env.COMMON_KERNEL_FOLDER }}/out/.config
+        if-no-files-found: ignore
+        retention-days: 7
 
     - name: 📊 ccache Post-Build Statistics
       id: ccache_stats
