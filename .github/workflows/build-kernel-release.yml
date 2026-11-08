@@ -260,6 +260,11 @@ on:
         type: choice
         options: [O2, O3]
         default: O2
+      mlgo:
+        description: 'Do you want to enable mlgo? [Machine Learning Guided Optimization]'
+        required: false
+        type: boolean
+        default: false
       build_profile:
         description: 'Build profile: "standard" keeps ccache and quiet logs, "clean" disables ccache, "debug" dumps debug artifacts and verbose logs, "clean + debug" does both'
         required: true
@@ -1001,6 +1006,7 @@ jobs:
           - Build profile: ${{ inputs.build_profile }}
           - Create Release: ${{ contains(inputs.run_mode, 'release') && '✅ Yes' || '❌ No' }}
           - Sync toolchains: ${{ inputs.mirror_toolchains && '✅ Yes' || '❌ No' }}
+          - MLGO advisor: ${{ inputs.mlgo && '✅ Yes' || '❌ No' }}
 
           **SUSFS Configuration:**
           EOF
@@ -1483,6 +1489,7 @@ jobs:
           nomount_commit: ${{ needs.resolve-nomount.outputs.nomount_commit }}
           nomount_ref_source: ${{ needs.resolve-nomount.outputs.nomount_source }}
           optimize_level: ${{ inputs.optimize_level }}
+          mlgo: ${{ inputs.mlgo }}
           build_timestamp: ${{ inputs.build_timestamp }}
           resolved_uname: ${{ matrix.resolved_uname }}
           clean: ${{ contains(inputs.build_profile, 'clean') }}
@@ -2116,6 +2123,7 @@ jobs:
           ksu_resolved_hash="${{ needs.set-op-model.outputs.ksu_resolved_hash }}"
 
           OPTIMIZE_LEVEL="${{ inputs.optimize_level }}"
+          MLGO_ENABLED="${{ inputs.mlgo }}"
           CLEAN_BUILD="${{ contains(inputs.build_profile, 'clean') }}"
 
           declare -A susfs_map=(
@@ -2289,6 +2297,7 @@ jobs:
           cat << EOF >> release_notes.md
           | **SUSFS Version** | \`$SUSFS_BASE_VERSION\` |
           | **Optimization Level** | \`$OPTIMIZE_LEVEL\` |
+          | **MLGO Advisor** | $( [ "$MLGO_ENABLED" = "true" ] && echo "✅ Enabled" || echo "❌ Disabled" ) |
           | **Clean Build** | $( [ "$CLEAN_BUILD" = "true" ] && echo "✅ Yes (no ccache)" || echo "❌ No (ccache enabled)" ) |
           | **Compiler** | Clang (version varies by device) |
 

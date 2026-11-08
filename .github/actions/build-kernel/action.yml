@@ -58,6 +58,11 @@ inputs:
     required: false
     type: string
     default: O2
+  mlgo:
+    description: 'Do you want to enable mlgo? [Machine Learning Guided Optimization]'
+    required: false
+    type: boolean
+    default: false
   clean:
     description: 'Force clean build without ccache acceleration'
     required: false
@@ -221,6 +226,7 @@ runs:
         ds="$OP_DS"
         ntsync="$OP_NTSYNC"
         optimize='${{ inputs.optimize_level }}'
+        mlgo='${{ inputs.mlgo }}'
         
         errors=()
         
@@ -362,6 +368,10 @@ runs:
         case "$optimize" in
           O2|O3) ;;
           *) errors+=("optimize_level must be O2 or O3. Got: '$optimize'"); ;;
+        esac
+        case "${mlgo}" in
+          true|false) ;;
+          *) errors+=("mlgo must be 'true' or 'false'. Got: '${mlgo}'"); ;;
         esac
         
         for bool_opt in OP_LZ4_UPGRADE OP_ZSTD_UPGRADE OP_ADIOS OP_RTMUTEX_CVE OP_BBR3 OP_BORE OP_BLACKLIST_APPLY; do
@@ -1415,31 +1425,39 @@ runs:
               aria_log_flags="--summary-interval=5" # Show progress every 5s in debug
           fi
           
+          local user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
           local aria2_headers=(
-            "--header=User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            "--header=Accept: */*"
-            "--header=Connection: keep-alive"
+            --user-agent="$user_agent"
+            --header="Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,application/octet-stream,*/*;q=0.8"
+            --header="Accept-Language: en-US,en;q=0.9"
+            --header="Sec-Fetch-Dest: document"
+            --header="Sec-Fetch-Mode: navigate"
+            --header="Sec-Fetch-Site: none"
+            --header="Sec-Fetch-User: ?1"
+            --header="Upgrade-Insecure-Requests: 1"
           )
           
           local download_url=""
           if [[ "$url" == *"github.com"* ]]; then
               download_url="${url%.git}/archive/refs/heads/${branch}.tar.gz"
           elif [[ "$url" == *"gitlab.com"* ]]; then
-              download_url="${url%.git}/-/archive/${branch}/${repo_name}-${branch}.tar.gz"
+              local project_path=$(echo "$url" | sed -E 's#^https?://gitlab\.com/##; s#\.git$##; s#/#%2F#g')
+              download_url="https://gitlab.com/api/v4/projects/${project_path}/repository/archive.tar.gz?sha=${branch}"
           else
               echo "::error::Unsupported host: $url"
               return 1
           fi
           
           while [ $attempt -le $max_attempts ]; do
+              local conn=1
+              case $attempt in
+                1) conn=16 ;;
+                2) conn=4 ;;
+                *) conn=1 ;;
+              esac
               echo " Attempt $attempt/$max_attempts: High-speed fetch for $repo_name ($branch)"
-              
-              local aria_splits="-x16 -s16 -j16"
-          if [[ "$url" == *"gitlab.com"* ]]; then
-            # GitLab throttles per-IP bursts; 16-way segmentation invites 429s
-            aria_splits="-x4 -s4"
-          fi
-          if aria2c $aria_splits -k1M --retry-wait=2 --max-tries=5 -d "/dev/shm" -o "$archive_name" --allow-overwrite=true "${aria2_headers[@]}" $aria_log_flags "$download_url"; then
+
+              if aria2c -x"$conn" -s"$conn" -j16 -k1M --retry-wait=2 --max-tries=5 -d "/dev/shm" -o "$archive_name" --allow-overwrite=true "${aria2_headers[@]}" $aria_log_flags "$download_url"; then
                   mkdir -p "$repo_name"
                   if tar -I "pigz -p $nproc -b 256" -x --record-size=1M -f "$shm_path" -C "$repo_name" --strip-components=1 --no-same-owner; then
                       echo "✅ Success: $repo_name synced"
@@ -3616,6 +3634,7 @@ runs:
         echo "Add TTL Target Support"
         cat >> "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" <<EOF
         CONFIG_IP_NF_TARGET_TTL=y
+        CONFIG_NETFILTER_XT_TARGET_HL=y
         CONFIG_IP6_NF_TARGET_HL=y
         CONFIG_IP6_NF_MATCH_HL=y
         EOF
@@ -3797,6 +3816,10 @@ runs:
         CONFIG_NETFILTER_XT_TARGET_LOG=y
         CONFIG_NETFILTER_XT_MATCH_RECENT=y
         CONFIG_USER_NS=y
+        CONFIG_IPC_NS=y
+        CONFIG_UTS_NS=y
+        CONFIG_NET_NS=y
+        CONFIG_MACVLAN=y
         EOF
         
         gen_patch ds-guard-userns "$KERNEL_PATCHES_FOLDER/common/droidspaces/0001-Guard-USER_NS-for-non-root-users.patch"
@@ -4246,6 +4269,18 @@ runs:
         MPMAP="-fmacro-prefix-map=${WORKSPACE}=."
         FPMAP="-ffile-prefix-map=${WORKSPACE}=."
         
+        add_kcflag() {
+          if printf 'int g(int a){return a+1;} int f(int a){return g(a)*2;}\n' \
+            | clang --target=aarch64-linux-gnu -O2 "$@" -x c - -c -o /dev/null 2>/dev/null; then
+            KCFLAGS="${KCFLAGS:+$KCFLAGS }$*"
+          else
+            echo "::warning::clang rejected flag(s), skipping: $*"
+          fi
+        }
+        
+        if [[ "${{ inputs.mlgo }}" = "true" ]]; then
+          add_kcflag -mllvm -regalloc-enable-advisor=release
+        fi
         export KCFLAGS="${KCFLAGS:-} $MAP $MPMAP $FPMAP -no-canonical-prefixes -fdiagnostics-color=never -Qunused-arguments -Wno-unused-command-line-argument -D__ANDROID_COMMON_KERNEL__"
         export KCPPFLAGS="${KCPPFLAGS:-} $MAP $MPMAP $FPMAP"
         
