@@ -12,15 +12,18 @@ on:
   workflow_dispatch:
     inputs:
       run_mode:
-        description: 'Run mode: "build" compiles and uploads artifacts; "build + release" also publishes a release; "build + release + bump increment" also bumps the -r tag increment; "patch dry run" applies every patch, uploads a verdict per device and skips compilation (never releases)'
+        description: 'Run mode: "build" compiles and uploads artifacts; "build + release" also publishes a release; "build + release + bump increment" also bumps the -r tag increment; "patch dry run" applies every patch, uploads a verdict per device and skips compilation (never releases); options suffixed "with mlgo" additionally enable MLGO (Machine Learning Guided Optimization) in KCFLAGS; "patch dry run" never compiles, so it has no mlgo variant'
         required: true
         type: choice
         options:
           - build
+          - build with mlgo
           - build + release
+          - build + release with mlgo
           - build + release + bump increment
+          - build + release + bump increment with mlgo
           - patch dry run
-        default: build
+        default: build with mlgo
       op_model:
         description: 'Select the OnePlus kernels to build'
         required: true
@@ -260,11 +263,6 @@ on:
         type: choice
         options: [O2, O3]
         default: O2
-      mlgo:
-        description: 'Do you want to enable mlgo? [Machine Learning Guided Optimization]'
-        required: false
-        type: boolean
-        default: false
       build_profile:
         description: 'Build profile: "standard" keeps ccache and quiet logs, "clean" disables ccache, "debug" dumps debug artifacts and verbose logs, "clean + debug" does both'
         required: true
@@ -1006,7 +1004,7 @@ jobs:
           - Build profile: ${{ inputs.build_profile }}
           - Create Release: ${{ contains(inputs.run_mode, 'release') && '✅ Yes' || '❌ No' }}
           - Sync toolchains: ${{ inputs.mirror_toolchains && '✅ Yes' || '❌ No' }}
-          - MLGO advisor: ${{ inputs.mlgo && '✅ Yes' || '❌ No' }}
+          - MLGO advisor: ${{ contains(inputs.run_mode, 'with mlgo') && '✅ Yes' || '❌ No' }}
 
           **SUSFS Configuration:**
           EOF
@@ -1489,7 +1487,7 @@ jobs:
           nomount_commit: ${{ needs.resolve-nomount.outputs.nomount_commit }}
           nomount_ref_source: ${{ needs.resolve-nomount.outputs.nomount_source }}
           optimize_level: ${{ inputs.optimize_level }}
-          mlgo: ${{ inputs.mlgo }}
+          mlgo: ${{ contains(inputs.run_mode, 'with mlgo') }}
           build_timestamp: ${{ inputs.build_timestamp }}
           resolved_uname: ${{ matrix.resolved_uname }}
           clean: ${{ contains(inputs.build_profile, 'clean') }}
@@ -2123,7 +2121,7 @@ jobs:
           ksu_resolved_hash="${{ needs.set-op-model.outputs.ksu_resolved_hash }}"
 
           OPTIMIZE_LEVEL="${{ inputs.optimize_level }}"
-          MLGO_ENABLED="${{ inputs.mlgo }}"
+          MLGO_ENABLED="${{ contains(inputs.run_mode, 'with mlgo') }}"
           CLEAN_BUILD="${{ contains(inputs.build_profile, 'clean') }}"
 
           declare -A susfs_map=(
