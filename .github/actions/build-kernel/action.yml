@@ -28,6 +28,16 @@ inputs:
     required: false
     type: string
     default: ""
+  susfs_ref_source:
+    description: 'Provenance label of the resolved SUSFS ref (set by the calling workflow); empty = derive locally'
+    required: false
+    type: string
+    default: ""
+  nomount_ref_source:
+    description: 'Provenance label of the resolved NoMount ref (set by the calling workflow); empty = derive locally'
+    required: false
+    type: string
+    default: ""
   use_rekernel:
     description: 'Integrate the Re-Kernel driver in-tree (CONFIG_REKERNEL, netlink freeze/kill notifier, manager-agnostic)'
     required: false
@@ -329,13 +339,13 @@ runs:
           errors+=("Input 'unicode' contains invalid characters. Allowed: 'true' or 'false'. Got: '$unicode'")
         fi
         
-        # OP_C_COMPILER currently has no checks!
+        # OP_C_COMPILER has no validation.
         
-        # OP_RUST_COMPILER currently has no checks!
+        # OP_RUST_COMPILER has no validation.
         
-        # OP_ZYC_COMPILER currently has no checks!
+        # OP_ZYC_COMPILER has no validation.
         
-        # OP_BINDGEN currently has no checks!
+        # OP_BINDGEN has no validation.
         
         if [[ -z "$ds" ]]; then
           errors+=("Input 'ds' cannot be empty")
@@ -1379,7 +1389,8 @@ runs:
           else
             # 40-char hash or branch/commit passed directly
             SUSFS_BRANCH="$SUSFS_INPUT"
-            SUSFS_REF_SOURCE="explicit input pin"
+            SUSFS_REF_SOURCE="${{ inputs.susfs_ref_source }}"
+            [ -n "$SUSFS_REF_SOURCE" ] || SUSFS_REF_SOURCE="explicit input pin"
             echo "🔧 Using resolved SUSFS ref: $SUSFS_BRANCH"
           fi
           echo "SUSFS_REF=$SUSFS_BRANCH" >> "$GITHUB_ENV"
@@ -1527,6 +1538,7 @@ runs:
             NOMOUNT_REF_SOURCE="upstream latest"
             echo "::warning::No NoMount commit provided; tracking upstream latest (${NOMOUNT_COMMIT_SHA})"
           fi
+          if [ -n "${{ inputs.nomount_ref_source }}" ]; then NOMOUNT_REF_SOURCE="${{ inputs.nomount_ref_source }}"; fi
           if [ -z "${NOMOUNT_REF_SOURCE:-}" ]; then NOMOUNT_REF_SOURCE="explicit input pin"; fi
           git -C nomount log --oneline -1
         fi
@@ -1937,7 +1949,13 @@ runs:
               echo "ℹ️ Skipping KernelSU folder patch for BakaSU"
             fi
             ;;
-          "v2.2.0"|"v2.3.0")
+          *)
+            if [ -d "$SUSFS_FOLDER/.git" ]; then
+              susfs_title="$(git -C "$SUSFS_FOLDER" log -1 --pretty=%s 2>/dev/null || true)"
+            else
+              susfs_title="$(curl -fsSL --retry 3 --retry-delay 2 "https://gitlab.com/api/v4/projects/simonpunk%2Fsusfs4ksu/repository/commits/${SUSFS_COMMIT_SHA}" 2>/dev/null | grep -o '"title" *: *"[^"]*"' | head -n1 | sed 's/.*"title" *: *"//; s/"$//')" || true
+            fi
+            echo "SusFS ${susfs_version} | ${susfs_title:-commit title unavailable}"
             if [ "${{ inputs.ksu_type }}" = "KSUN" ]; then
               cd "$KSUN_FOLDER"
               susfs_ksun_patch="$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
@@ -2177,7 +2195,9 @@ runs:
                   exit 1
                 fi
                 observer_source=./kernel/manager/pkg_observer.c
-                if [ -f "$observer_source" ] && ! grep -q 'susfs_parse_priority_app_strings' "$observer_source"; then
+                if grep -rq 'susfs_parse_priority_app_strings' ./kernel; then
+                  echo "ℹ️ ./kernel renews the priority uid filter natively; observer hook skipped"
+                elif [ -f "$observer_source" ]; then
                   tmp_observer="$(mktemp)"
                   if ! awk '
                     /^static void ksu_defer_track_throne\(void\)$/ { in_fn = 1 }
@@ -2215,10 +2235,6 @@ runs:
             else
               echo "ℹ️ Skipping KernelSU folder patch for ${{ inputs.ksu_type }}"
             fi
-            ;;
-          *)
-            echo "::error::Unsupported SUSFS version: $susfs_version"
-            exit 1
             ;;
         esac
         echo "::endgroup::"
@@ -2507,15 +2523,13 @@ runs:
         CONFIG_KSU_SUSFS_SUS_MAP=y
         CONFIG_KSU_SUSFS_SUS_SU=n
         EOF
-        # Priority UID filter (susfs upstream 2557ea25/68f62fae): declare the
-        # Kconfig symbol in the grafted KSU driver's kernel/Kconfig when the
-        # driver predates it (BakaSU stock block does; KSU/KSUN get it from
-        # the 10_enable graft), then enable it in defconfig. Gate surface is
-        # susfs.h - susfs_def.h only carries the CMD_ supercall id, which is
-        # why the v1 gate here always skipped and the vmlinux link died on
-        # undefined susfs_set_priority_uid_filter. Over-enabling is harmless
-        # (olddefconfig drops symbols with no declaration); under-enabling
-        # breaks the link.
+        # Priority UID filter (susfs upstream 2557ea25/68f62fae): susfs_def.h
+        # carries only the CMD_ supercall id, so the feature gate must match
+        # susfs.h. Declare the symbol in the grafted KSU driver's kernel/Kconfig
+        # when the driver predates it (BakaSU stock block; KSU/KSUN receive it
+        # via the 10_enable graft), then enable it in defconfig. olddefconfig
+        # drops symbols with no declaration, so over-enabling is harmless;
+        # under-enabling breaks the vmlinux link.
         susfs_h="$COMMON_KERNEL_FOLDER/include/linux/susfs.h"
         if grep -q 'CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER' "$susfs_h" 2>/dev/null; then
           kconfig_declared=0
@@ -3386,8 +3400,8 @@ runs:
         
         echo "Patching $(basename $NTSYNC_PATCH)!"
         # Pre-shim: only when this compat patch actually targets lockdep.h,
-        # idempotently add the missing no-op lockdep macros (formerly the
-        # post-failure .rej rescue) so the hunk lands at fuzz=0.
+        # idempotently add the missing no-op lockdep macros so the hunk lands
+        # at fuzz=0.
         if grep -Eq '^\+\+\+ (a/|b/)?include/linux/lockdep\.h' "$NTSYNC_PATCH" && [ -f include/linux/lockdep.h ]; then
           grep -q '#define lockdep_assert(c)' include/linux/lockdep.h || \
             sed -i '/#define lockdep_is_held_type(l, r)/a\#define lockdep_assert(c)\t\t\tdo { } while (0)' include/linux/lockdep.h
@@ -4509,8 +4523,9 @@ runs:
         ccache -c
         
         echo "Perform ccache eviction!"
-        # 0.5 days = 12 Hrs. Delete cache unused in 12 hrs. 12 hrs is considered for safety.
-        # Yes. ccache uses mtime as a store of time due to cross compatibility with different OS.
+        # Evict cache files untouched for 12 hours (0.5 days, safety margin).
+        # ccache records mtime as its timestamp for cross-OS compatibility, so
+        # age-based eviction keys on mtime.
         find "$CCACHE_DIR" -type f -mtime +0.5 -delete
         # Remove empty layout subdirectories
         find "$CCACHE_DIR" -type d -empty -delete
@@ -4582,9 +4597,9 @@ runs:
         fi
         
         if [ -f "$COMMON_KERNEL_FOLDER/build.log" ]; then
-          # Compiler diagnostics only (file:line:col: warning: …). The previous
-          # case-insensitive substring grep also swept script/config notices such as
-          # the "Unexpected CONFIG_* value found" self-check into this count.
+          # Compiler diagnostics only (file:line:col: warning: …); script and
+          # config notices such as the "Unexpected CONFIG_* value found"
+          # self-check do not match this pattern.
           WARNINGS_COUNT="$(grep -cE '^[^ :]+:[0-9]+:[0-9]+: warning: ' "$COMMON_KERNEL_FOLDER/build.log" 2>/dev/null || true)"
           [ -n "$WARNINGS_COUNT" ] || WARNINGS_COUNT="0"
         else
@@ -4615,7 +4630,7 @@ runs:
         KERNEL_UNAME_BANNER=$(strings "$IMG" | grep -E 'Linux version.*#' | tail -n1)
         # Keep only the release string (e.g. 6.12.58-android16-6-g925a103d123c-ab15898589-4k) for
         # the summary; the full banner (compiler, build user@host, SMP PREEMPT + timestamp) stays in
-        # this log group only, mirroring a clean uname like BP's build reports.
+        # this log group only.
         KERNEL_UNAME=$(printf '%s' "$KERNEL_UNAME_BANNER" | sed -e 's/^Linux version //' -e 's/ .*//')
         echo "Kernel Uname (full banner): $KERNEL_UNAME_BANNER"
         echo "Kernel Uname: $KERNEL_UNAME"
