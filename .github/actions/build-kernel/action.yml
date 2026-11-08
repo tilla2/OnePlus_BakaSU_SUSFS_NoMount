@@ -374,6 +374,12 @@ runs:
           *) errors+=("mlgo must be 'true' or 'false'. Got: '${mlgo}'"); ;;
         esac
         
+        for ident in OP_BUILD_USER OP_BUILD_HOST; do
+          val="${!ident:-}"
+          if [[ -n "$val" && ! "$val" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            errors+=("$ident contains invalid characters. Allowed: letters, digits, ., _, -. Got: '$val'")
+          fi
+        done
         for bool_opt in OP_LZ4_UPGRADE OP_ZSTD_UPGRADE OP_ADIOS OP_RTMUTEX_CVE OP_BBR3 OP_BORE OP_BLACKLIST_APPLY; do
           val="${!bool_opt:-}"
           if [[ -n "$val" && "$val" != "true" && "$val" != "false" ]]; then
@@ -1056,14 +1062,14 @@ runs:
         fi
         echo "::endgroup::"
 
-    - name: 🏷️ Set Build Identity (Hardcoded)
+    - name: 🏷️ Set Build Identity
       shell: bash
       run: |
         set -euo pipefail
         echo "::group::Set build user/host"
                 
-        BUILD_USER="OnePlus"
-        BUILD_HOST="ubuntu-build"
+        BUILD_USER="${OP_BUILD_USER:-OnePlus}"
+        BUILD_HOST="${OP_BUILD_HOST:-ubuntu-build}"
         
         echo "BUILD_USER=$BUILD_USER" >> "$GITHUB_ENV"
         echo "BUILD_HOST=$BUILD_HOST" >> "$GITHUB_ENV"
@@ -3756,10 +3762,10 @@ runs:
         fi
         
         cat >> "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" <<EOF
-        CONFIG_SYSVIPC = y
-        CONFIG_DEVTMPFS = y
-        CONFIG_PID_NS = y
-        CONFIG_POSIX_MQUEUE = y
+        CONFIG_SYSVIPC=y
+        CONFIG_DEVTMPFS=y
+        CONFIG_PID_NS=y
+        CONFIG_POSIX_MQUEUE=y
         EOF
         echo "ds|applied" >> "$PS_FILE"
         echo "✅ LXC / Droidspaces support added (SYSVIPC enabled, namespaces + POSIX mqueue configured)"
@@ -3812,7 +3818,6 @@ runs:
         CONFIG_DEVTMPFS=y
         CONFIG_PID_NS=y
         CONFIG_POSIX_MQUEUE=y
-        CONFIG_NETFILTER_XT_TARGET_REJECT=y
         CONFIG_NETFILTER_XT_TARGET_LOG=y
         CONFIG_NETFILTER_XT_MATCH_RECENT=y
         CONFIG_USER_NS=y

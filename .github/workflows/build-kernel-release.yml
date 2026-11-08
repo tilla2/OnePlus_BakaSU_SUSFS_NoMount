@@ -228,6 +228,7 @@ on:
           - OP15T
           - OP15r
           - Myron
+          - Myron-parity
       config_paths:
         description: 'Optional extra device config path(s) for multi-device builds — comma, semicolon or space separated, e.g. a16/OP15.json, a15/OP13.json (full configs/… paths also accepted, .json optional). Deduplicated and combined with the device menus'
         required: false
