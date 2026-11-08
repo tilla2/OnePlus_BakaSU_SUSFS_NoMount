@@ -4416,7 +4416,13 @@ runs:
 
         case "$OP_BRANCH" in
           wild/sm8750|wild/sm8850|wild/sm8845)
-            KCFLAGS_EXTRA="-mcpu=oryon-1 ${KCFLAGS_EXTRA}"
+            CLANG_PROBE="clang"
+            if [ -n "${CLANG_BIN_PATH:-}" ] && [ -x "${CLANG_BIN_PATH}/clang" ]; then CLANG_PROBE="${CLANG_BIN_PATH}/clang"; fi
+            if printf 'int x;\n' | "$CLANG_PROBE" --target=aarch64-linux-gnu -mcpu=oryon-1 -x c -c - -o /dev/null 2>/dev/null; then
+              KCFLAGS_EXTRA="-mcpu=oryon-1 ${KCFLAGS_EXTRA}"
+            else
+              echo "⚠️ Toolchain rejects -mcpu=oryon-1 — Oryon CPU tuning flag skipped"
+            fi
             ;;
         esac
         
