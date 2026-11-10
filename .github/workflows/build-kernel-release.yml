@@ -12,15 +12,18 @@ on:
   workflow_dispatch:
     inputs:
       run_mode:
-        description: 'Run mode: "build" compiles and uploads artifacts; "build + release" also publishes a release; "build + release + bump increment" also bumps the -r tag increment; "patch dry run" applies every patch, uploads a verdict per device and skips compilation (never releases)'
+        description: 'Run mode: "build" compiles and uploads artifacts; "build + release" also publishes a release; "build + release + bump increment" also bumps the -r tag increment; "patch dry run" applies every patch, uploads a verdict per device and skips compilation (never releases); options suffixed "with mlgo" additionally enable MLGO (Machine Learning Guided Optimization) in KCFLAGS; "patch dry run" never compiles, so it has no mlgo variant'
         required: true
         type: choice
         options:
           - build
+          - build with mlgo
           - build + release
+          - build + release with mlgo
           - build + release + bump increment
+          - build + release + bump increment with mlgo
           - patch dry run
-        default: build
+        default: build with mlgo
       op_model:
         description: 'Select the OnePlus kernels to build'
         required: true
@@ -226,7 +229,8 @@ on:
           - OP15T
           - OP15r
           - Myron
-          - myron_oss_6.12.81
+          - Myron-OSS-6.12.81
+          - Myron-parity
       config_paths:
         description: 'Optional extra device config path(s) for multi-device builds — comma, semicolon or space separated, e.g. a16/OP15.json, a15/OP13.json (full configs/… paths also accepted, .json optional). Deduplicated and combined with the device menus'
         required: false
@@ -598,12 +602,11 @@ jobs:
           fi
 
           # ── Ref kind for downstream fetchers ──
-          # pin    = stored last-success SHA applied  → commit-exact APK
-          # sha    = explicit 40-hex dispatch input   → commit-exact APK
-          # branch = branch/tag ref (incl. auto HEAD) → LATEST successful
-          #          manager CI run on that branch (manager.zip preferred).
-          # Pins are optional overrides, never a hard pin: a branch ref
-          # always tracks that branch's newest successful build.
+          # pin/sha/branch only describe where the ref came from: every kind
+          # has already resolved to the commit the kernel side applies
+          # (ksu_resolved_hash), so the manager fetchers query CI runs by
+          # head_sha only; the latest upstream release is the fallback for
+          # SHAs without a successful manager CI run.
           if [ "${KSU_REF_PIN_APPLIED:-0}" = "1" ]; then
             ksu_ref_kind="pin";    ksu_ref_name=""
           elif [[ "$ksu_ref" =~ ^[0-9a-f]{40}$ ]]; then
@@ -731,7 +734,7 @@ jobs:
             fi
             if [ -n "${user_inputs[$key]}" ]; then
               susfs_src="explicit input pin"
-            elif [ -n "$stored_susfs" ]; then
+            elif [ -n "$stored_susfs" ] && [ "$user_val" = "$stored_susfs" ]; then
               susfs_src="last-success pin"
             else
               susfs_src="branch head (${user_val})"
@@ -1012,6 +1015,7 @@ jobs:
           - Build profile: ${{ inputs.build_profile }}
           - Create Release: ${{ contains(inputs.run_mode, 'release') && '✅ Yes' || '❌ No' }}
           - Sync toolchains: ${{ inputs.mirror_toolchains && '✅ Yes' || '❌ No' }}
+          - MLGO advisor: ${{ contains(inputs.run_mode, 'with mlgo') && '✅ Yes' || '❌ No' }}
 
           **SUSFS Configuration:**
           EOF
@@ -1490,8 +1494,11 @@ jobs:
           ksu_type: ${{ matrix.ksu_type }}
           ksu_branch_or_hash: ${{ matrix.ksu_resolved_hash }}
           susfs_commit_hash_or_branch: ${{ matrix.susfs_resolved_hash }}
+          susfs_ref_source: ${{ matrix.susfs_resolved_src }}
           nomount_commit: ${{ needs.resolve-nomount.outputs.nomount_commit }}
+          nomount_ref_source: ${{ needs.resolve-nomount.outputs.nomount_source }}
           optimize_level: ${{ inputs.optimize_level }}
+          mlgo: ${{ contains(inputs.run_mode, 'with mlgo') }}
           build_timestamp: ${{ inputs.build_timestamp }}
           resolved_uname: ${{ matrix.resolved_uname }}
           clean: ${{ contains(inputs.build_profile, 'clean') }}
@@ -1711,27 +1718,13 @@ jobs:
           echo "MANAGER_REPO=${MANAGER_REPO}" >> "$GITHUB_ENV"
           KSU_REF_KIND="${KSU_REF_KIND:-}"
           KSU_REF_NAME="${KSU_REF_NAME:-}"
-          if [ "$KSU_REF_KIND" = "branch" ] && [ -n "$KSU_REF_NAME" ]; then
-            echo "Manager repo: $MANAGER_REPO — resolving latest successful manager build on branch '${KSU_REF_NAME}'"
-          else
-            echo "Manager repo: $MANAGER_REPO — resolving commit-exact build for ${KSU_SHA} (ref kind: ${KSU_REF_KIND:-sha})"
-          fi
+          echo "Manager repo: $MANAGER_REPO — resolving commit-exact build for ${KSU_SHA} (ref kind: ${KSU_REF_KIND:-sha})"
 
-          MANAGER_RUN_ID=""
-          if [ "$KSU_REF_KIND" = "branch" ] && [ -n "$KSU_REF_NAME" ]; then
-            # Branch ref → newest successful manager build ON that branch.
-            MANAGER_RUN_ID=$(gh api "repos/${MANAGER_REPO}/actions/runs?status=success&per_page=100" \
-              --jq '[.workflow_runs[] | select(.event != "pull_request") | select(.path | test("build-manager(-ci)?\\.yml$"))][0].id // empty' || true)
-            if [ -n "$MANAGER_RUN_ID" ]; then
-              echo "✅ Newest manager CI run found (repo-wide): ${MANAGER_RUN_ID}"
-            else
-              echo "::warning::No successful manager CI run on branch '${KSU_REF_NAME}' — trying commit-exact match for ${KSU_SHA:0:12}"
-            fi
-          fi
-          if [ -z "$MANAGER_RUN_ID" ]; then
-            MANAGER_RUN_ID=$(gh api "repos/${MANAGER_REPO}/actions/runs?head_sha=${KSU_SHA}&status=success&per_page=50" \
-              --jq '[.workflow_runs[] | select(.event != "pull_request") | select(.path | test("build-manager(-ci)?\\.yml$"))][0].id // empty' || true)
-          fi
+          # KSU_SHA is the commit the kernel side applies; only CI runs headed
+          # by that exact commit qualify. The latest upstream release below
+          # remains the fallback for SHAs without a successful CI run.
+          MANAGER_RUN_ID=$(gh api "repos/${MANAGER_REPO}/actions/runs?head_sha=${KSU_SHA}&status=success&per_page=50" \
+            --jq '[.workflow_runs[] | select(.event != "pull_request") | select(.path | test("build-manager(-ci)?\\.yml$"))][0].id // empty' || true)
 
           if [ -n "$MANAGER_RUN_ID" ]; then
             echo "✅ Manager CI run found: ${MANAGER_RUN_ID}"
@@ -2024,27 +2017,13 @@ jobs:
           esac
           KSU_REF_KIND="${KSU_REF_KIND:-}"
           KSU_REF_NAME="${KSU_REF_NAME:-}"
-          if [ "$KSU_REF_KIND" = "branch" ] && [ -n "$KSU_REF_NAME" ]; then
-            echo "Manager repo: $MANAGER_REPO — resolving latest successful manager build on branch '${KSU_REF_NAME}'"
-          else
-            echo "Manager repo: $MANAGER_REPO — resolving commit-exact build for ${KSU_SHA} (ref kind: ${KSU_REF_KIND:-sha})"
-          fi
+          echo "Manager repo: $MANAGER_REPO — resolving commit-exact build for ${KSU_SHA} (ref kind: ${KSU_REF_KIND:-sha})"
 
-          MANAGER_RUN_ID=""
-          if [ "$KSU_REF_KIND" = "branch" ] && [ -n "$KSU_REF_NAME" ]; then
-            # Branch ref → newest successful manager build ON that branch.
-            MANAGER_RUN_ID=$(gh api "repos/${MANAGER_REPO}/actions/runs?status=success&per_page=100" \
-              --jq '[.workflow_runs[] | select(.event != "pull_request") | select(.path | test("build-manager(-ci)?\\.yml$"))][0].id // empty' || true)
-            if [ -n "$MANAGER_RUN_ID" ]; then
-              echo "✅ Newest manager CI run found (repo-wide): ${MANAGER_RUN_ID}"
-            else
-              echo "::warning::No successful manager CI run on branch '${KSU_REF_NAME}' — trying commit-exact match for ${KSU_SHA:0:12}"
-            fi
-          fi
-          if [ -z "$MANAGER_RUN_ID" ]; then
-            MANAGER_RUN_ID=$(gh api "repos/${MANAGER_REPO}/actions/runs?head_sha=${KSU_SHA}&status=success&per_page=50" \
-              --jq '[.workflow_runs[] | select(.event != "pull_request") | select(.path | test("build-manager(-ci)?\\.yml$"))][0].id // empty' || true)
-          fi
+          # KSU_SHA is the commit the kernel side applies; only CI runs headed
+          # by that exact commit qualify. The latest upstream release below
+          # remains the fallback for SHAs without a successful CI run.
+          MANAGER_RUN_ID=$(gh api "repos/${MANAGER_REPO}/actions/runs?head_sha=${KSU_SHA}&status=success&per_page=50" \
+            --jq '[.workflow_runs[] | select(.event != "pull_request") | select(.path | test("build-manager(-ci)?\\.yml$"))][0].id // empty' || true)
 
           if [ -n "$MANAGER_RUN_ID" ]; then
             echo "✅ Manager CI run found: ${MANAGER_RUN_ID}"
@@ -2153,6 +2132,7 @@ jobs:
           ksu_resolved_hash="${{ needs.set-op-model.outputs.ksu_resolved_hash }}"
 
           OPTIMIZE_LEVEL="${{ inputs.optimize_level }}"
+          MLGO_ENABLED="${{ contains(inputs.run_mode, 'with mlgo') }}"
           CLEAN_BUILD="${{ contains(inputs.build_profile, 'clean') }}"
 
           declare -A susfs_map=(
@@ -2326,6 +2306,7 @@ jobs:
           cat << EOF >> release_notes.md
           | **SUSFS Version** | \`$SUSFS_BASE_VERSION\` |
           | **Optimization Level** | \`$OPTIMIZE_LEVEL\` |
+          | **MLGO Advisor** | $( [ "$MLGO_ENABLED" = "true" ] && echo "✅ Enabled" || echo "❌ Disabled" ) |
           | **Clean Build** | $( [ "$CLEAN_BUILD" = "true" ] && echo "✅ Yes (no ccache)" || echo "❌ No (ccache enabled)" ) |
           | **Compiler** | Clang (version varies by device) |
 
