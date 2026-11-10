@@ -32,9 +32,9 @@
   "root_tag": "ChimeraKernel",
   "blacklist_apply": false,
   "blacklist_modules": "kernelsu,coresight_tpda,coresight_tgu,coresight_trace_noc,coresight_cti,coresight_qmi,coresight_dummy,coresight_remote_etm,coresight_tpdm,coresight_uetm,coresight_stm,coresight_tmc_sec,f_fs_ipc_log,qti_battery_debug,rdbg,stm_heartbeat,stm_p_ost,stm_core,stm_ftrace,stm_console,spmi_pmic_arb_debug",
-  "uname": "6-g156718920225-4k",
+  "uname": "6-g99a0d7c9fb2c-4k",
   "build_user": "kleaf",
   "build_host": "build-host",
-  "build_time": "Wed Oct 21 23:56:42 UTC 2026",
+  "build_time": "Wed Nov  4 13:05:57 UTC 2026",
   "rekernel": true
 }
