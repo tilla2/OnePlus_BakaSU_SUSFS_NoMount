@@ -8,7 +8,7 @@
     <remote fetch="https://github.com/huangdihd" name="wild"/>
   <project remote="wild" name="AnyKernel3" path="AnyKernel3" revision="gki-2.0"/>
 
-  <project remote="aosp" name="kernel/common" path="kernel_platform/common" revision="156718920225fb0bce7ad9a95dc4df54c3d9032e" clone-depth="1">
+  <project remote="aosp" name="kernel/common" path="kernel_platform/common" revision="99a0d7c9fb2cf2477c71ee783ad43c8d536b5cc3" clone-depth="1">
     <linkfile dest="kernel_platform/.source_date_epoch_dir" src="."/>
   </project>
 
