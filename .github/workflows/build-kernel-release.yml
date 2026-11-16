@@ -1724,15 +1724,27 @@ jobs:
           if [ -n "$MANAGER_RUN_ID" ]; then
             echo "✅ Manager CI run found: ${MANAGER_RUN_ID}"
             echo "MANAGER_RUN_URL=https://github.com/${MANAGER_REPO}/actions/runs/${MANAGER_RUN_ID}" >> "$GITHUB_ENV"
-            # Upstream artifact names are not standardized; priority-ordered probe, release before debug.
+            # Probe only plausible APK bundles: upstream also uploads mappings/ksud/lkm
+            # artifacts that would burn rate-limited download attempts; release before debug.
             ART_ROWS=$(gh api "repos/${MANAGER_REPO}/actions/runs/${MANAGER_RUN_ID}/artifacts?per_page=100" \
-              --jq '[.artifacts[] | select(.expired == false)] | sort_by([(.name | test("manager|release|apk"; "i")) | not, (.name | test("debug"; "i"))]) | .[] | "\(.id) \(.name)"' || true)
+              --jq '[.artifacts[] | select(.expired == false) | select(.name | test("mappings|symbols|ksud|ksuinit|lkm|telegram"; "i") | not)] | sort_by([(.name | test("debug"; "i")), (.name | test("release"; "i")) | not]) | .[] | "\(.id) \(.name)"' || true)
             while read -r aid aname; do
               [ -z "$aid" ] && continue
               [ -s apk-map.tsv ] && break
               ls -1 *.apk 2>/dev/null | sort > /tmp/apks-before.txt || true
-              gh api "repos/${MANAGER_REPO}/actions/artifacts/${aid}/zip" > "${aname}.zip" || true
-              unzip -o -j "${aname}.zip" '*.apk' -d ./ >/dev/null || true
+              dl_ok=0
+              for attempt in 1 2 3; do
+                rm -f "${aname}.zip"
+                if gh api "repos/${MANAGER_REPO}/actions/artifacts/${aid}/zip" > "${aname}.zip" 2>"${aname}.err"; then
+                  [ "$(head -c 2 "${aname}.zip" 2>/dev/null)" = "PK" ] && { dl_ok=1; break; }
+                  echo "::warning::Artifact ${aname}: payload is not a zip archive (attempt ${attempt}/3)"
+                else
+                  echo "::warning::Artifact ${aname}: download failed (attempt ${attempt}/3): $(tail -c 200 "${aname}.err" | tr '\n' ' ')"
+                fi
+                [ "$attempt" -lt 3 ] && sleep 5
+              done
+              rm -f "${aname}.err"
+              [ "$dl_ok" = "1" ] && unzip -o -j "${aname}.zip" '*.apk' -d ./ >/dev/null || true
               rm -f "${aname}.zip"
               ls -1 *.apk 2>/dev/null | sort > /tmp/apks-after.txt || true
               comm -13 /tmp/apks-before.txt /tmp/apks-after.txt | while read -r new_apk; do
@@ -1743,7 +1755,7 @@ jobs:
           fi
 
           if ! ls ./*.apk >/dev/null 2>&1; then
-            echo "::warning::No manager APK from CI run ${MANAGER_RUN_ID:-none matched} (ref kind ${KSU_REF_KIND:-sha}${KSU_REF_NAME:+, branch '${KSU_REF_NAME}'}, sha ${KSU_SHA:0:12}) — falling back to the newest upstream release"
+            echo "::warning::No manager APK from CI run ${MANAGER_RUN_ID:-none matched} (ref kind ${KSU_REF_KIND:-sha}${KSU_REF_NAME:+, branch '${KSU_REF_NAME}'}, sha ${KSU_SHA:0:12}) — falling back to the newest upstream release (release assets can lag the pinned commit)"
             LATEST_TAG="$(gh api "repos/${MANAGER_REPO}/releases?per_page=1" --jq '.[0].tag_name // empty' 2>/dev/null || true)"
             if [ -z "$LATEST_TAG" ]; then
               echo "::error::No manager APK could be fetched from ${MANAGER_REPO} for ${KSU_SHA}"
@@ -2023,14 +2035,26 @@ jobs:
             echo "✅ Manager CI run found: ${MANAGER_RUN_ID}"
             echo "MANAGER_RUN_URL=https://github.com/${MANAGER_REPO}/actions/runs/${MANAGER_RUN_ID}" >> "$GITHUB_ENV"
             mkdir -p /tmp/mgr
-            # Same non-standardized artifact names; priority-ordered probe, release before debug (see fetch-manager-apks).
+            # Probe only plausible APK bundles (skip mappings/ksud/lkm junk); release before debug.
             ART_ROWS=$(gh api "repos/${MANAGER_REPO}/actions/runs/${MANAGER_RUN_ID}/artifacts?per_page=100" \
-              --jq '[.artifacts[] | select(.expired == false)] | sort_by([(.name | test("manager|release|apk"; "i")) | not, (.name | test("debug"; "i"))]) | .[] | "\(.id) \(.name)"' || true)
+              --jq '[.artifacts[] | select(.expired == false) | select(.name | test("mappings|symbols|ksud|ksuinit|lkm|telegram"; "i") | not)] | sort_by([(.name | test("debug"; "i")), (.name | test("release"; "i")) | not]) | .[] | "\(.id) \(.name)"' || true)
             while read -r aid aname; do
               [ -z "$aid" ] && continue
               ls -1 *.apk 2>/dev/null | sort > /tmp/mgr/apks-before.txt || true
-              gh api "repos/${MANAGER_REPO}/actions/artifacts/${aid}/zip" > "/tmp/mgr/${aname}.zip" || true
-              unzip -o -j "/tmp/mgr/${aname}.zip" '*.apk' -d ./ >/dev/null || true
+              dl_ok=0
+              for attempt in 1 2 3; do
+                rm -f "/tmp/mgr/${aname}.zip"
+                if gh api "repos/${MANAGER_REPO}/actions/artifacts/${aid}/zip" > "/tmp/mgr/${aname}.zip" 2>"/tmp/mgr/${aname}.err"; then
+                  [ "$(head -c 2 "/tmp/mgr/${aname}.zip" 2>/dev/null)" = "PK" ] && { dl_ok=1; break; }
+                  echo "::warning::Artifact ${aname}: payload is not a zip archive (attempt ${attempt}/3)"
+                else
+                  echo "::warning::Artifact ${aname}: download failed (attempt ${attempt}/3): $(tail -c 200 "/tmp/mgr/${aname}.err" | tr '\n' ' ')"
+                fi
+                [ "$attempt" -lt 3 ] && sleep 5
+              done
+              rm -f "/tmp/mgr/${aname}.err"
+              [ "$dl_ok" = "1" ] && unzip -o -j "/tmp/mgr/${aname}.zip" '*.apk' -d ./ >/dev/null || true
+              rm -f "/tmp/mgr/${aname}.zip"
               ls -1 *.apk 2>/dev/null | sort > /tmp/mgr/apks-after.txt || true
               comm -13 /tmp/mgr/apks-before.txt /tmp/mgr/apks-after.txt > /tmp/mgr/new.txt
               [ -s /tmp/mgr/new.txt ] && break
@@ -2038,7 +2062,7 @@ jobs:
           fi
 
           if ! ls ./*.apk >/dev/null 2>&1; then
-            echo "::warning::No manager APK from CI run ${MANAGER_RUN_ID:-none matched} (ref kind ${KSU_REF_KIND:-sha}${KSU_REF_NAME:+, branch '${KSU_REF_NAME}'}, sha ${KSU_SHA:0:12}) — falling back to the newest upstream release"
+            echo "::warning::No manager APK from CI run ${MANAGER_RUN_ID:-none matched} (ref kind ${KSU_REF_KIND:-sha}${KSU_REF_NAME:+, branch '${KSU_REF_NAME}'}, sha ${KSU_SHA:0:12}) — falling back to the newest upstream release (release assets can lag the pinned commit)"
             LATEST_TAG="$(gh api "repos/${MANAGER_REPO}/releases?per_page=1" --jq '.[0].tag_name // empty' 2>/dev/null || true)"
             if [ -z "$LATEST_TAG" ]; then
               echo "::error::No manager APK could be fetched from ${MANAGER_REPO} for ${KSU_SHA}"
