@@ -1930,6 +1930,8 @@ runs:
     - name: Apply SUSFS Patches
       shell: bash
       if: ${{ env.OP_SUSFS == 'true' }}
+      env:
+        KSU_TYPE: ${{ inputs.ksu_type }}
       run: |
         set -euo pipefail
         echo "::group::Apply SUSFS patches"
@@ -1956,7 +1958,7 @@ runs:
         
         case "$susfs_version" in
           "v1.5.8")
-            if [ "${{ inputs.ksu_type }}" = "KSU" ]; then
+            if [ "${KSU_TYPE:-}" = "KSU" ]; then
               cd "$KSU_FOLDER"
               source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
               gen_patch susfs-ksu-enable "$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || echo "::warning::[susfs] 10_enable_susfs_for_ksu.patch did not stage cleanly (soft-fail, continuing)"
@@ -1965,7 +1967,7 @@ runs:
             fi
             ;;
           "v1.5.9"|"v1.5.10"|"v1.5.11"|"v1.5.12"|"v2.0.0"|"v2.1.0")
-            if [ "${{ inputs.ksu_type }}" = "KSU" ]; then
+            if [ "${KSU_TYPE:-}" = "KSU" ]; then
               cd "$KSU_FOLDER"
               source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
               gen_patch susfs-ksu-enable "$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
@@ -1980,7 +1982,7 @@ runs:
               susfs_title="$(curl -fsSL --retry 3 --retry-delay 2 "https://gitlab.com/api/v4/projects/simonpunk%2Fsusfs4ksu/repository/commits/${SUSFS_COMMIT_SHA}" 2>/dev/null | grep -o '"title" *: *"[^"]*"' | head -n1 | sed 's/.*"title" *: *"//; s/"$//')" || true
             fi
             echo "SusFS ${susfs_version} | ${susfs_title:-commit title unavailable}"
-            if [ "${{ inputs.ksu_type }}" = "KSUN" ]; then
+            if [ "${KSU_TYPE:-}" = "KSUN" ]; then
               cd "$KSUN_FOLDER"
               susfs_ksun_patch="$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
               filtered_susfs_patch="$(mktemp)"
@@ -2098,7 +2100,7 @@ runs:
                   gen_patch "susfs-fix-${compatibility_patch%.patch}" "$fix_path"
                 fi
               done
-            elif [ "${{ inputs.ksu_type }}" = "KSU" ]; then
+            elif [ "${KSU_TYPE:-}" = "KSU" ]; then
               cd "$KSU_FOLDER"
               susfs_ksu_patch="$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
               filtered_susfs_patch="$(mktemp)"
@@ -2163,7 +2165,7 @@ runs:
               # Keep v3.2.5's existing reboot kprobe for KSU fd installation;
               # the SUSFS dispatch commands remain in the surrounding switch.
               sed -i '/^    if (magic2 == KSU_INSTALL_MAGIC2)$/,+1d' "$dispatch_source"
-            elif [ "${{ inputs.ksu_type }}" = "BakaSU" ]; then
+            elif [ "${KSU_TYPE:-}" = "BakaSU" ]; then
               # Upstream 10_enable targets KSU/KSUN dispatcher layouts, so for
               # BakaSU graft the susfs supercall wiring directly, mirroring
               # upstream susfs commit 97cbbaf (priority uid filter). Gated on
@@ -2367,7 +2369,7 @@ runs:
                 fi
               fi
             else
-              echo "ℹ️ Skipping KernelSU folder patch for ${{ inputs.ksu_type }}"
+              echo "ℹ️ Skipping KernelSU folder patch for ${KSU_TYPE:-}"
             fi
             ;;
         esac

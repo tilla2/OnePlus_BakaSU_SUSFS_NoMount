@@ -1727,11 +1727,12 @@ jobs:
             echo "✅ Manager CI run found: ${MANAGER_RUN_ID}"
             echo "MANAGER_RUN_URL=https://github.com/${MANAGER_REPO}/actions/runs/${MANAGER_RUN_ID}" >> "$GITHUB_ENV"
             # Artifact names are not standardized upstream (FinaSU: "manager",
-            # KSU/KSUN: unversioned bundles) - no name filter: order likely
-            # manager bundles first and probe every live artifact; the unzip
-            # probe self-filters and the loop stops at the first APK found.
+            # KSU/KSUN: unversioned bundles) - no name filter: manager-ish
+            # bundles first, release variants before debug variants, then
+            # probe every live artifact; the unzip probe self-filters and
+            # the loop stops at the first APK found.
             ART_ROWS=$(gh api "repos/${MANAGER_REPO}/actions/runs/${MANAGER_RUN_ID}/artifacts?per_page=100" \
-              --jq '[.artifacts[] | select(.expired == false)] | sort_by((.name | test("manager|release|apk"; "i")) | not) | .[] | "\(.id) \(.name)"' || true)
+              --jq '[.artifacts[] | select(.expired == false)] | sort_by([(.name | test("manager|release|apk"; "i")) | not, (.name | test("debug"; "i"))]) | .[] | "\(.id) \(.name)"' || true)
             while read -r aid aname; do
               [ -z "$aid" ] && continue
               [ -s apk-map.tsv ] && break
@@ -2027,9 +2028,9 @@ jobs:
             echo "MANAGER_RUN_URL=https://github.com/${MANAGER_REPO}/actions/runs/${MANAGER_RUN_ID}" >> "$GITHUB_ENV"
             mkdir -p /tmp/mgr
             # Same non-standardized upstream artifact names - no name filter,
-            # priority-ordered probe (see fetch-manager-apks).
+            # priority-ordered probe, release before debug (see fetch-manager-apks).
             ART_ROWS=$(gh api "repos/${MANAGER_REPO}/actions/runs/${MANAGER_RUN_ID}/artifacts?per_page=100" \
-              --jq '[.artifacts[] | select(.expired == false)] | sort_by((.name | test("manager|release|apk"; "i")) | not) | .[] | "\(.id) \(.name)"' || true)
+              --jq '[.artifacts[] | select(.expired == false)] | sort_by([(.name | test("manager|release|apk"; "i")) | not, (.name | test("debug"; "i"))]) | .[] | "\(.id) \(.name)"' || true)
             while read -r aid aname; do
               [ -z "$aid" ] && continue
               ls -1 *.apk 2>/dev/null | sort > /tmp/mgr/apks-before.txt || true
