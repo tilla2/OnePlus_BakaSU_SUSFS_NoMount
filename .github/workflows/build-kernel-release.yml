@@ -602,11 +602,8 @@ jobs:
           fi
 
           # ── Ref kind for downstream fetchers ──
-          # pin/sha/branch only describe where the ref came from: every kind
-          # has already resolved to the commit the kernel side applies
-          # (ksu_resolved_hash), so the manager fetchers query CI runs by
-          # head_sha only; the latest upstream release is the fallback for
-          # SHAs without a successful manager CI run.
+          # pin/sha/branch describe only the ref's origin; every kind has already resolved to the
+          # kernel-side commit (ksu_resolved_hash), so fetchers query CI by head_sha, release as fallback.
           if [ "${KSU_REF_PIN_APPLIED:-0}" = "1" ]; then
             ksu_ref_kind="pin";    ksu_ref_name=""
           elif [[ "$ksu_ref" =~ ^[0-9a-f]{40}$ ]]; then
@@ -718,9 +715,8 @@ jobs:
             stored_susfs=""
             susfs_src=""
             # ── SUSFS: "same as last successful run" for this GKI/KMI ──
-            # The stored ref only applies when the pin toggle
-            # (pin_last_success=susfs|both) forces it below; otherwise the
-            # per-KMI dispatch input or the branch head is used.
+            # Stored ref applies only when the pin toggle (pin_last_success=susfs|both) forces it below;
+            # otherwise the per-KMI dispatch input or the branch head is used.
             if [ -z "${user_inputs[$key]}" ]; then
               stored_susfs="$(jq -r --arg k "$key" '.susfs[$k] // empty' <<<"$PINS_JSON")"
             fi
@@ -1717,20 +1713,18 @@ jobs:
           KSU_REF_NAME="${KSU_REF_NAME:-}"
           echo "Manager repo: $MANAGER_REPO — resolving commit-exact build for ${KSU_SHA} (ref kind: ${KSU_REF_KIND:-sha})"
 
-          # KSU_SHA is the commit the kernel side applies; only CI runs headed
-          # by that exact commit qualify. The latest upstream release below
-          # remains the fallback for SHAs without a successful CI run.
-          MANAGER_RUN_ID=$(gh api "repos/${MANAGER_REPO}/actions/runs?head_sha=${KSU_SHA}&status=success&per_page=50" \
-            --jq '[.workflow_runs[] | select(.event != "pull_request") | select(.path | test("build-manager(-ci)?\\.yml$"))][0].id // empty' || true)
+          # Only CI runs headed by the kernel-side commit qualify; the release below is the fallback.
+          MANAGER_RUN_ID=""
+          for _ in 1 2; do
+            MANAGER_RUN_ID=$(gh api "repos/${MANAGER_REPO}/actions/runs?head_sha=${KSU_SHA}&status=success&per_page=50" \
+              --jq '[.workflow_runs[] | select(.event != "pull_request") | select(.path | test("build-manager(-ci)?\\.yml$"))][0].id // empty') && break
+            sleep 2
+          done
 
           if [ -n "$MANAGER_RUN_ID" ]; then
             echo "✅ Manager CI run found: ${MANAGER_RUN_ID}"
             echo "MANAGER_RUN_URL=https://github.com/${MANAGER_REPO}/actions/runs/${MANAGER_RUN_ID}" >> "$GITHUB_ENV"
-            # Artifact names are not standardized upstream (FinaSU: "manager",
-            # KSU/KSUN: unversioned bundles) - no name filter: manager-ish
-            # bundles first, release variants before debug variants, then
-            # probe every live artifact; the unzip probe self-filters and
-            # the loop stops at the first APK found.
+            # Upstream artifact names are not standardized; priority-ordered probe, release before debug.
             ART_ROWS=$(gh api "repos/${MANAGER_REPO}/actions/runs/${MANAGER_RUN_ID}/artifacts?per_page=100" \
               --jq '[.artifacts[] | select(.expired == false)] | sort_by([(.name | test("manager|release|apk"; "i")) | not, (.name | test("debug"; "i"))]) | .[] | "\(.id) \(.name)"' || true)
             while read -r aid aname; do
@@ -1749,15 +1743,15 @@ jobs:
           fi
 
           if ! ls ./*.apk >/dev/null 2>&1; then
-            echo "::warning::No live manager CI build matched (ref kind ${KSU_REF_KIND:-sha}${KSU_REF_NAME:+, branch '${KSU_REF_NAME}'}, sha ${KSU_SHA:0:12}) — falling back to the latest upstream release (last resort only)"
-            LATEST_TAG="$(gh api "repos/${MANAGER_REPO}/releases/latest" --jq '.tag_name' 2>/dev/null || true)"
+            echo "::warning::No manager APK from CI run ${MANAGER_RUN_ID:-none matched} (ref kind ${KSU_REF_KIND:-sha}${KSU_REF_NAME:+, branch '${KSU_REF_NAME}'}, sha ${KSU_SHA:0:12}) — falling back to the newest upstream release"
+            LATEST_TAG="$(gh api "repos/${MANAGER_REPO}/releases?per_page=1" --jq '.[0].tag_name // empty' 2>/dev/null || true)"
             if [ -z "$LATEST_TAG" ]; then
               echo "::error::No manager APK could be fetched from ${MANAGER_REPO} for ${KSU_SHA}"
               exit 1
             fi
             echo "MANAGER_RUN_URL=https://github.com/${MANAGER_REPO}/releases/tag/${LATEST_TAG}" >> "$GITHUB_ENV"
-            for asset_url in $(gh api "repos/${MANAGER_REPO}/releases/latest" \
-              --jq '.assets[] | select(.name | endswith(".apk")) | .browser_download_url'); do
+            for asset_url in $(gh api "repos/${MANAGER_REPO}/releases?per_page=1" \
+              --jq '.[0].assets[] | select(.name | endswith(".apk")) | .browser_download_url' 2>/dev/null || true); do
               case "$asset_url" in
                 *release*.apk|*release-*.apk)
                   curl --fail --location --retry 3 --retry-delay 5 -O "$asset_url" || true
@@ -2017,18 +2011,19 @@ jobs:
           KSU_REF_NAME="${KSU_REF_NAME:-}"
           echo "Manager repo: $MANAGER_REPO — resolving commit-exact build for ${KSU_SHA} (ref kind: ${KSU_REF_KIND:-sha})"
 
-          # KSU_SHA is the commit the kernel side applies; only CI runs headed
-          # by that exact commit qualify. The latest upstream release below
-          # remains the fallback for SHAs without a successful CI run.
-          MANAGER_RUN_ID=$(gh api "repos/${MANAGER_REPO}/actions/runs?head_sha=${KSU_SHA}&status=success&per_page=50" \
-            --jq '[.workflow_runs[] | select(.event != "pull_request") | select(.path | test("build-manager(-ci)?\\.yml$"))][0].id // empty' || true)
+          # Only CI runs headed by the kernel-side commit qualify; the release below is the fallback.
+          MANAGER_RUN_ID=""
+          for _ in 1 2; do
+            MANAGER_RUN_ID=$(gh api "repos/${MANAGER_REPO}/actions/runs?head_sha=${KSU_SHA}&status=success&per_page=50" \
+              --jq '[.workflow_runs[] | select(.event != "pull_request") | select(.path | test("build-manager(-ci)?\\.yml$"))][0].id // empty') && break
+            sleep 2
+          done
 
           if [ -n "$MANAGER_RUN_ID" ]; then
             echo "✅ Manager CI run found: ${MANAGER_RUN_ID}"
             echo "MANAGER_RUN_URL=https://github.com/${MANAGER_REPO}/actions/runs/${MANAGER_RUN_ID}" >> "$GITHUB_ENV"
             mkdir -p /tmp/mgr
-            # Same non-standardized upstream artifact names - no name filter,
-            # priority-ordered probe, release before debug (see fetch-manager-apks).
+            # Same non-standardized artifact names; priority-ordered probe, release before debug (see fetch-manager-apks).
             ART_ROWS=$(gh api "repos/${MANAGER_REPO}/actions/runs/${MANAGER_RUN_ID}/artifacts?per_page=100" \
               --jq '[.artifacts[] | select(.expired == false)] | sort_by([(.name | test("manager|release|apk"; "i")) | not, (.name | test("debug"; "i"))]) | .[] | "\(.id) \(.name)"' || true)
             while read -r aid aname; do
@@ -2043,15 +2038,15 @@ jobs:
           fi
 
           if ! ls ./*.apk >/dev/null 2>&1; then
-            echo "::warning::No live manager CI build matched (ref kind ${KSU_REF_KIND:-sha}${KSU_REF_NAME:+, branch '${KSU_REF_NAME}'}, sha ${KSU_SHA:0:12}) — falling back to the latest upstream release (last resort only)"
-            LATEST_TAG="$(gh api "repos/${MANAGER_REPO}/releases/latest" --jq '.tag_name' 2>/dev/null || true)"
+            echo "::warning::No manager APK from CI run ${MANAGER_RUN_ID:-none matched} (ref kind ${KSU_REF_KIND:-sha}${KSU_REF_NAME:+, branch '${KSU_REF_NAME}'}, sha ${KSU_SHA:0:12}) — falling back to the newest upstream release"
+            LATEST_TAG="$(gh api "repos/${MANAGER_REPO}/releases?per_page=1" --jq '.[0].tag_name // empty' 2>/dev/null || true)"
             if [ -z "$LATEST_TAG" ]; then
               echo "::error::No manager APK could be fetched from ${MANAGER_REPO} for ${KSU_SHA}"
               exit 1
             fi
             echo "MANAGER_RUN_URL=https://github.com/${MANAGER_REPO}/releases/tag/${LATEST_TAG}" >> "$GITHUB_ENV"
-            for asset_url in $(gh api "repos/${MANAGER_REPO}/releases/latest" \
-              --jq '.assets[] | select(.name | endswith(".apk")) | .browser_download_url'); do
+            for asset_url in $(gh api "repos/${MANAGER_REPO}/releases?per_page=1" \
+              --jq '.[0].assets[] | select(.name | endswith(".apk")) | .browser_download_url' 2>/dev/null || true); do
               case "$asset_url" in
                 *release*.apk|*release-*.apk) curl --fail --location --retry 3 --retry-delay 5 -O "$asset_url" || true ;;
               esac

@@ -162,12 +162,9 @@ runs:
         PS_BASE="${P_MODEL}_${P_OSVER}"
         echo "PS_BASE=$PS_BASE" >> "$GITHUB_ENV"
         echo "PS_FILE=$GITHUB_WORKSPACE/patch-status-$PS_BASE.txt" >> "$GITHUB_ENV"
-        # Default only when the config omits the key. Do NOT test ${OP_BORE:-} here:
-        # the to_entries export above only lands in LATER steps, so OP_BORE is always
-        # unset in this same step and an unconditional default would clobber a parsed
-        # bore:false (last GITHUB_ENV write wins).
-        # BoRE is experimental: by owner decision it defaults to OFF when the key is missing
-        # (explicit exception to the default-on rule). Re-enable per config with "bore": true.
+        # Default only when the config omits the key: OP_BORE is unset in this same step (the to_entries
+        # export lands in later steps), and an unconditional default would clobber a parsed bore:false.
+        # BoRE defaults OFF (experimental; explicit exception to the default-on rule) - re-enable with "bore": true.
         if ! jq -e 'has("bore")' /tmp/config.json >/dev/null; then
           echo "OP_BORE=false" >> "$GITHUB_ENV"
         fi
@@ -525,11 +522,8 @@ runs:
           ' "$patch_file"
         }
         regen_hunk() {
-          # Exact drift-tolerant hunk regeneration (diff @ generate).
-          # Locates the hunk's core change in the sandbox copy of the live tree by
-          # exact line matching only - no fuzz, no anchor sidecars, no 3-way merge.
-          # Edits the sandbox copy in place; the caller regenerates the final diff
-          # from the sandbox, so the live-tree apply stays fuzz=0.
+          # Drift-tolerant hunk regeneration (diff @ generate): exact line matching only, no fuzz, no anchors.
+          # Edits the sandbox copy; the caller regenerates the diff from it, keeping the live-tree apply fuzz=0.
           # rc: 0 = edited exactly, 2 = change already present, 1 = not placeable.
           local hunk="$1" root="$2" floor="${3:-0}" tgt f src errf tmp_out rc diag
           tgt=$( { grep -m1 -E '^\+\+\+ ' "$hunk" || true; } | awk '{print $2}' | sed 's#^b/##;s#^a/##' )
@@ -1799,10 +1793,8 @@ runs:
       run: |
         set -euo pipefail
         echo "::group::Fetch FinaSU compat suite"
-        # Remote-first, local fallback: track the maintained copies at runtime.
-        # LyraVoid/FinaSU upstream ships no compat scripts; LingLuo's repos do.
-        # OnePlusOSS manifests -> OnePlus_KernelSU_SUSFS set, AOSP-hybrid (gki)
-        # manifests -> AnyKernel3 set; the other repo mirrors as second hop.
+        # Remote-first, local fallback for compat scripts (FinaSU upstream ships none; LingLuo's repos maintain them).
+        # OnePlusOSS manifests -> OnePlus_KernelSU_SUSFS set, AOSP-hybrid (gki) manifests -> AnyKernel3 set.
         COMPAT_DIR="$GITHUB_WORKSPACE/scripts/finasu_compat"
         mkdir -p "$COMPAT_DIR"
         if [[ "${OP_MANIFEST:-}" == *_gki_* ]]; then
@@ -1847,10 +1839,8 @@ runs:
             || { git -C KernelSU fetch origin "$KSU_INPUT" && git -C KernelSU checkout --detach "$KSU_INPUT"; }
         fi
 
-        # FinaSU keeps its UAPI headers at the repo root; the driver reaches them via
-        # include/uapi -> ../../uapi, which only resolves in upstream's M= build layout.
-        # In-tree, drivers/kernelsu addresses KernelSU/kernel, so materialize the root
-        # uapi/ inside the driver dir; fail loudly if upstream moves it.
+        # FinaSU keeps its UAPI headers at the repo root (include/uapi -> ../../uapi resolves only in M= builds);
+        # for in-tree use, materialize root uapi/ inside drivers/kernelsu. Fail loudly if upstream moves it.
         if [ ! -e KernelSU/kernel/uapi/app_profile.h ]; then
           [ -f KernelSU/uapi/app_profile.h ] \
             || { echo "::error::FinaSU uapi headers not found at KernelSU/uapi (upstream layout changed)"; exit 1; }
@@ -1858,9 +1848,8 @@ runs:
           cp KernelSU/uapi/*.h KernelSU/kernel/uapi/
         fi
 
-        # FinaSU ships no setup.sh for in-tree use - wire it manually:
-        # symlink the kernel dir, mount Makefile/Kconfig (trailing-newline guard
-        # for vendor trees whose drivers/Makefile lacks a final newline).
+        # FinaSU ships no setup.sh for in-tree use: symlink the kernel dir, mount Makefile/Kconfig
+        # (trailing-newline guard for vendor trees whose drivers/Makefile lacks a final newline).
         DRIVER_DIR="$COMMON_KERNEL_FOLDER/drivers"
         ln -sfn "$(realpath --relative-to="$DRIVER_DIR" "$KERNEL_PLATFORM_FOLDER/KernelSU/kernel")" "$DRIVER_DIR/kernelsu"
         grep -q "obj-.*CONFIG_KSU.*kernelsu/" "$DRIVER_DIR/Makefile" \
@@ -1871,9 +1860,8 @@ runs:
         CONFIG_KSU=y
         EOF
 
-        # Trust the official FinaSU manager via the second signature slot.
-        # Without it the upstream KernelSU manager hijacks the manager identity
-        # and the FinaSU manager reports "not installed".
+        # Trust the official FinaSU manager via the second signature slot; without it the upstream
+        # KernelSU manager hijacks the manager identity and the FinaSU manager reports "not installed".
         REL_APK="$(mktemp -d)/manager.apk"
         REL_JSON=""
         for ATTEMPT in 1 2 3; do
@@ -2027,9 +2015,8 @@ runs:
                 mv "$tmp_kconfig" ./kernel/Kconfig
               fi
 
-              # The v3.3.0 source omits the dispatcher guard in both x86
-              # blocks and has trailing whitespace in the init guard comment.
-              # Restore the v2.2.0 compatibility patch's exact preimage.
+              # v3.3.0 omits the dispatcher guard in both x86 blocks and has trailing whitespace in the
+              # init guard comment; restore the v2.2.0 compatibility patch's exact preimage.
               init_source=./kernel/core/init.c
               if [ "$(grep -Fxc '#if defined(__x86_64__)' "$init_source")" -ne 2 ]; then
                 echo "::error::Unexpected KernelSU Next v3.3.0 x86 guard layout"
@@ -2048,9 +2035,8 @@ runs:
                   gen_patch "susfs-fix-${compatibility_patch%.patch}" "$KERNEL_PATCHES_FOLDER/next/susfs_fix_patches/$susfs_version/$compatibility_patch"
                 done
               else
-                # WK has no susfs fix set for this version (e.g. v2.3.0).
-                # Bouteillepleine tracks newer susfs releases and additionally
-                # ships fix_dispatch.c.patch, so fall back to that set.
+                # WK has no susfs fix set for this version (e.g. v2.3.0); Bouteillepleine tracks newer
+                # susfs releases and additionally ships fix_dispatch.c.patch, so fall back to that set.
                 susfs_fix_base="https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/next/susfs_fix_patches/${susfs_version}"
                 susfs_fix_dir="$(mktemp -d)"
                 if fetch_patch "$susfs_fix_base/fix_Kbuild.patch" "$susfs_fix_dir/fix_Kbuild.patch"; then
@@ -2166,11 +2152,8 @@ runs:
               # the SUSFS dispatch commands remain in the surrounding switch.
               sed -i '/^    if (magic2 == KSU_INSTALL_MAGIC2)$/,+1d' "$dispatch_source"
             elif [ "${KSU_TYPE:-}" = "BakaSU" ]; then
-              # Upstream 10_enable targets KSU/KSUN dispatcher layouts, so for
-              # BakaSU graft the susfs supercall wiring directly, mirroring
-              # upstream susfs commit 97cbbaf (priority uid filter). Gated on
-              # the staged susfs_def.h declaring the command so older susfs
-              # versions skip cleanly.
+              # 10_enable targets KSU/KSUN dispatcher layouts: for BakaSU graft the susfs supercall wiring
+              # directly (susfs upstream 97cbbaf), gated on the staged susfs_def.h so older susfs skips cleanly.
               susfs_def_h="$COMMON_KERNEL_FOLDER/include/linux/susfs_def.h"
               if ! grep -q 'CMD_SUSFS_SET_PRIORITY_UID_FILTER' "$susfs_def_h" 2>/dev/null; then
                 echo "ℹ️ Staged susfs does not declare CMD_SUSFS_SET_PRIORITY_UID_FILTER; skipping BakaSU dispatcher graft"
@@ -2381,10 +2364,8 @@ runs:
       run: |
         set -euo pipefail
         echo "::group::Apply FinaSU SUSFS integration"
-        # Kernel-side fs/include copies already happened in 'Apply SUSFS Patches'.
-        # This applies the KSU-side 10_enable patch + maintained drift fixes
-        # (two-step git apply with hard verification) to the FinaSU tree and
-        # forces manual-hook mode (inline hook machinery is removed by the patches).
+        # Applies the KSU-side 10_enable patch + drift fixes to the FinaSU tree (fs/include copies already
+        # done in 'Apply SUSFS Patches'); forces manual-hook mode (patches remove the inline hook machinery).
         SUSFS4KSU="$SUSFS_FOLDER" bash "$GITHUB_WORKSPACE/scripts/finasu_compat/apply.sh" "$KSU_FOLDER"
         echo "NEED_HOOKS=false" >> "$GITHUB_ENV"
         echo "susfs-finasu|applied" >> "$PS_FILE"
@@ -2478,9 +2459,8 @@ runs:
         filtered_kernel_patch=""
         if [ "${{ inputs.ksu_type }}" = "KSU" ]; then
           filtered_kernel_patch="$(mktemp)"
-          # Classic KernelSU v3.2.5 already hooks these syscalls through its
-          # syscall table. Drop only the duplicate newer-hook hunks while
-          # retaining the remaining SUSFS kernel integration.
+          # Classic KernelSU v3.2.5 hooks these syscalls via its syscall table: drop only the duplicate
+          # newer-hook hunks, retaining the remaining SUSFS kernel integration.
           awk '
             function flush_hunk() {
               if (hunk == "")
@@ -2524,20 +2504,16 @@ runs:
           ' "$susfs_kernel_patch" > "$filtered_kernel_patch"
           patch_to_apply="$filtered_kernel_patch"
         fi
-        # Stage SUSFS through patchgen (diff & generate), fuzz=0 only. The
-        # SUS_MAP include pre-shim runs only when the patch lacks the block
-        # itself; on gki-android16-6.12 the upstream hunk adds it and a shim
-        # would break that hunk's context.
+        # Stage SUSFS through patchgen (diff & generate), fuzz=0 only. The SUS_MAP include pre-shim runs
+        # only when the patch lacks the block itself (on gki-android16-6.12 the upstream hunk adds it).
         if ! grep -q 'CONFIG_KSU_SUSFS_SUS_MAP' mm/memory.c && grep -q '#include <linux/vmalloc.h>' mm/memory.c \
            && ! grep -q 'CONFIG_KSU_SUSFS_SUS_MAP' "$patch_to_apply"; then
           echo "[patchgen] susfs-main: pre-shimming mm/memory.c SUS_MAP include block (patch lacks it)"
           sed -i '/#include <linux\/vmalloc.h>/a #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n#include <linux\/susfs_def.h>\n#endif \/\/ #ifdef CONFIG_KSU_SUSFS_SUS_MAP' mm/memory.c
         fi
         source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        # susfs-main is redundant (and self-contradictory) when the synced tree
-        # already wires SUSFS into fs/Makefile (pre-integrated community/FinaSU
-        # sources). Nothing earlier in this run wires it: 10_enable_susfs_for_ksu
-        # only touches kernel/*. Skip instead of stacking a second integration.
+        # Skip susfs-main when the synced tree already wires SUSFS into fs/Makefile (pre-integrated sources):
+        # 10_enable_susfs_for_ksu only touches kernel/*, so a second integration would be self-contradictory.
         if grep -qF 'obj-$(CONFIG_KSU_SUSFS) += susfs.o' fs/Makefile; then
           echo "[patchgen] susfs-main: fs/Makefile already wires CONFIG_KSU_SUSFS - skipping susfs-main"
           echo "susfs-main|already" >> "$PS_FILE"
@@ -2582,9 +2558,8 @@ runs:
           fi
         fi
 
-        # Newer SUSFS patches use the VMA padding API in the open-redirect
-        # path. Keep the original vm_end behavior for trees that did not use
-        # that API before patching, including incomplete vendor backports.
+        # Newer SUSFS patches use the VMA padding API in the open-redirect path; keep the original vm_end
+        # behavior for trees that never used that API, including incomplete vendor backports.
         if [ "$had_task_mmu_vma_pad_start" -eq 0 ]; then
           vma_pad_compat_count=$(grep -Fc 'VMA_PAD_START(vma)' ./fs/proc/task_mmu.c || true)
           if [ "$vma_pad_compat_count" -gt 0 ]; then
@@ -2659,13 +2634,9 @@ runs:
         CONFIG_KSU_SUSFS_SUS_MAP=y
         CONFIG_KSU_SUSFS_SUS_SU=n
         EOF
-        # Priority UID filter (susfs upstream 2557ea25/68f62fae): susfs_def.h
-        # carries only the CMD_ supercall id, so the feature gate must match
-        # susfs.h. Declare the symbol in the grafted KSU driver's kernel/Kconfig
-        # when the driver predates it (BakaSU stock block; KSU/KSUN receive it
-        # via the 10_enable graft), then enable it in defconfig. olddefconfig
-        # drops symbols with no declaration, so over-enabling is harmless;
-        # under-enabling breaks the vmlinux link.
+        # Priority UID filter (susfs upstream 2557ea25/68f62fae): susfs_def.h carries only the CMD_ supercall
+        # id, so declare the gate in kernel/Kconfig when the driver predates it (KSU/KSUN get it via the graft).
+        # Over-enabling is harmless (olddefconfig drops undeclared symbols); under-enabling breaks the vmlinux link.
         susfs_h="$COMMON_KERNEL_FOLDER/include/linux/susfs.h"
         if grep -q 'CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER' "$susfs_h" 2>/dev/null; then
           kconfig_declared=0
@@ -2698,9 +2669,8 @@ runs:
           exit 1
         fi
 
-        # pershoot SuSFS/Toolkit coexistence: upstream only ENABLES the uname-spoof
-        # static key, so track the reset and disable the key. Optional: warn+continue
-        # if it can't stage at fuzz=0. Upstream paths carry kernel_patches/ - rewrite to -p1.
+        # pershoot SuSFS/Toolkit coexistence: upstream only ENABLES the uname-spoof static key, so track the
+        # reset and disable it; warn+continue if staging at fuzz=0 fails. Upstream paths are kernel_patches/ - rewrite to -p1.
         pershoot_uname_url="https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/pershoot/susfs4ksu/0002-pershoot-Implement-SuSFS-and-Toolkit-coexistence.patch"
         if fetch_patch "$pershoot_uname_url" /tmp/pershoot_uname_coexistence.patch; then
           gen_patch pershoot-uname-coexistence /tmp/pershoot_uname_coexistence.patch 's|kernel_patches/fs/|fs/|g'
@@ -3412,11 +3382,8 @@ runs:
         echo "::group::Apply WildKernels' optimisations (opt bundle, patchgen staging @ fuzz=0)"
         cd "$COMMON_KERNEL_FOLDER"
         source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        # The opt switch only decides WHETHER the bundle runs, never HOW: every
-        # member still goes through patchgen staging (fuzz=0 or not applied, exact
-        # anchor rescue, post-apply self-verification). gen_patch returns 0 even
-        # when a member can't stage (it writes '<name>|failed' to $PS_FILE), so one
-        # drifted member skips itself instead of aborting the remaining members.
+        # The opt switch decides WHETHER the bundle runs, never HOW: every member goes through patchgen staging
+        # (fuzz=0, anchor rescue, self-verification); a member that can't stage writes '<name>|failed' and skips itself.
         WK_SKIPPED=""
         wk_tally() { # <name>: read the latest status gen_patch recorded
           local st
@@ -3535,9 +3502,8 @@ runs:
         fi
         
         echo "Patching $(basename $NTSYNC_PATCH)!"
-        # Pre-shim: only when this compat patch actually targets lockdep.h,
-        # idempotently add the missing no-op lockdep macros so the hunk lands
-        # at fuzz=0.
+        # Pre-shim: only when this compat patch targets lockdep.h, idempotently add the missing no-op
+        # lockdep macros so the hunk lands at fuzz=0.
         if grep -Eq '^\+\+\+ (a/|b/)?include/linux/lockdep\.h' "$NTSYNC_PATCH" && [ -f include/linux/lockdep.h ]; then
           grep -q '#define lockdep_assert(c)' include/linux/lockdep.h || \
             sed -i '/#define lockdep_is_held_type(l, r)/a\#define lockdep_assert(c)\t\t\tdo { } while (0)' include/linux/lockdep.h
@@ -4173,11 +4139,8 @@ runs:
         cd "$COMMON_KERNEL_FOLDER"
         source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
 
-        # Kernel-side refusal of vendor module loads via
-        # CONFIG_DEBLOAT_VENDOR_MODULES (comma-separated list compiled into the
-        # kernel and checked in blacklisted()). The debloater disables itself
-        # via a static key on non-normal boots (recovery/OTA), so it can never
-        # break non-standard boot paths.
+        # Kernel-side refusal of vendor module loads via CONFIG_DEBLOAT_VENDOR_MODULES (comma-separated list
+        # checked in blacklisted()); a static key disables it on non-normal boots (recovery/OTA).
         RISKY_MODULES=("coresight" "rust_binder" "msm_kgsl" "camera" "oplusboot" "rmnet_wlan" "rmnet_core" "msm_drm" "cnss2" "oplus_chg_v2" "reboot_mode" "rfkill" "bootloader_log")
 
         declare -a modules=()
@@ -4408,11 +4371,9 @@ runs:
         export LD=ld.lld HOSTLD=ld.lld AR=llvm-ar NM=llvm-nm 
         export OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
 
-        # FinaSU's Kbuild computes KSU_KERNEL_DIR := $(srctree)/$(src), which
-        # double-prefixes $(src) in O= in-tree builds and breaks both the -I flags
-        # and the preinit runner.elf prerequisite. The `ifndef KSU_KERNEL_DIR`
-        # guard is an override hook: export the absolute path and every KSU_KERNEL_DIR
-        # use (includes, runner rule, wildcard deps) resolves correctly.
+        # FinaSU's Kbuild computes KSU_KERNEL_DIR := $(srctree)/$(src), double-prefixing $(src) in O= in-tree
+        # builds (breaks -I flags and the runner.elf prerequisite). The `ifndef KSU_KERNEL_DIR` guard is the
+        # override hook: export an absolute path and every KSU_KERNEL_DIR use resolves correctly.
         if [ "${{ inputs.ksu_type }}" = "FinaSU" ] && [ -d "$KERNEL_PLATFORM_FOLDER/KernelSU/kernel" ]; then
           export KSU_KERNEL_DIR="$KERNEL_PLATFORM_FOLDER/KernelSU/kernel"
         fi
@@ -4479,10 +4440,8 @@ runs:
         ccache -s | head -n 20
         echo "============================================"
         
-        # Dedup gki_defconfig before kconfig runs: fragment appends can repeat
-        # symbols already present, and kconfig emits "override: reassigning to
-        # symbol" for each duplicate. Keeping the LAST occurrence of each symbol
-        # is exactly the semantics kconfig applies — without the warning noise.
+        # Dedup gki_defconfig before kconfig runs: fragment appends can repeat symbols and kconfig warns
+        # "override: reassigning to symbol" per duplicate; keeping the LAST occurrence matches kconfig semantics.
         DF="$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig"
         if [ -f "$DF" ]; then
           awk '
@@ -4681,9 +4640,8 @@ runs:
         ccache -c
         
         echo "Perform ccache eviction!"
-        # Evict cache files untouched for 12 hours (0.5 days, safety margin).
-        # ccache records mtime as its timestamp for cross-OS compatibility, so
-        # age-based eviction keys on mtime.
+        # Evict cache files untouched for 12 hours; ccache records mtime as its timestamp for cross-OS
+        # compatibility, so age-based eviction keys on mtime.
         find "$CCACHE_DIR" -type f -mtime +0.5 -delete
         # Remove empty layout subdirectories
         find "$CCACHE_DIR" -type d -empty -delete
@@ -4786,9 +4744,8 @@ runs:
         BUILD_TIME="${BUILD_TIME:-0}"
         
         KERNEL_UNAME_BANNER=$(strings "$IMG" | grep -E 'Linux version.*#' | tail -n1)
-        # Keep only the release string (e.g. 6.12.58-android16-6-g925a103d123c-ab15898589-4k) for
-        # the summary; the full banner (compiler, build user@host, SMP PREEMPT + timestamp) stays in
-        # this log group only.
+        # Keep only the release string (e.g. 6.12.58-android16-6-g925a103d123c-ab15898589-4k) for the summary;
+        # the full banner (compiler, build user@host, SMP PREEMPT + timestamp) stays in this log group only.
         KERNEL_UNAME=$(printf '%s' "$KERNEL_UNAME_BANNER" | sed -e 's/^Linux version //' -e 's/ .*//')
         echo "Kernel Uname (full banner): $KERNEL_UNAME_BANNER"
         echo "Kernel Uname: $KERNEL_UNAME"
