@@ -2256,6 +2256,116 @@ runs:
                   echo "susfs-bakasu-graft|applied" >> "$PS_FILE"
                 fi
               fi
+              if ! grep -q 'CMD_SUSFS_SET_SUS_PATH_UID_FILTER' "$susfs_def_h" 2>/dev/null; then
+                echo "ℹ️ Staged susfs does not declare CMD_SUSFS_SET_SUS_PATH_UID_FILTER; skipping BakaSU sus path filter graft"
+              else
+                graft2_hit=0
+                graft2_applied=0
+                for graft2_source in $(grep -rl 'case CMD_SUSFS_' ./kernel 2>/dev/null || true); do
+                  if grep -q 'CMD_SUSFS_SET_SUS_PATH_UID_FILTER' "$graft2_source"; then
+                    echo "✅ $graft2_source already handles CMD_SUSFS_SET_SUS_PATH_UID_FILTER (upstream synced)"
+                    graft2_hit=1
+                    continue
+                  fi
+                  grep -q 'case CMD_SUSFS_SHOW_VERSION' "$graft2_source" || continue
+                  tmp_dispatch2="$(mktemp)"
+                  if ! awk '
+                    /^    case CMD_SUSFS_SHOW_VERSION:/ { in_show = 1 }
+                    in_show && !done && /^    }$/ {
+                      print
+                      print "    case CMD_SUSFS_SET_SUS_PATH_UID_FILTER: {"
+                      print "        susfs_set_sus_path_uid_filter(arg);"
+                      print "        return 0;"
+                      print "    }"
+                      done = 1
+                      next
+                    }
+                    { print }
+                    END { exit (done ? 0 : 42) }
+                  ' "$graft2_source" > "$tmp_dispatch2"; then
+                    rm -f "$tmp_dispatch2"
+                    continue
+                  fi
+                  mv "$tmp_dispatch2" "$graft2_source"
+                  if ! grep -q '#include <linux/susfs.h>' "$graft2_source"; then
+                    sed -i '0,/^#include <linux\/version.h>$/{s|^#include <linux/version.h>$|#include <linux/version.h>\n#include <linux/susfs.h>|}' "$graft2_source"
+                  fi
+                  if ! grep -q 'case CMD_SUSFS_SET_SUS_PATH_UID_FILTER' "$graft2_source"; then
+                    echo "::error::BakaSU sus path filter graft did not verify in $graft2_source"
+                    exit 1
+                  fi
+                  grep -q '^#include <linux/susfs\.h>$' "$graft2_source" || { echo "::error::susfs.h include missing after sus path graft in $graft2_source"; exit 1; }
+                  echo "✅ Grafted CMD_SUSFS_SET_SUS_PATH_UID_FILTER into $graft2_source"
+                  graft2_hit=1
+                  graft2_applied=1
+                done
+                if [ "$graft2_hit" -ne 1 ]; then
+                  echo "::error::BakaSU dispatcher with susfs cases not found under ./kernel; cannot graft CMD_SUSFS_SET_SUS_PATH_UID_FILTER"
+                  exit 1
+                fi
+                observer_source=./kernel/manager/pkg_observer.c
+                if grep -rq 'susfs_parse_sus_path_app_strings' ./kernel; then
+                  echo "ℹ️ ./kernel renews the sus path uid filter natively; observer hook skipped"
+                elif [ -f "$observer_source" ] && grep -q 'susfs_parse_priority_app_strings' "$observer_source"; then
+                  tmp_observer2="$(mktemp)"
+                  if ! awk '
+                    /susfs_parse_priority_app_strings\(\);/ && !done {
+                      print
+                      print ""
+                      print "    // Renew the sus path uid bitmap filter"
+                      print "    susfs_parse_sus_path_app_strings();"
+                      done = 1
+                      next
+                    }
+                    { print }
+                    END { exit (done ? 0 : 42) }
+                  ' "$observer_source" > "$tmp_observer2"; then
+                    rm -f "$tmp_observer2"
+                    echo "::error::Could not locate priority renewal in $observer_source to anchor sus path renewal"
+                    exit 1
+                  fi
+                  mv "$tmp_observer2" "$observer_source"
+                  if ! grep -q 'susfs_parse_sus_path_app_strings' "$observer_source"; then
+                    echo "::error::BakaSU sus path observer renewal hook did not verify in $observer_source"
+                    exit 1
+                  fi
+                  echo "✅ Hooked susfs_parse_sus_path_app_strings() next to the priority renewal"
+                  graft2_applied=1
+                elif [ -f "$observer_source" ]; then
+                  tmp_observer2="$(mktemp)"
+                  if ! awk '
+                    /^static void ksu_defer_track_throne\(void\)$/ { in_fn = 1 }
+                    in_fn && !done && /^    struct callback_head \*cb;$/ {
+                      print
+                      print ""
+                      print "    // Renew the sus path uid bitmap filter"
+                      print "    susfs_parse_sus_path_app_strings();"
+                      done = 1
+                      next
+                    }
+                    { print }
+                    END { exit (done ? 0 : 42) }
+                  ' "$observer_source" > "$tmp_observer2"; then
+                    rm -f "$tmp_observer2"
+                    echo "::error::Could not locate ksu_defer_track_throne() body in $observer_source"
+                    exit 1
+                  fi
+                  mv "$tmp_observer2" "$observer_source"
+                  if ! grep -q '#include <linux/susfs.h>' "$observer_source"; then
+                    sed -i '0,/^#include <linux\/version.h>$/{s|^#include <linux/version.h>$|#include <linux/version.h>\n#include <linux/susfs.h>|}' "$observer_source"
+                  fi
+                  if ! grep -q 'susfs_parse_sus_path_app_strings' "$observer_source"; then
+                    echo "::error::BakaSU sus path observer renewal hook did not verify in $observer_source"
+                    exit 1
+                  fi
+                  grep -q '^#include <linux/susfs\.h>$' "$observer_source" || { echo "::error::susfs.h include missing after sus path observer hook in $observer_source"; exit 1; }
+                  echo "✅ Hooked susfs_parse_sus_path_app_strings() into ksu_defer_track_throne()"
+                  graft2_applied=1
+                fi
+                if [ "$graft2_applied" -eq 1 ]; then
+                  echo "susfs-bakasu-graft-suspath|applied" >> "$PS_FILE"
+                fi
+              fi
             else
               echo "ℹ️ Skipping KernelSU folder patch for ${{ inputs.ksu_type }}"
             fi
