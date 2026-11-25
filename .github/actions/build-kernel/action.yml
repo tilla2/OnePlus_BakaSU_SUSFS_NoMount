@@ -742,8 +742,121 @@ runs:
           echo "${diag:-not placeable}"
           return 1
         }
+        regen_hunk_refit() {
+          # Curated-anchor refit for add-only hunks regen_hunk cannot place (e.g.
+          # attribute-prefixed function headers its line-start finder cannot see).
+          # Locates the hinted function with a top-level brace-depth scan, requires
+          # the anchor ERE to match exactly one trimmed line inside that scope, and
+          # inserts the + lines after it, transferring the anchor's indentation.
+          # Sandbox-only; the live-tree apply stays fuzz=0.
+          # rc: 0 = refit-staged, 2 = change already present, 1 = not placeable.
+          local hunk="$1" root="$2" floor="${3:-0}" anchor_re="$4" tgt f src
+          [ -n "$anchor_re" ] || { echo "refit: empty anchor"; return 1; }
+          tgt=$( { grep -m1 -E '^\+\+\+ ' "$hunk" || true; } | awk '{print $2}' | sed 's#^b/##;s#^a/##' )
+          if [ -z "$tgt" ] || [ "$tgt" = "/dev/null" ]; then
+            echo "refit: hunk has no file target"
+            return 1
+          fi
+          f="$root/$tgt"
+          if [ ! -f "$f" ]; then
+            echo "refit: target missing from sandbox: $tgt"
+            return 1
+          fi
+          if grep -q -- '^-[^-]' "$hunk"; then
+            echo "refit: hunk is not add-only; refusing to refit"
+            return 1
+          fi
+          errf=$(mktemp); tmp_out=$(mktemp); rc=0
+          awk -v are="$anchor_re" -v floor="$floor" '
+            function fail2(msg) { printf "FAIL %s\n", msg > "/dev/stderr"; exit 1 }
+            function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+            function leadws(s,   r) { r = s; sub(/[^ \t].*$/, "", r); return r }
+            FNR == NR {
+              if (!inh) { if ($0 ~ /^@@ /) { inh = 1; hint = $0; sub(/^@@[^@]*@@[ \t]?/, "", hint); sub(/[ \t]+$/, "", hint) }; next }
+              if ($0 ~ /^\\/) { noeno = 1; next }
+              b[++nb] = $0
+              next
+            }
+            { fl[++n] = $0 }
+            END {
+              if (noeno) fail2("no-newline marker in hunk; not refitting")
+              fnname = ""
+              if (match(hint, /[A-Za-z_][A-Za-z_0-9]*[ \t]*\(/)) fnname = substr(hint, RSTART, RLENGTH)
+              sub(/[ \t]*\($/, "", fnname)
+              if (fnname == "") fail2("refit: no function name in hunk hint")
+              depth = 0
+              for (i = 1; i <= n; i++) {
+                t = fl[i]
+                if (fnlo == 0 && depth == 0 && t !~ /^[ \t]*#/ && t !~ /;[ \t]*$/ && t ~ fnname "[ \t]*\\(") fnlo = i
+                ob = gsub(/{/, "{", t); cb = gsub(/}/, "}", t)
+                depth += ob - cb
+              }
+              if (fnlo == 0) fail2("refit: function " fnname "() not found at top level")
+              depth = 0; seen = 0; fnhi = 0
+              for (j = fnlo; j <= n; j++) {
+                t = fl[j]
+                ob = gsub(/{/, "{", t); cb = gsub(/}/, "}", t)
+                if (t ~ /{/) seen = 1
+                depth += ob - cb
+                if (seen && depth <= 0) { fnhi = j; break }
+                if (depth < 0) break
+              }
+              if (fnhi <= fnlo) fail2("refit: cannot bracket " fnname "() body")
+              for (i = 1; i <= nb; i++) {
+                c = substr(b[i], 1, 1)
+                if (c == "-") fail2("refit: removal line in hunk; refusing")
+                if (c == "+") add[++nadd] = substr(b[i], 2)
+              }
+              if (nadd == 0) fail2("refit: hunk adds nothing")
+              nm = 0; apos = 0
+              for (i = fnlo + 1; i < fnhi; i++) {
+                if (trim(fl[i]) ~ are) { nm++; apos = i }
+              }
+              if (nm == 0) fail2("refit: anchor not found in " fnname "()")
+              if (nm > 1) fail2("refit: anchor matches " nm " lines in " fnname "(); ambiguous")
+              for (j = fnlo + 1; j + nadd - 1 < fnhi; j++) {
+                ok2 = 1
+                for (m = 1; m <= nadd; m++) if (trim(fl[j + m - 1]) != trim(add[m])) { ok2 = 0; break }
+                if (ok2) { printf "ALREADY\n" > "/dev/stderr"; exit 2 }
+              }
+              if (floor > 0 && apos < floor) fail2("refit: anchor at line " apos " is before POS floor " floor)
+              bws = leadws(fl[apos])
+              minws = -1
+              for (m = 1; m <= nadd; m++) {
+                if (trim(add[m]) == "") continue
+                lws = length(leadws(add[m]))
+                if (minws < 0 || lws < minws) minws = lws
+              }
+              if (minws < 0) minws = 0
+              for (i = 1; i <= apos; i++) print fl[i]
+              for (m = 1; m <= nadd; m++) {
+                if (trim(add[m]) == "") { print ""; continue }
+                lws = leadws(add[m])
+                pad = (length(lws) >= minws) ? bws substr(lws, minws + 1) : bws
+                print pad trim(add[m])
+              }
+              for (i = apos + 1; i <= n; i++) print fl[i]
+              printf "refit: inserted %d line(s) after line %d (anchor in %s()) POS %d\n", nadd, apos, fnname, apos + nadd > "/dev/stderr"
+              exit 0
+            }
+          ' "$hunk" "$f" > "$tmp_out" 2> "$errf" || rc=$?
+          diag=$(paste -sd ';' "$errf" 2>/dev/null || true)
+          rm -f "$errf"
+          if [ "$rc" = "0" ]; then
+            cat "$tmp_out" > "$f"; rm -f "$tmp_out"
+            echo "${diag:-refit staged}"
+            return 0
+          elif [ "$rc" = "2" ]; then
+            rm -f "$tmp_out"
+            echo "${diag:-already present (refit)}"
+            return 2
+          fi
+          rm -f "$tmp_out"
+          echo "${diag:-refit: not placeable}"
+          return 1
+        }
         gen_patch() {
-          local name="$1" patch_file="$2" sed_expr="${3:-}" verify_spec="${4:-}"
+          local name="$1" patch_file="$2" sed_expr="${3:-}" verify_spec="${4:-}" refit_spec="${5:-}"
           local base="$GITHUB_WORKSPACE/patchgen/${name}"
           local um="${base}/unmodified" md="${base}/modified"
           local psf="${PS_FILE:-patch-status-raw.txt}"
@@ -763,8 +876,21 @@ runs:
             mkdir -p "${um}/$(dirname "$f")" "${md}/$(dirname "$f")"
             cp "$f" "${um}/$f" && cp "$f" "${md}/$f"
           done
-          local hunk_dir="${base}/hunks" h hlist staged already_ct failed_ct failed_list htarget verdict rcv floor_pos
+          local hunk_dir="${base}/hunks" h hlist staged already_ct failed_ct failed_list htarget verdict rcv floor_pos hkey refit_re rcv2
           local -A hpos=()
+          local -A refit_for=()
+          if [ -n "$refit_spec" ]; then
+            local rspec
+            local -a rlist
+            IFS=';' read -ra rlist <<< "$refit_spec"
+            for rspec in "${rlist[@]}"; do
+              [ -n "$rspec" ] || continue
+              case "$rspec" in
+                *\|*) refit_for["${rspec%%|*}"]="${rspec#*|}" ;;
+                *) echo "::warning::[patchgen] ${name}: malformed refit spec '${rspec}' (want file|regex); ignoring" ;;
+              esac
+            done
+          fi
           mkdir -p "$hunk_dir"
           split_hunks "$src" "$hunk_dir"
           hlist=$(ls "$hunk_dir"/*.hunk 2>/dev/null || true)
@@ -810,6 +936,25 @@ runs:
                   echo "hunk ${h##*/} already in tree: ${verdict}" >> "${base}/stage.log"
                   echo "[patchgen] ${name}: SKIP ${h##*/} (${htarget:-?}): already in tree"
                 else
+                  hkey="${htarget#a/}"; hkey="${hkey#b/}"
+                  refit_re="${refit_for[$hkey]:-}"
+                  if [ -n "$refit_re" ]; then
+                    rcv2=0
+                    verdict=$(regen_hunk_refit "$h" "$md" "$floor_pos" "$refit_re") || rcv2=$?
+                    if [ "$rcv2" = "0" ]; then
+                      staged=$((staged+1))
+                      floor_pos=$(printf '%s' "$verdict" | { grep -o 'POS [0-9]*' || true; } | tail -1 | awk '{print $2}')
+                      [ -n "$floor_pos" ] && hpos["$htarget"]="$floor_pos"
+                      echo "hunk ${h##*/} refit-staged: ${verdict}" >> "${base}/stage.log"
+                      echo "[patchgen] ${name}: REFIT ${h##*/} (${htarget:-?}): ${verdict}"
+                      continue
+                    elif [ "$rcv2" = "2" ]; then
+                      already_ct=$((already_ct+1))
+                      echo "hunk ${h##*/} already in tree (refit): ${verdict}" >> "${base}/stage.log"
+                      echo "[patchgen] ${name}: SKIP ${h##*/} (${htarget:-?}): already in tree (refit)"
+                      continue
+                    fi
+                  fi
                   if grep -qxF "${name}|${h##*/}" "$GITHUB_WORKSPACE/patchgen/expected-rejects.txt" 2>/dev/null; then
                     expected_ct=$((expected_ct+1))
                     echo "hunk ${h##*/} expected-reject (ledger): ${verdict}" >> "${base}/stage.log"
@@ -3946,7 +4091,9 @@ runs:
         echo "Hide ADB/JDWP Sockets (SusFS)"
         cd "$COMMON_KERNEL_FOLDER"
         source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        gen_patch hide-adb-jdwp "$KERNEL_PATCHES_FOLDER/common/hide_adb_jdwp_sockets.patch" "" "g:net/unix/af_unix.c|susfs_is_hidden_adb_jdwp_addr"
+        gen_patch hide-adb-jdwp "$KERNEL_PATCHES_FOLDER/common/hide_adb_jdwp_sockets.patch" "" \
+          "g:net/unix/af_unix.c|susfs_is_hidden_adb_jdwp_addr;g:fs/susfs.c|d_u\.d_alias" \
+          "fs/susfs.c|struct fuse_inode [*]fi = NULL;"
         if ! grep -Eq '^hide-adb-jdwp\|(applied|already)' "$PS_FILE" 2>/dev/null; then
           echo "::error::hide_adb_jdwp_sockets patch failed to stage at fuzz=0 (see patch-faillogs)"
           exit 1
@@ -4287,7 +4434,10 @@ runs:
       uses: actions/upload-artifact@v7
       with:
         name: patch-faillogs-${{ env.PS_BASE }}
-        path: ${{ github.workspace }}/patch-faillogs/
+        path: |
+          ${{ github.workspace }}/patch-faillogs/
+          ${{ github.workspace }}/kernel_workspace/**/*.rej
+          ${{ github.workspace }}/*.rej
         if-no-files-found: ignore
         retention-days: 7
 
