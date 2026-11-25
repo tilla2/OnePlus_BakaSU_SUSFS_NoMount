@@ -801,6 +801,7 @@ jobs:
           REPO = os.environ["GITHUB_REPOSITORY"]
           TARGET_BRANCH = os.environ["TARGET_BRANCH"]
           drift = []
+          ok = []
           notes = []
 
           def api(url):
@@ -881,6 +882,29 @@ jobs:
               print("INFO: pin store empty/missing - no successful build has "
                     "recorded pins yet; skipping watch")
               raise SystemExit(0)
+          
+          # -- Watch state: the heads this job observed on its previous run
+          # (uploaded as the watch-pins-state artifact). Entries the build
+          # pin store says nothing about get baselined from here, so drift
+          # checking starts the run after the first sighting instead of
+          # waiting for the next green build to pin them. --
+          prev_state, new_state = {}, {}
+          try:
+              sarts = api("https://api.github.com/repos/"
+                          f"{REPO}/actions/artifacts"
+                          "?name=watch-pins-state&per_page=100").get("artifacts", [])
+              slive = [a for a in sarts if not a.get("expired")]
+              if slive:
+                  sid = max(slive, key=lambda x: x["id"])["id"]
+                  sdata = subprocess.run(
+                      ["gh", "api", f"repos/{REPO}/actions/artifacts/{sid}/zip"],
+                      capture_output=True).stdout
+                  if sdata[:2] == b"PK":
+                      zf = zipfile.ZipFile(io.BytesIO(sdata))
+                      sdata = zf.read(zf.namelist()[0])
+                  prev_state = json.loads(sdata.decode())
+          except Exception as e:
+              print(f"WARN: could not load watch state: {e}")
 
           def repo_state(repo, ref="HEAD"):
               d = with_retries(lambda: api(
@@ -898,77 +922,99 @@ jobs:
               except Exception:
                   return True  # cannot prove still-current -> report, don't hide
 
-          # -- kernel_patches repos (BP & WD) vs the heads recorded at build time --
+          # -- kernel_patches repos (BP & WD) vs the heads recorded at build
+          # time; entries the store says nothing about are baselined at the
+          # last head this job observed (watch state), so drift checking
+          # starts the run after the first sighting instead of waiting for
+          # the next green build --
           for label, repo, key in (
                   ("BP kernel_patches", os.environ["BP_PATCHES_REPO"],
                    "bp_patches_head"),
                   ("WD kernel_patches", os.environ["WD_PATCHES_REPO"],
                    "wd_patches_head")):
-              pinned = pins.get(key, "")
-              if not pinned:
-                  notes.append(
-                      f"- INFO **{label}**: no head recorded by the last "
-                      "successful build (older pin store) - drift check "
-                      "resumes after the next green build")
-                  continue
+              base, src_key = pins.get(key, ""), "pinned"
+              if not base:
+                  prev = prev_state.get(key) or {}
+                  if prev.get("head"):
+                      base, src_key = prev["head"], "watch baseline"
               try:
                   head, date = repo_state(repo)
               except Exception as e:
                   notes.append(f"- WARN **{label}**: head lookup failed ({e})")
                   continue
-              if head != pinned and advanced(repo, pinned, head):
-                  drift.append(
-                      f"- **{label}** drift: pinned `{pinned}` but upstream "
-                      f"head is `{head}` ({date})")
-              elif head != pinned:
+              new_state[key] = {"head": head, "date": date}
+              if not base:
                   notes.append(
-                      f"- INFO **{label}**: pinned `{pinned}` is ahead of "
-                      f"branch head `{head}` - left as is")
+                      f"- INFO **{label}**: no pin recorded by the last "
+                      f"successful build - recorded at head `{head}` ({date}); "
+                      "drift check starts with the next run")
+                  continue
+              if head != base and advanced(repo, base, head):
+                  drift.append(
+                      f"- **{label}** drift: {src_key} `{base}` but upstream "
+                      f"head is `{head}` ({date})")
+              elif head != base:
+                  notes.append(
+                      f"- INFO **{label}**: {src_key} `{base}` is ahead of "
+                      f"branch head `{head}` ({date}) - left as is")
+              else:
+                  ok.append(
+                      f"- OK **{label}**: no drift - head `{head}` ({date})")
 
-          # -- NoMount: pinned commit vs dev AND main heads --
+          # -- NoMount: pinned commit vs dev AND master heads --
           nm_repo = os.environ["NOMOUNT_REPO"]
           nm_pinned = pins.get("nomount_commit", "")
-          if not nm_pinned:
-              notes.append(
-                  "- INFO **NoMount**: no commit recorded by the last "
-                  "successful build (FinaSU builds embed NoMount in ksud)")
-          else:
-              for branch in ("dev", "master"):
-                  try:
-                      head, date = repo_state(nm_repo, branch)
-                  except Exception as e:
-                      notes.append(f"- WARN **NoMount/{branch}**: head lookup "
-                                   f"failed ({e})")
-                      continue
-                  if head != nm_pinned and advanced(nm_repo, nm_pinned, head):
-                      drift.append(
-                          f"- **NoMount ({branch})** drift: pinned "
-                          f"`{nm_pinned}` but `{branch}` head is `{head}` ({date})")
-
-          # -- susfs4ksu: every GKI/KMI branch held in the pin store,
-          # unioned with the KMIs our own configs declare - the store only
-          # carries KMIs built by the last green run, so the union keeps
-          # susfs movement visible between builds (drift checking starts
-          # for a KMI as soon as the next green build pins it) --
-          kmi_seen = set()
-          for p in subprocess.run(["git", "ls-files", "configs/"],
-                                  capture_output=True,
-                                  text=True).stdout.split():
-              if not p.endswith(".json"):
-                  continue
+          for branch in ("dev", "master"):
+              key = f"nomount_{branch}"
+              base, src_key = nm_pinned, "pinned"
+              if not base:
+                  prev = prev_state.get(key) or {}
+                  if prev.get("head"):
+                      base, src_key = prev["head"], "watch baseline"
               try:
-                  c = json.load(open(p))
-              except Exception:
+                  head, date = repo_state(nm_repo, branch)
+              except Exception as e:
+                  notes.append(
+                      f"- WARN **NoMount/{branch}**: head lookup failed ({e})")
                   continue
-              av = str(c.get("android_version", ""))
-              kv = str(c.get("kernel_version", ""))
-              if (av.startswith("android") and av[len("android"):].isdigit()
-                      and kv.count(".") == 1
-                      and kv.replace(".", "").isdigit()):
-                  kmi_seen.add(f"{av}-{kv}")
-          for kmi in sorted(set(pins.get("susfs", {})) | kmi_seen):
-              pinned = pins.get("susfs", {}).get(kmi, "")
+              new_state[key] = {"head": head, "date": date}
+              if not base:
+                  notes.append(
+                      f"- INFO **NoMount/{branch}**: no commit recorded by the "
+                      f"last successful build - recorded at head `{head}` "
+                      f"({date}); drift check starts with the next run")
+                  continue
+              if head != base and advanced(nm_repo, base, head):
+                  drift.append(
+                      f"- **NoMount ({branch})** drift: {src_key} `{base}` "
+                      f"but `{branch}` head is `{head}` ({date})")
+              elif head != base:
+                  notes.append(
+                      f"- INFO **NoMount/{branch}**: {src_key} `{base}` is "
+                      f"ahead of `{branch}` head `{head}` ({date}) - left as is")
+              else:
+                  ok.append(
+                      f"- OK **NoMount/{branch}**: no drift - "
+                      f"head `{head}` ({date})")
+
+          # -- susfs4ksu: the canonical GKI/KMI branch set - every kernel
+          # version pairs with exactly one android level upstream
+          # (5.10->android12, 5.15->android13, 6.1->android14,
+          # 6.6->android15, 6.12->android16). Configs are NOT consulted:
+          # our a16 tree carries 5.15/6.1/6.6 devices and the
+          # android16-{5.15,6.1,6.6} cross products are not real susfs
+          # branches - they only produced duplicate failed lookups. Store
+          # keys outside the canonical set are ignored for the same reason. --
+          SUSFS_KMIS = ["android12-5.10", "android13-5.15", "android14-6.1",
+                        "android15-6.6", "android16-6.12"]
+          for kmi in SUSFS_KMIS:
+              key = f"susfs/{kmi}"
               branch = f"gki-{kmi}"
+              base, src_key = pins.get("susfs", {}).get(kmi, ""), "pinned"
+              if not base:
+                  prev = prev_state.get(key) or {}
+                  if prev.get("head"):
+                      base, src_key = prev["head"], "watch baseline"
               try:
                   c = with_retries(lambda: gitlab_api(
                       "https://gitlab.com/api/v4/projects/simonpunk%2Fsusfs4ksu"
@@ -977,32 +1023,44 @@ jobs:
                   if not (isinstance(c, list) and c):
                       raise RuntimeError(f"no commits for ref {branch}")
                   head, date = c[0]["id"], c[0]["committed_date"]
-                  if not pinned:
-                      notes.append(
-                          f"- INFO **susfs4ksu/{branch}**: head `{head}` "
-                          f"({date}) - no pin recorded by the last "
-                          "successful build yet; drift check resumes "
-                          "after the next green build")
-                      continue
-                  if head != pinned:
-                      moved = True
-                      try:
-                          cmp_ = with_retries(lambda: gitlab_api(
-                              "https://gitlab.com/api/v4/projects/"
-                              "simonpunk%2Fsusfs4ksu/repository/compare"
-                              f"?from={pinned}&to={head}"))
-                          moved = bool(cmp_.get("commits"))
-                      except Exception:
-                          pass
-                      if moved:
-                          drift.append(
-                              f"- **susfs4ksu/{branch}** drift: pinned "
-                              f"`{pinned}` but upstream head is `{head}` ({date})")
               except Exception as e:
                   notes.append(
                       f"- WARN **susfs4ksu/{branch}**: lookup failed ({e})")
+                  continue
+              new_state[key] = {"head": head, "date": date}
+              if not base:
+                  notes.append(
+                      f"- INFO **susfs4ksu/{branch}**: no pin recorded by the "
+                      f"last successful build - recorded at head `{head}` "
+                      f"({date}); drift check starts with the next run")
+                  continue
+              if head != base:
+                  moved = True
+                  try:
+                      cmp_ = with_retries(lambda: gitlab_api(
+                          "https://gitlab.com/api/v4/projects/"
+                          "simonpunk%2Fsusfs4ksu/repository/compare"
+                          f"?from={base}&to={head}"))
+                      moved = bool(cmp_.get("commits"))
+                  except Exception:
+                      pass
+                  if moved:
+                      drift.append(
+                          f"- **susfs4ksu/{branch}** drift: {src_key} "
+                          f"`{base}` but upstream head is `{head}` ({date})")
+                  else:
+                      ok.append(
+                          f"- OK **susfs4ksu/{branch}**: no drift - head "
+                          f"`{head}` ({date}) (baseline tree unchanged)")
+              else:
+                  ok.append(
+                      f"- OK **susfs4ksu/{branch}**: no drift - head "
+                      f"`{head}` ({date})")
 
-          lines = drift + notes or [
+          if new_state:
+              with open("watch-pins-state.json", "w") as f:
+                  json.dump(new_state, f, indent=2, sort_keys=True)
+          lines = (drift + ok + notes) or [
               "- OK No drift - every watched ref matches the last successful build."]
           body = ("### Upstream pin watch\n\n"
                   "Compared against last successful **build-kernel-release** run on branch `"
@@ -1012,8 +1070,11 @@ jobs:
                      else "(anchor lookup failed this run)") + "\n\n"
                   + "\n".join(lines)
                   + "\n\n_Watched: BP kernel_patches, WD kernel_patches, "
-                    "NoMount (dev + master), susfs4ksu (every GKI/KMI branch "
-                    "in the pin store or declared by our configs)._")
+                    "NoMount (dev + master), susfs4ksu (gki-android12-5.10, "
+                    "gki-android13-5.15, gki-android14-6.1, gki-android15-6.6, "
+                    "gki-android16-6.12). Entries without a build pin are "
+                    "recorded at the current head (watch-pins-state artifact) "
+                    "and drift-checked from the next run onward._")
 
           title = "upstream-sync-monitor: susfs / kernel_patches pin drift"
           found = gh("issue", "list", "--state", "open",
@@ -1054,6 +1115,14 @@ jobs:
               print("No drift, no open issue - nothing to do")
           print(body)
           PYEOF
+      - name: Keep watch baselines for entries without build pins
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: watch-pins-state
+          path: watch-pins-state.json
+          retention-days: 7
+          if-no-files-found: ignore
   cleanup-branch:
     runs-on: ubuntu-latest
     if: >-
