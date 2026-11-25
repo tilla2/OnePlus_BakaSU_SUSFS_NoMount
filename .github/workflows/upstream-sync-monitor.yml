@@ -573,6 +573,15 @@ jobs:
               with urllib.request.urlopen(req) as r:
                   return json.load(r)
 
+          # GitLab validates any Authorization header it receives and
+          # rejects foreign tokens with 401 - it must be called WITHOUT
+          # the GitHub bearer stamped on (that is what red-lined the job)
+          def gitlab_api(url):
+              req = urllib.request.Request(url, headers={
+                  "User-Agent": "upstream-sync-monitor"})
+              with urllib.request.urlopen(req) as r:
+                  return json.load(r)
+
           # transient 429/5xx on the remotes must not red the nightly run
           def with_retries(fn, tries=3, delay=5.0):
               for attempt in range(tries):
@@ -591,9 +600,10 @@ jobs:
               f"{os.environ['WD_PATCHES_REPO']}/commits/HEAD"))["sha"]
           # simonpunk/susfs4ksu @ the ref the build's DEFAULT_SUSFS pins;
           # the previous project path was a nonexistent repo (404)
-          sus_list = with_retries(lambda: api(
+          sus_list = with_retries(lambda: gitlab_api(
               "https://gitlab.com/api/v4/projects/simonpunk%2Fsusfs4ksu"
-              "/repository/commits?ref_name=gki-android16-6.12&per_page=1"))
+              "/repository/commits?ref_name=gki-android16-6.12&per_page=1"),
+              tries=4, delay=10.0)
           if not (isinstance(sus_list, list) and sus_list):
               raise RuntimeError("susfs4ksu gitlab: no commits for "
                                  "ref gki-android16-6.12")
