@@ -151,6 +151,9 @@ on:
         default: none
         options:
           - none
+          - Myron
+          - Myron-OSS-6.12.81
+          - Myron-parity
           - OP-ACE-2
           - OP-ACE-2-PRO
           - OP-ACE-2V
@@ -173,13 +176,18 @@ on:
           - OP-ACE-6-ULTRA
           - OP-ACE-6T
           - OP-N6
+          - OP-N6-5.15.180
+          - OP-N6-5.15.197
           - OP-N6X
           - OP-NORD-3
           - OP-NORD-4
           - OP-NORD-4-6.1.118
+          - OP-NORD-4-6.1.141
+          - OP-NORD-4-6.1.157
           - OP-NORD-4-CE
           - OP-NORD-5
           - OP-NORD-5-6.1.118
+          - OP-NORD-5-6.1.141
           - OP-NORD-6
           - OP-NORD-CE-5
           - OP-NORD-CE-5-6.1.134
@@ -193,6 +201,7 @@ on:
           - OP-PAD-2-PRO
           - OP-PAD-2-PRO-6.6.89
           - OP-PAD-2-SM8650
+          - OP-PAD-2-SM8650-6.1.118
           - OP-PAD-3-MT6897
           - OP-PAD-3-PRO
           - OP-PAD-3-SM8750
@@ -206,31 +215,34 @@ on:
           - OP-TURBO-6V
           - OP-TURBO-6V-6.1.118
           - OP-TURBO-6X
+          - OP-TURBO-6X-6.1.134
           - OP10pro
           - OP11
           - OP11-5.15.167
+          - OP11-5.15.180
           - OP11r
           - OP12
           - OP12-6.1.118
           - OP12r
           - OP12r-5.15.167
+          - OP12r-5.15.180
           - OP13
           - OP13-6.6.89
           - OP13S
+          - OP13S-6.6.89
           - OP13T
           - OP13T-6.6.89
           - OP13r
           - OP13r-6.1.118
+          - OP13r-6.1.141
           - OP15
+          - OP15-6.12.23
           - OP15-6.12.58
           - OP15-6.12.69
           - OP15-6.12.81
           - OP15-6.12.92
           - OP15T
           - OP15r
-          - Myron
-          - Myron-OSS-6.12.81
-          - Myron-parity
       config_paths:
         description: 'Optional extra device config path(s) for multi-device builds — comma, semicolon or space separated, e.g. a16/OP15.json, a15/OP13.json (full configs/… paths also accepted, .json optional). Deduplicated and combined with the device menus'
         required: false
