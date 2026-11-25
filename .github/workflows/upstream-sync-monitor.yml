@@ -44,6 +44,7 @@ env:
   WD_PATCHES_REPO: WildKernels/kernel_patches
   AK_REMOTE_URL: https://github.com/huangdihd
   AK_PROJECT: <project remote="wild" name="AnyKernel3" path="AnyKernel3" revision="gki-2.0"/>
+  NOMOUNT_REPO: maxsteeel/nomount
   SYNC_BRANCH: upstream-sync/auto
 
 jobs:
@@ -401,6 +402,47 @@ jobs:
               added_cfg.append(ours_path
                                + (f" [{'; '.join(notes)}]" if notes else ""))
 
+          # pass 2c: standardise EVERY local config that has no upstream
+          # counterpart to the current template - canonical key order,
+          # missing policy keys filled from fleet policy, unknown keys
+          # preserved, existing device values never touched (locally-added
+          # configs like the Myron pair have no upstream to sync from).
+          std_cfg = []
+          for andir, cfg_name in sorted(our_cfg_set
+                                        - (set(wd_cfgs) | set(bp_cfgs))):
+              ours_path = f"configs/{andir}/{cfg_name}"
+              cfg = json.load(open(ours_path))
+              missing = [k for k in TEMPLATE if k not in cfg]
+              filled = []
+              for k in missing:
+                  if k in FORCED:
+                      v = FORCED[k]
+                  elif k in DEFAULT_TRUE:
+                      v = True
+                  elif k in TOOLCHAIN_DEFAULTS or k in MISC_KEYS:
+                      v = ""
+                  elif k == "lto":
+                      v = "none"
+                  elif k == "hmbird":
+                      v = False
+                  elif k == "blacklist_apply":
+                      v = True
+                  elif k == "root_tag":
+                      v = "ChimeraKernel"
+                  else:
+                      v = ""
+                  cfg[k] = v
+                  filled.append(f"{k}={v}")
+              extras = {k: cfg[k] for k in cfg if k not in TEMPLATE}
+              rekeyed = order_config(cfg)
+              rekeyed.update(extras)
+              if filled or list(rekeyed) != list(cfg):
+                  if APPLY:
+                      open(ours_path, "w").write(dump(rekeyed))
+                  std_cfg.append(f"{ours_path}: "
+                                 + ("added " + ", ".join(filled) if filled
+                                    else "key order normalized"))
+
           # pass 2b: pair manifests to configs - flag added manifests that
           # no upstream config references (copied, but not buildable alone)
           for mpath in added_man:
@@ -416,8 +458,8 @@ jobs:
               man_changes[mpath] = digest
 
           entries = []
-          for entry in added_cfg + upd_cfg:
-              if entry in upd_cfg:
+          for entry in added_cfg + upd_cfg + std_cfg:
+              if entry in upd_cfg or entry in std_cfg:
                   p, changes = entry.split(": ", 1)  # "path: what changed"
               else:
                   p, changes = entry.split(" [")[0], ""
@@ -468,6 +510,7 @@ jobs:
                   ("New configs", added_cfg),
                   ("Updated manifests", upd_man),
                   ("Updated configs", upd_cfg),
+                  ("Standardised configs (template enforced)", std_cfg),
                   ("Config references missing upstream manifest", orphan_cfg),
                   ("Manifests without upstream config counterpart "
                    "(copied, no build config)", man_wo_cfg)]:
@@ -498,7 +541,7 @@ jobs:
               print("Report/matrix only - no files written"
                     + (" (dry run)" if os.environ["DRY_RUN"] == "true" else ""))
               raise SystemExit(0)
-          if not (added_man + added_cfg + upd_man + upd_cfg):
+          if not (added_man + added_cfg + upd_man + upd_cfg + std_cfg):
               print("No changes to apply")
               raise SystemExit(0)
 
@@ -545,15 +588,21 @@ jobs:
           ref: ${{ inputs.target_branch || github.ref_name }}
           fetch-depth: 1
 
-      - name: Watch susfs & kernel_patches pins for drift
+      - name: Watch upstream pins vs last successful build
         env:
           GH_TOKEN: ${{ github.token }}
+          TARGET_BRANCH: ${{ inputs.target_branch || github.ref_name }}
+          BP_PATCHES_REPO: Bouteillepleine/kernel_patches
+          WD_PATCHES_REPO: WildKernels/kernel_patches
+          NOMOUNT_REPO: maxsteeel/nomount
         run: |
           set -euo pipefail
           python3 - <<'PYEOF'
-          import json, os, re, subprocess, time, urllib.request
+          import io, json, os, subprocess, time, urllib.parse, urllib.request, zipfile
 
           TOKEN = os.environ["GH_TOKEN"]
+          REPO = os.environ["GITHUB_REPOSITORY"]
+          TARGET_BRANCH = os.environ["TARGET_BRANCH"]
 
           def api(url):
               req = urllib.request.Request(url, headers={
@@ -562,9 +611,7 @@ jobs:
               with urllib.request.urlopen(req) as r:
                   return json.load(r)
 
-          # GitLab validates any Authorization header it receives and
-          # rejects foreign tokens with 401 - it must be called WITHOUT
-          # the GitHub bearer stamped on (that is what red-lined the job)
+          # GitLab rejects foreign Authorization headers - call it anonymously
           def gitlab_api(url):
               req = urllib.request.Request(url, headers={
                   "User-Agent": "upstream-sync-monitor"})
@@ -572,7 +619,7 @@ jobs:
                   return json.load(r)
 
           # transient 429/5xx on the remotes must not red the nightly run
-          def with_retries(fn, tries=3, delay=5.0):
+          def with_retries(fn, tries=4, delay=8.0):
               for attempt in range(tries):
                   try:
                       return fn()
@@ -581,51 +628,169 @@ jobs:
                           raise
                       time.sleep(delay)
 
-          bp = with_retries(lambda: api(
-              "https://api.github.com/repos/"
-              f"{os.environ['BP_PATCHES_REPO']}/commits/HEAD"))["sha"]
-          wd = with_retries(lambda: api(
-              "https://api.github.com/repos/"
-              f"{os.environ['WD_PATCHES_REPO']}/commits/HEAD"))["sha"]
-          # simonpunk/susfs4ksu @ the ref the build's DEFAULT_SUSFS pins;
-          # the previous project path was a nonexistent repo (404)
-          sus_list = with_retries(lambda: gitlab_api(
-              "https://gitlab.com/api/v4/projects/simonpunk%2Fsusfs4ksu"
-              "/repository/commits?ref_name=gki-android16-6.12&per_page=1"),
-              tries=4, delay=10.0)
-          if not (isinstance(sus_list, list) and sus_list):
-              raise RuntimeError("susfs4ksu gitlab: no commits for "
-                                 "ref gki-android16-6.12")
-          sus = sus_list[0]
-
-          action = open(".github/actions/build-kernel/action.yml").read()
-          lines = [f"- **susfs4ksu/gki-android16-6.12** head: "
-                   f"`{sus['id']}` ({sus['committed_date']})",
-                   f"- **WD kernel_patches** head: `{wd}`"]
-          m = re.search(r"BP_PATCHES_REF[^\n]*?([0-9a-f]{40})", action)
-          if m and m.group(1) != bp:
-              lines.insert(0, f"- **BP kernel_patches drift**: pinned "
-                              f"`{m.group(1)}` but upstream head is `{bp}`")
-          body = ("### Upstream pin drift\n\n" + "\n".join(lines) +
-                  f"\n\n_Compared against action.yml @ "
-                  f"{os.environ.get('GITHUB_SHA', '')[:12]}_")
-
           def gh(*args):
               return subprocess.run(["gh"] + list(args),
                                     capture_output=True, text=True)
+
+          # -- Anchor: last successful build-kernel-release run on this branch --
+          runs = with_retries(lambda: api(
+              "https://api.github.com/repos/"
+              f"{REPO}/actions/workflows/build-kernel-release.yml/runs"
+              f"?branch={urllib.parse.quote(TARGET_BRANCH)}"
+              "&status=success&per_page=1"))
+          run = (runs.get("workflow_runs") or [None])[0]
+          if run is None:
+              print(f"INFO: no successful build-kernel-release run on "
+                    f"'{TARGET_BRANCH}' yet - nothing to compare pins against")
+              raise SystemExit(0)
+
+          # -- Pin store: newest non-expired 'last-success-pins' artifact --
+          pins = {}
+          try:
+              arts = api("https://api.github.com/repos/"
+                         f"{REPO}/actions/artifacts"
+                         "?name=last-success-pins&per_page=100").get("artifacts", [])
+              live = [a for a in arts if not a.get("expired")]
+              if live:
+                  aid = max(live, key=lambda x: x["id"])["id"]
+                  dl = subprocess.run(
+                      ["gh", "api",
+                       f"repos/{REPO}/actions/artifacts/{aid}/zip"],
+                      capture_output=True)
+                  data = dl.stdout
+                  if data[:2] == b"PK":
+                      zf = zipfile.ZipFile(io.BytesIO(data))
+                      data = zf.read(zf.namelist()[0])
+                  try:
+                      pins = json.loads(data.decode())
+                  except Exception:
+                      pins = {}
+          except Exception as e:
+              print(f"WARN: could not load last-success-pins artifact: {e}")
+          if not pins:
+              print("INFO: pin store empty/missing - no successful build has "
+                    "recorded pins yet; skipping watch")
+              raise SystemExit(0)
+
+          drift = []
+          notes = []
+
+          def repo_state(repo, ref="HEAD"):
+              d = with_retries(lambda: api(
+                  f"https://api.github.com/repos/{repo}/commits/{ref}"))
+              return d["sha"], d["commit"]["committer"]["date"]
+
+          def advanced(repo, base, head):
+              # True when the upstream branch moved past the pinned sha
+              if not base or base == head:
+                  return False
+              try:
+                  c = with_retries(lambda: api(
+                      f"https://api.github.com/repos/{repo}/compare/{base}...{head}"))
+                  return c.get("status") in ("ahead", "diverged")
+              except Exception:
+                  return True  # cannot prove still-current -> report, don't hide
+
+          # -- kernel_patches repos (BP & WD) vs the heads recorded at build time --
+          for label, repo, key in (
+                  ("BP kernel_patches", os.environ["BP_PATCHES_REPO"],
+                   "bp_patches_head"),
+                  ("WD kernel_patches", os.environ["WD_PATCHES_REPO"],
+                   "wd_patches_head")):
+              pinned = pins.get(key, "")
+              if not pinned:
+                  notes.append(
+                      f"- INFO **{label}**: no head recorded by the last "
+                      "successful build (older pin store) - drift check "
+                      "resumes after the next green build")
+                  continue
+              head, date = repo_state(repo)
+              if head != pinned and advanced(repo, pinned, head):
+                  drift.append(
+                      f"- **{label}** drift: pinned `{pinned}` but upstream "
+                      f"head is `{head}` ({date})")
+              elif head != pinned:
+                  notes.append(
+                      f"- INFO **{label}**: pinned `{pinned}` is ahead of "
+                      f"branch head `{head}` - left as is")
+
+          # -- NoMount: pinned commit vs dev AND main heads --
+          nm_repo = os.environ["NOMOUNT_REPO"]
+          nm_pinned = pins.get("nomount_commit", "")
+          if not nm_pinned:
+              notes.append(
+                  "- INFO **NoMount**: no commit recorded by the last "
+                  "successful build (FinaSU builds embed NoMount in ksud)")
+          else:
+              for branch in ("dev", "main"):
+                  head, date = repo_state(nm_repo, branch)
+                  if head != nm_pinned and advanced(nm_repo, nm_pinned, head):
+                      drift.append(
+                          f"- **NoMount ({branch})** drift: pinned "
+                          f"`{nm_pinned}` but `{branch}` head is `{head}` ({date})")
+
+          # -- susfs4ksu: every GKI/KMI branch recorded in the pin store --
+          for kmi in sorted(pins.get("susfs", {})):
+              pinned = pins["susfs"][kmi]
+              branch = f"gki-{kmi}"
+              try:
+                  c = with_retries(lambda: gitlab_api(
+                      "https://gitlab.com/api/v4/projects/simonpunk%2Fsusfs4ksu"
+                      f"/repository/commits?ref_name={branch}&per_page=1"),
+                      tries=4, delay=10.0)
+                  if not (isinstance(c, list) and c):
+                      raise RuntimeError(f"no commits for ref {branch}")
+                  head, date = c[0]["id"], c[0]["committed_date"]
+                  if head != pinned:
+                      moved = True
+                      try:
+                          cmp_ = with_retries(lambda: gitlab_api(
+                              "https://gitlab.com/api/v4/projects/"
+                              "simonpunk%2Fsusfs4ksu/repository/compare"
+                              f"?from={pinned}&to={head}"))
+                          moved = bool(cmp_.get("commits"))
+                      except Exception:
+                          pass
+                      if moved:
+                          drift.append(
+                              f"- **susfs4ksu/{branch}** drift: pinned "
+                              f"`{pinned}` but upstream head is `{head}` ({date})")
+              except Exception as e:
+                  notes.append(
+                      f"- WARN **susfs4ksu/{branch}**: lookup failed ({e})")
+
+          lines = drift + notes or [
+              "- OK No drift - every watched ref matches the last successful build."]
+          body = ("### Upstream pin watch\n\n"
+                  "Compared against last successful **build-kernel-release** run on branch `"
+                  + TARGET_BRANCH + "` (pins recorded "
+                  + str(pins.get("recorded_at", "unknown")) + ") - "
+                  + str(run.get("html_url", "")) + "\n\n"
+                  + "\n".join(lines)
+                  + "\n\n_Watched: BP kernel_patches, WD kernel_patches, "
+                    "NoMount (dev + main), susfs4ksu (all GKI/KMI branches in "
+                    "the pin store)._")
 
           title = "upstream-sync-monitor: susfs / kernel_patches pin drift"
           found = gh("issue", "list", "--state", "open",
                      "--search", f"{title} in:title",
                      "--json", "number", "--jq", ".[0].number").stdout.strip()
-          if found:
-              gh("issue", "comment", found, "--body", body)
-              print(f"Updated issue #{found}")
+          if drift:
+              if found:
+                  gh("issue", "comment", found, "--body", body)
+                  print(f"Updated issue #{found}")
+              else:
+                  gh("issue", "create", "--title", title, "--body", body)
+                  print("Created new drift issue")
+          elif found:
+              gh("issue", "close", found,
+                 "--comment", "All watched upstream refs now match the last "
+                 "successful build - closing as resolved.")
+              print(f"Closed issue #{found}: no drift")
           else:
-              gh("issue", "create", "--title", title, "--body", body)
+              print("No drift, no open issue - nothing to do")
           print(body)
           PYEOF
-
   cleanup-branch:
     runs-on: ubuntu-latest
     if: >-

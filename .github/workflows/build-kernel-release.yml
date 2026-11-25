@@ -42,6 +42,11 @@ on:
           - android13-5.15
           - android12-5.10
         default: A14+A15+A16
+      regen_device_options:
+        description: 'Regeneration mode: rebuild the device_a14/a15/a16 menus in alphabetical order (none stays first) from configs/ and commit any change; nothing is built'
+        required: false
+        type: boolean
+        default: false
       device_a14:
         description: 'Device menu (optional): pick ONE config from configs/a14/; "none" = unused. Any explicit device selection (menus and/or config_paths) overrides the op_model tree filter'
         required: false
@@ -346,6 +351,7 @@ on:
 jobs:
   set-op-model:
     runs-on: ubuntu-24.04
+    if: ${{ inputs.regen_device_options != true }}
     outputs:
       matrix: ${{ steps.set-matrix-final.outputs.matrix }}
       device_count: ${{ steps.set-matrix-final.outputs.count }}
@@ -1062,7 +1068,7 @@ jobs:
     name: Resolve NoMount commit (locked for all kernels)
     runs-on: ubuntu-24.04
     # FinaSU ships NoMount inside ksud (embedded per KMI) - nothing to resolve upstream.
-    if: ${{ !cancelled() && inputs.ksu_type != 'FinaSU' }}
+    if: ${{ !cancelled() && inputs.ksu_type != 'FinaSU' && inputs.regen_device_options != true }}
     outputs:
       nomount_commit: ${{ steps.resolve.outputs.nomount_commit }}
       nomount_source: ${{ steps.resolve.outputs.nomount_source }}
@@ -1363,6 +1369,7 @@ jobs:
   prepare_ccache:
     name: Prepare ccache binary (download once)
     runs-on: ubuntu-24.04
+    if: ${{ inputs.regen_device_options != true }}
     steps:
       - name: Download custom ccache once
         run: |
@@ -2553,6 +2560,88 @@ jobs:
             fi
           done
 
+  regen-device-options:
+    name: ♻️ Regenerate device menus (alphabetical, none first)
+    # Regeneration-only dispatch: every other job is gated off by the same input.
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.regen_device_options == true }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: 🧾 Checkout (current branch)
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: ♻️ Rewrite device_a14/a15/a16 options from configs/
+        shell: bash
+        run: |
+          set -euo pipefail
+          WF=".github/workflows/build-kernel-release.yml"
+          cat > /tmp/regen_menus.py <<'PYEOF'
+          import glob, os, re, sys
+
+          wf = sys.argv[1]
+          text = open(wf, encoding="utf-8").read()
+
+          def menu(patterns):
+              names = set()
+              for pat in patterns:
+                  for p in glob.glob(pat):
+                      names.add(os.path.splitext(os.path.basename(p))[0])
+              return sorted(names)
+
+          menus = {
+              "device_a14": menu(["configs/a14/*.json"]),
+              "device_a15": menu(["configs/a15/*.json"]),
+              # the a16 menu also offers the a17 tree (Myron/OSS configs)
+              "device_a16": menu(["configs/a16/*.json", "configs/a17/*.json"]),
+          }
+
+          def rewrite(text, key, entries):
+              m = re.search(
+                  r"(?m)(^      " + re.escape(key) + r":\n"
+                  r"(?:^        .*\n)*?^        options:\n)"
+                  r"((?:^          - .*\n)+)",
+                  text)
+              if not m:
+                  raise SystemExit(f"::error::options list for {key} not found in workflow")
+              items = "".join(f"          - {e}\n" for e in ["none"] + entries)
+              return text[:m.start(2)] + items + text[m.end(2):]
+
+          for key, entries in menus.items():
+              text = rewrite(text, key, entries)
+              print(f"{key}: {len(entries)} device(s) + none")
+          open(wf, "w", encoding="utf-8").write(text)
+          PYEOF
+          python3 /tmp/regen_menus.py "$WF"
+          # idempotence guard: a second pass must be a no-op
+          cp "$WF" /tmp/wf.pass1
+          python3 /tmp/regen_menus.py "$WF"
+          if ! diff -q /tmp/wf.pass1 "$WF" >/dev/null; then
+            echo "::error::menu regeneration is not idempotent - aborting without committing"
+            exit 1
+          fi
+          {
+            echo "## ♻️ Device menus regenerated (alphabetical, none first)"
+            for key in device_a14 device_a15 device_a16; do
+              echo ""
+              echo "**$key:**"
+              sed -n "/^      ${key}:/,/^      [a-z_]*:/p" "$WF" | grep '^          - ' | sed 's/^/  /' || true
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          if git diff --quiet -- "$WF"; then
+            echo "✅ Menus already canonical - nothing to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$WF"
+          git commit -m "chore: regenerate device menus (alphabetical, none first)"
+          git pull --rebase origin "$GITHUB_REF_NAME" || git pull --rebase
+          git push
+          echo "✅ Menus committed and pushed to $GITHUB_REF_NAME"
+
   record-last-successful-pins:
     name: 📌 Record refs as "last successful run" pins
     needs: [set-op-model, resolve-nomount, build]
@@ -2576,6 +2665,10 @@ jobs:
           set -euo pipefail
           echo "::group::Record last-successful pins"
 
+          # Watch-pins needs the upstream kernel_patches heads at build time
+          bp_head="$(git ls-remote https://github.com/Bouteillepleine/kernel_patches HEAD | cut -f1)"
+          wd_head="$(git ls-remote https://github.com/WildKernels/kernel_patches HEAD | cut -f1)"
+
           new_pins=$(jq -n \
             --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --arg run_id "${{ github.run_id }}" \
@@ -2585,6 +2678,8 @@ jobs:
             --arg ksu_ref_kind "${{ needs.set-op-model.outputs.ksu_ref_kind }}" \
             --arg ksu_ref_name "${{ needs.set-op-model.outputs.ksu_ref_name }}" \
             --arg nomount "${{ needs.resolve-nomount.outputs.nomount_commit }}" \
+            --arg bp_head "$bp_head" \
+            --arg wd_head "$wd_head" \
             --arg a12 "${{ needs.set-op-model.outputs.susfs_hash_android12_5_10 }}" \
             --arg a13 "${{ needs.set-op-model.outputs.susfs_hash_android13_5_15 }}" \
             --arg a14 "${{ needs.set-op-model.outputs.susfs_hash_android14_6_1 }}" \
@@ -2603,6 +2698,8 @@ jobs:
               ksu_sha: $ksu_sha,
               ksu_ref_source: (if $ksu_ref_kind == "branch" then ("branch " + $ksu_ref_name) else $ksu_ref_kind end),
               nomount_commit: $nomount,
+              bp_patches_head: $bp_head,
+              wd_patches_head: $wd_head,
               susfs: (
                 {}
                 + (if ($a12 | test("^[0-9a-f]{40}$")) then {"android12-5.10": $a12} else {} end)
@@ -2647,6 +2744,8 @@ jobs:
           merged=$(jq -n --argjson new "$new_pins" --argjson old "$old_pins" \
             '$new
              + (if ($new.nomount_commit // "") == "" then {nomount_commit: ($old.nomount_commit // "")} else {} end)
+             + (if ($new.bp_patches_head // "") == "" then {bp_patches_head: ($old.bp_patches_head // "")} else {} end)
+             + (if ($new.wd_patches_head // "") == "" then {wd_patches_head: ($old.wd_patches_head // "")} else {} end)
              + {susfs: (($old.susfs // {}) + ($new.susfs // {})), susfs_src: (($old.susfs_src // {}) + ($new.susfs_src // {}))}')
 
           printf '%s' "$merged" > last-success-pins

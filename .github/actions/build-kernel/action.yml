@@ -2198,9 +2198,11 @@ runs:
               else
                 # WK has no susfs fix set for this version (e.g. v2.3.0); Bouteillepleine tracks newer
                 # susfs releases and additionally ships fix_dispatch.c.patch, so fall back to that set.
-                # Pinned to BP head 3e7e48f0746fee8e131637f8e884ae4caaa539e6 (2026-11-18)
-                # instead of a moving 'main'; override with BP_PATCHES_REF if ever needed.
-                BP_PATCHES_REF="${BP_PATCHES_REF:-3e7e48f0746fee8e131637f8e884ae4caaa539e6}"
+                # BP head is a moving 'main' now: the last successful build's
+                # head is recorded in the last-success-pins store and the
+                # upstream-sync-monitor watch-pins job reports drift. Override
+                # with BP_PATCHES_REF if ever needed.
+                BP_PATCHES_REF="${BP_PATCHES_REF:-main}"
                 susfs_fix_base="https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/${BP_PATCHES_REF}/next/susfs_fix_patches/${susfs_version}"
                 susfs_fix_dir="$(mktemp -d)"
                 if fetch_patch "$susfs_fix_base/fix_Kbuild.patch" "$susfs_fix_dir/fix_Kbuild.patch"; then
@@ -4143,11 +4145,25 @@ runs:
           append_nl drivers/misc/Makefile ''
           printf 'obj-$(CONFIG_USBADB_GATE)\t+= usbadb_gate/\n' >> drivers/misc/Makefile
         fi
-        gen_patch usbadb-gate-notifier "$GATE_SRC/patches/0001-usb-gadget-state-notifier.patch" "" "g:drivers/usb/gadget/udc/core.c|usb_gadget_register_state_notifier"
+        NOTIFIER_PATCH="$GATE_SRC/patches/0001-usb-gadget-state-notifier.patch"
+        # WD ships 0001 without --- a/+++ b/ file headers; gen_patch discovers
+        # targets from '+++' lines only, so synthesize the headers from the
+        # diff --git lines before staging (idempotent).
+        if ! grep -q "^+++ " "$NOTIFIER_PATCH"; then
+          sed -i -E 's|^diff --git a/(.+) b/(.+)$|diff --git a/\1 b/\2\n--- a/\1\n+++ b/\2|' "$NOTIFIER_PATCH"
+          echo "[usbadb-gate] synthesized missing ---/+++ file headers into $(basename "$NOTIFIER_PATCH")"
+        fi
+        gen_patch usbadb-gate-notifier "$NOTIFIER_PATCH" "" "g:drivers/usb/gadget/udc/core.c|usb_gadget_register_state_notifier"
         if ! grep -Eq '^usbadb-gate-notifier\|(applied|already)' "$PS_FILE" 2>/dev/null; then
-          echo "::error::usb-gadget-state-notifier patch failed to stage at fuzz=0; WD ships an anchor-based fallback at common/usbadb-gate/patches/apply_notifier_fallback.sh"
+          echo "gen_patch staging failed; using WD's anchor-based fallback (apply_notifier_fallback.sh: name-anchored, idempotent, fail-closed)"
+          sh "$GATE_SRC/patches/apply_notifier_fallback.sh" "$PWD" || true
+        fi
+        if ! grep -q "usb_gadget_register_state_notifier" drivers/usb/gadget/udc/core.c \
+           || ! grep -q "usb_gadget_register_state_notifier" include/linux/usb/gadget.h; then
+          echo "::error::usb-gadget-state-notifier: neither gen_patch nor the anchor-based fallback could stage the notifier hook"
           exit 1
         fi
+        grep -qF 'usbadb-gate-notifier|applied' "$PS_FILE" 2>/dev/null || echo "usbadb-gate-notifier|applied" >> "$PS_FILE"
         grep -q '^CONFIG_USBADB_GATE=y' arch/arm64/configs/gki_defconfig || \
           echo 'CONFIG_USBADB_GATE=y' >> arch/arm64/configs/gki_defconfig
         grep -n '^CONFIG_USBADB_GATE=y' arch/arm64/configs/gki_defconfig
@@ -4368,6 +4384,12 @@ runs:
           [ -n "${name:-}" ] || continue
           last_status["$name"]="${status:-unknown}"
         done < "$PS_FILE"
+        # static supersede pairs (belt & braces for the dynamic index below):
+        # a later WD patch deliberately rewrites an earlier one's oracle
+        # lines - once the later patch is in the tree, the earlier one's
+        # missing lines are excused without consulting the index.
+        declare -A SUPERSEDE_BY=()
+        SUPERSEDE_BY["add_limitation_scaling_min_freq"]="re_write_limitation_scaling_min_freq"
         stealth_fail=0; ok_applied=0; ok_already=0; info=0; oracle_checked=0; superseded=0
         # Supersession index: every '-' line in the patchset, scoped to the b/ path it
         # edits. An applied patch's oracle line can legitimately vanish when a LATER
@@ -4409,7 +4431,7 @@ runs:
                       sup_by=""
                       while IFS= read -r cand; do
                         case "$file" in
-                          */"$cand")
+                          "$cand"|*/"$cand")
                             sup_by=$(awk -F'\t' -v f="$cand" -v l="$nline" '$1 == f && $3 == l { print $2; exit }' "$SUP_IDX" 2>/dev/null || true)
                             if [ -n "$sup_by" ]; then break; fi
                             ;;
@@ -4420,8 +4442,17 @@ runs:
                         echo "superseded ${name}: oracle line replaced by later patch '${sup_by}' in ${file}: ${line}"
                         superseded=$((superseded+1))
                       else
-                        echo "ORACLE-MISS ${name}: ${root}/${file}: ${line}"
-                        miss=$((miss+1))
+                        sup2="${SUPERSEDE_BY[$name]:-}"
+                        sup2st="${last_status[$sup2]:-}"
+                        if [ -n "$sup2" ] && [ "$sup2" != "$name" ] \
+                           && { [ "$sup2st" = applied ] || [ "$sup2st" = already ]; }; then
+                          echo "superseded ${name}: oracle line rewritten by '${sup2}' (static pair): ${line}"
+                          superseded=$((superseded+1))
+                        else
+                          echo "ORACLE-MISS ${name}: ${root}/${file}: ${line}"
+                          awk -F'\t' -v f="$file" '$1 == f { print "SUPIDX-ROW " $0 }' "$SUP_IDX" 2>/dev/null | head -20 || true
+                          miss=$((miss+1))
+                        fi
                       fi
                     fi
                   done < "$oracle"
