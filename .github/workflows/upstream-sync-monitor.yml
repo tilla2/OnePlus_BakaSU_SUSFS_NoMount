@@ -40,8 +40,13 @@ permissions:
   # workflow-file changes by design; to let the sync branch carry the
   # regenerated build-kernel-release.yml, set an optional repo secret
   # SYNC_PAT (classic PAT with repo scope, or fine-grained with Contents +
-  # Workflows read/write). Without it this job pushes the sync branch
-  # WITHOUT workflow files and attaches the regen to the ci-matrix artifact.
+  # Workflows read/write; the token must list this repo in its access
+  # list). SYNC_PAT is also handed to checkout on purpose: the credential
+  # checkout saves into git config would otherwise outvote the PAT embedded
+  # in the push URL, and the remote would evaluate GITHUB_TOKEN (a GitHub
+  # App) and reject workflow-file changes despite a valid PAT. Without
+  # SYNC_PAT this job pushes the sync branch WITHOUT workflow files and
+  # attaches the regen to the ci-matrix artifact.
 
 concurrency:
   group: upstream-sync-monitor
@@ -68,6 +73,11 @@ jobs:
         with:
           ref: ${{ inputs.target_branch || github.ref_name }}
           fetch-depth: 1
+          # the PAT must reach checkout, not only the push URL: checkout
+          # saves its token as http.https://github.com/.extraheader, and
+          # that header applies to every github.com request - an unpatched
+          # pair would let GITHUB_TOKEN outvote the push-URL PAT
+          token: ${{ secrets.SYNC_PAT || github.token }}
 
       - name: Detect upstream changes, pair & rewrite sources, emit CI matrix
         id: sync
@@ -359,6 +369,11 @@ jobs:
                   added_man.append(ours_path)
               elif open(ours_path).read() != up_text:
                   digest = diff_manifest(open(ours_path).read(), up_text)
+                  if digest == "formatting only (no content change)":
+                      # XML-equivalent (remote/project order, comment
+                      # or line-ending drift): not an update. Writing
+                      # it would re-dirty the tree on every run.
+                      continue
                   if APPLY:
                       open(ours_path, "w").write(up_text)
                   upd_man.append(f"{ours_path}: {digest}")
@@ -632,9 +647,19 @@ jobs:
           # not force-push each other's open sync PR out from under it
           branch = os.environ["SYNC_BRANCH"] + "-" + re.sub(
               r"[^A-Za-z0-9._-]", "-", TARGET).strip("-")
-          subprocess.run(["git", "checkout", "-b", branch], check=True)
+          subprocess.run(["git", "checkout", "-B", branch], check=True)
           subprocess.run(["git", "add", "manifests/", "configs/", wf_path],
                          check=True)
+          staged = subprocess.run(["git", "diff", "--cached", "--name-only"],
+                                  capture_output=True, text=True)
+          if not staged.stdout.strip():
+              print("Nothing to sync - the base branch already carries "
+                    "the upstream state; sync branch left unchanged.")
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                  f.write("\nNothing to sync - the base branch already "
+                          "carries the upstream state; sync branch left "
+                          "unchanged.\n")
+              raise SystemExit(0)
           commit_msg = ("sync: upstream manifests (huangdihd anykernel) "
                         "& generated configs")
           if regen:
@@ -654,12 +679,28 @@ jobs:
           remote = (f"https://x-access-token:{sync_pat}@github.com/"
                     f"{os.environ['GITHUB_REPOSITORY']}.git"
                     if sync_pat else "origin")
+          # actions/checkout persists its token as
+          # http.https://github.com/.extraheader in the local git config;
+          # that header is sent with every github.com request and would
+          # outvote the PAT embedded in the push URL - the remote would then
+          # evaluate GITHUB_TOKEN (a GitHub App) and reject workflow-file
+          # changes even though a valid SYNC_PAT was supplied. Drop the
+          # saved header for the PAT push so the URL credential is the only
+          # one the server sees (restored below before any fallback push).
+          gh_extra = subprocess.run(
+              ["git", "config", "--get", "http.https://github.com/.extraheader"],
+              capture_output=True, text=True)
+          had_gh_extra = gh_extra.returncode == 0 and bool(gh_extra.stdout.strip())
+          if sync_pat and had_gh_extra:
+              subprocess.run(["git", "config", "--unset-all",
+                              "http.https://github.com/.extraheader"],
+                             check=True)
           pushed = _push(remote)
           if pushed.returncode != 0:
               errtxt = pushed.stderr + pushed.stdout
               if sync_pat:
                   errtxt = errtxt.replace(sync_pat, "***")
-              if ("create or update workflow" in errtxt) and not sync_pat:
+              if "create or update workflow" in errtxt:
                   with open("regen-build-kernel-release.yml", "w") as f_out:
                       f_out.write(open(wf_path, encoding="utf-8").read())
                   subprocess.run(["git", "reset", "--soft", "HEAD~1"],
@@ -671,21 +712,42 @@ jobs:
                                   "anykernel) & generated configs "
                                   "(device-menu regen withheld - needs "
                                   "SYNC_PAT)"], check=True)
-                  pushed = _push("origin")
+                  if sync_pat and had_gh_extra:
+                      subprocess.run(["git", "config", "--local", "--add",
+                                      "http.https://github.com/.extraheader",
+                                      gh_extra.stdout.strip()], check=True)
+                  pushed = _push(remote if sync_pat else "origin")
                   if pushed.returncode != 0:
                       print(pushed.stderr + pushed.stdout)
                       raise SystemExit(1)
-                  warn = (
-                      "> [!WARNING]\n"
-                      "> GITHUB_TOKEN cannot push workflow-file changes, so "
-                      "the sync branch was pushed WITHOUT the regenerated "
-                      f"`{wf_path}`.\n"
-                      "> The regenerated file is attached to the ci-matrix "
-                      "artifact as `regen-build-kernel-release.yml` - apply "
-                      "it by hand, or add a repo secret `SYNC_PAT` (classic "
-                      "PAT with repo scope, or fine-grained with Contents + "
-                      "Workflows read/write) and re-run to let the sync "
-                      "branch carry it directly.")
+                  if sync_pat:
+                      warn = (
+                          "> [!WARNING]\n"
+                          "> The push was refused the workflow-file change "
+                          "even with `SYNC_PAT` set - GitHub rejected the "
+                          f"token for `{wf_path}`.\n"
+                          "> Fix the token: fine-grained PAT needs "
+                          "**Workflows: Read and write** AND this repo in "
+                          "its Repository access list; classic PAT needs the "
+                          "`workflow` scope. GitHub App tokens need the "
+                          "permission re-approved after granting.\n"
+                          "> The sync branch was pushed WITHOUT the "
+                          "regenerated file; it is attached to the ci-matrix "
+                          "artifact as `regen-build-kernel-release.yml` - "
+                          "apply it by hand or fix `SYNC_PAT` and re-run.")
+                  else:
+                      warn = (
+                          "> [!WARNING]\n"
+                          "> GITHUB_TOKEN cannot push workflow-file changes, "
+                          "so the sync branch was pushed WITHOUT the "
+                          f"regenerated `{wf_path}`.\n"
+                          "> The regenerated file is attached to the "
+                          "ci-matrix artifact as "
+                          "`regen-build-kernel-release.yml` - apply it by "
+                          "hand, or add a repo secret `SYNC_PAT` (classic "
+                          "PAT with repo scope, or fine-grained with "
+                          "Contents + Workflows read/write) and re-run to "
+                          "let the sync branch carry it directly.")
                   print(warn)
                   with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
                       f.write("\n" + warn + "\n")
@@ -883,9 +945,29 @@ jobs:
                           f"- **NoMount ({branch})** drift: pinned "
                           f"`{nm_pinned}` but `{branch}` head is `{head}` ({date})")
 
-          # -- susfs4ksu: every GKI/KMI branch recorded in the pin store --
-          for kmi in sorted(pins.get("susfs", {})):
-              pinned = pins["susfs"][kmi]
+          # -- susfs4ksu: every GKI/KMI branch held in the pin store,
+          # unioned with the KMIs our own configs declare - the store only
+          # carries KMIs built by the last green run, so the union keeps
+          # susfs movement visible between builds (drift checking starts
+          # for a KMI as soon as the next green build pins it) --
+          kmi_seen = set()
+          for p in subprocess.run(["git", "ls-files", "configs/"],
+                                  capture_output=True,
+                                  text=True).stdout.split():
+              if not p.endswith(".json"):
+                  continue
+              try:
+                  c = json.load(open(p))
+              except Exception:
+                  continue
+              av = str(c.get("android_version", ""))
+              kv = str(c.get("kernel_version", ""))
+              if (av.startswith("android") and av[len("android"):].isdigit()
+                      and kv.count(".") == 1
+                      and kv.replace(".", "").isdigit()):
+                  kmi_seen.add(f"{av}-{kv}")
+          for kmi in sorted(set(pins.get("susfs", {})) | kmi_seen):
+              pinned = pins.get("susfs", {}).get(kmi, "")
               branch = f"gki-{kmi}"
               try:
                   c = with_retries(lambda: gitlab_api(
@@ -895,6 +977,13 @@ jobs:
                   if not (isinstance(c, list) and c):
                       raise RuntimeError(f"no commits for ref {branch}")
                   head, date = c[0]["id"], c[0]["committed_date"]
+                  if not pinned:
+                      notes.append(
+                          f"- INFO **susfs4ksu/{branch}**: head `{head}` "
+                          f"({date}) - no pin recorded by the last "
+                          "successful build yet; drift check resumes "
+                          "after the next green build")
+                      continue
                   if head != pinned:
                       moved = True
                       try:
@@ -923,21 +1012,40 @@ jobs:
                      else "(anchor lookup failed this run)") + "\n\n"
                   + "\n".join(lines)
                   + "\n\n_Watched: BP kernel_patches, WD kernel_patches, "
-                    "NoMount (dev + master), susfs4ksu (all GKI/KMI branches in "
-                    "the pin store)._")
+                    "NoMount (dev + master), susfs4ksu (every GKI/KMI branch "
+                    "in the pin store or declared by our configs)._")
 
           title = "upstream-sync-monitor: susfs / kernel_patches pin drift"
           found = gh("issue", "list", "--state", "open",
                      "--search", f"{title} in:title",
                      "--json", "number", "--jq", ".[0].number").stdout.strip()
+
+          def retain_last_entry(number):
+              # single-entry retention: the issue body always carries the
+              # latest report and every previous bot comment is deleted,
+              # so the issue never grows a comment thread
+              cur = gh("issue", "view", str(number),
+                       "--json", "body", "--jq", ".body").stdout
+              if cur.strip() != body.strip():
+                  gh("issue", "edit", str(number), "--body", body)
+              stale = gh("api", f"repos/{REPO}/issues/{number}/comments",
+                         "--paginate", "--jq",
+                         '.[] | select(.user.login '
+                         '== "github-actions[bot]") | .id').stdout.split()
+              for cid in stale:
+                  gh("api", "-X", "DELETE",
+                     f"repos/{REPO}/issues/comments/{cid}")
+
           if drift:
               if found:
-                  gh("issue", "comment", found, "--body", body)
-                  print(f"Updated issue #{found}")
+                  retain_last_entry(found)
+                  print(f"Updated issue #{found} (body = latest report, "
+                        "comment thread cleared)")
               else:
                   gh("issue", "create", "--title", title, "--body", body)
                   print("Created new drift issue")
           elif found:
+              retain_last_entry(found)
               gh("issue", "close", found,
                  "--comment", "All watched upstream refs now match the last "
                  "successful build - closing as resolved.")
