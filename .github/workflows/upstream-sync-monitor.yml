@@ -34,6 +34,10 @@ on:
 permissions:
   contents: write
   issues: write
+  # the sync branch commit may rewrite device menus inside
+  # .github/workflows/build-kernel-release.yml - pushing workflow files
+  # requires this or the remote rejects the push
+  workflows: write
 
 concurrency:
   group: upstream-sync-monitor
@@ -147,6 +151,40 @@ jobs:
 
           def order_config(cfg):
               return {k: cfg[k] for k in TEMPLATE if k in cfg}
+
+          def fill_missing(cfg):
+              # fleet-policy defaults for template keys the config lacks -
+              # existing device values are never touched
+              filled = []
+              for k in TEMPLATE:
+                  if k in cfg:
+                      continue
+                  if k in FORCED:
+                      v = FORCED[k]
+                  elif k in DEFAULT_TRUE:
+                      v = True
+                  elif k in TOOLCHAIN_DEFAULTS or k in MISC_KEYS:
+                      v = ""
+                  elif k == "lto":
+                      v = "none"
+                  elif k == "hmbird":
+                      v = False
+                  elif k == "blacklist_apply":
+                      v = True
+                  elif k == "root_tag":
+                      v = "ChimeraKernel"
+                  else:
+                      v = ""
+                  cfg[k] = v
+                  filled.append(f"{k}={v}")
+              return filled
+
+          def standardise(cfg):
+              # canonical template order; unknown keys preserved at the end
+              extras = {k: cfg[k] for k in cfg if k not in TEMPLATE}
+              out = order_config(cfg)
+              out.update(extras)
+              return out
 
           def dump(cfg):
               return json.dumps(cfg, indent=2, ensure_ascii=False) + "\n"
@@ -297,7 +335,8 @@ jobs:
                       ov, nv = old_m[key].get(attr, ""), new_m[key].get(attr, "")
                       if ov != nv:
                           parts.append(f"{disp}.{attr}: {show(ov)} -> {show(nv)}")
-              return "; ".join(parts) if parts else "content changed"
+              return ("; ".join(parts) if parts
+                      else "formatting only (no content change)")
 
           # pass 1: manifests - transform upstream sources, then sync content
           for andir, fname in sorted(set(wd_man) | set(bp_man)):
@@ -377,15 +416,17 @@ jobs:
                           if nv:
                               changed.append(f"{k}: set {nv!r}")
                               ours[k] = nv
-                  rekeyed = order_config(ours)
-                  if changed:
+                  # template enforcement on EVERY config: fill missing
+                  # policy keys, canonical key order, extras preserved
+                  filled = fill_missing(ours)
+                  if filled:
+                      changed += [f"added {f}" for f in filled]
+                  rekeyed = standardise(ours)
+                  if changed or list(rekeyed) != list(ours):
                       if APPLY:
                           open(ours_path, "w").write(dump(rekeyed))
-                      upd_cfg.append(f"{ours_path}: " + "; ".join(changed))
-                  elif rekeyed != ours:
-                      if APPLY:
-                          open(ours_path, "w").write(dump(rekeyed))
-                      upd_cfg.append(f"{ours_path}: key order normalized")
+                      upd_cfg.append(f"{ours_path}: " + "; ".join(
+                          changed if changed else ["key order normalized"]))
                   continue
               rcfg = ref_cfg_for(andir)
               ordered, dropped, ignored, orphan = gen_config(
@@ -404,40 +445,19 @@ jobs:
               added_cfg.append(ours_path
                                + (f" [{'; '.join(notes)}]" if notes else ""))
 
-          # pass 2c: standardise EVERY local config that has no upstream
-          # counterpart to the current template - canonical key order,
-          # missing policy keys filled from fleet policy, unknown keys
-          # preserved, existing device values never touched (locally-added
-          # configs like the Myron pair have no upstream to sync from).
+          # pass 2c: standardise every local config that has no upstream
+          # counterpart (upstream-paired ones are standardised in pass 2) -
+          # canonical key order, missing policy keys filled from fleet
+          # policy, unknown keys preserved, existing device values never
+          # touched (locally-added configs like the Myron pair have no
+          # upstream to sync from).
           std_cfg = []
           for andir, cfg_name in sorted(our_cfg_set
                                         - (set(wd_cfgs) | set(bp_cfgs))):
               ours_path = f"configs/{andir}/{cfg_name}"
               cfg = json.load(open(ours_path))
-              missing = [k for k in TEMPLATE if k not in cfg]
-              filled = []
-              for k in missing:
-                  if k in FORCED:
-                      v = FORCED[k]
-                  elif k in DEFAULT_TRUE:
-                      v = True
-                  elif k in TOOLCHAIN_DEFAULTS or k in MISC_KEYS:
-                      v = ""
-                  elif k == "lto":
-                      v = "none"
-                  elif k == "hmbird":
-                      v = False
-                  elif k == "blacklist_apply":
-                      v = True
-                  elif k == "root_tag":
-                      v = "ChimeraKernel"
-                  else:
-                      v = ""
-                  cfg[k] = v
-                  filled.append(f"{k}={v}")
-              extras = {k: cfg[k] for k in cfg if k not in TEMPLATE}
-              rekeyed = order_config(cfg)
-              rekeyed.update(extras)
+              filled = fill_missing(cfg)
+              rekeyed = standardise(cfg)
               if filled or list(rekeyed) != list(cfg):
                   if APPLY:
                       open(ours_path, "w").write(dump(rekeyed))
@@ -660,6 +680,8 @@ jobs:
           TOKEN = os.environ["GH_TOKEN"]
           REPO = os.environ["GITHUB_REPOSITORY"]
           TARGET_BRANCH = os.environ["TARGET_BRANCH"]
+          drift = []
+          notes = []
 
           def api(url):
               req = urllib.request.Request(url, headers={
@@ -690,16 +712,27 @@ jobs:
                                     capture_output=True, text=True)
 
           # -- Anchor: last successful build-kernel-release run on this branch --
-          runs = with_retries(lambda: api(
-              "https://api.github.com/repos/"
-              f"{REPO}/actions/workflows/build-kernel-release.yml/runs"
-              f"?branch={urllib.parse.quote(TARGET_BRANCH)}"
-              "&status=success&per_page=1"))
-          run = (runs.get("workflow_runs") or [None])[0]
-          if run is None:
+          # a transient API brownout must not red the watch - proceed on the
+          # pin store alone and note the degraded anchor instead
+          anchor_ok = True
+          run = None
+          try:
+              runs = with_retries(lambda: api(
+                  "https://api.github.com/repos/"
+                  f"{REPO}/actions/workflows/build-kernel-release.yml/runs"
+                  f"?branch={urllib.parse.quote(TARGET_BRANCH)}"
+                  "&status=success&per_page=1"))
+              run = (runs.get("workflow_runs") or [None])[0]
+          except Exception as e:
+              anchor_ok = False
+              notes.append(f"- WARN **anchor**: last-success lookup failed "
+                           f"after retries ({e})")
+          if run is None and anchor_ok:
               print(f"INFO: no successful build-kernel-release run on "
                     f"'{TARGET_BRANCH}' yet - nothing to compare pins against")
               raise SystemExit(0)
+          if run is None:
+              print("WARN: anchor unavailable - comparing pin store only")
 
           # -- Pin store: newest non-expired 'last-success-pins' artifact --
           pins = {}
@@ -728,9 +761,6 @@ jobs:
               print("INFO: pin store empty/missing - no successful build has "
                     "recorded pins yet; skipping watch")
               raise SystemExit(0)
-
-          drift = []
-          notes = []
 
           def repo_state(repo, ref="HEAD"):
               d = with_retries(lambda: api(
@@ -761,7 +791,11 @@ jobs:
                       "successful build (older pin store) - drift check "
                       "resumes after the next green build")
                   continue
-              head, date = repo_state(repo)
+              try:
+                  head, date = repo_state(repo)
+              except Exception as e:
+                  notes.append(f"- WARN **{label}**: head lookup failed ({e})")
+                  continue
               if head != pinned and advanced(repo, pinned, head):
                   drift.append(
                       f"- **{label}** drift: pinned `{pinned}` but upstream "
@@ -779,8 +813,13 @@ jobs:
                   "- INFO **NoMount**: no commit recorded by the last "
                   "successful build (FinaSU builds embed NoMount in ksud)")
           else:
-              for branch in ("dev", "main"):
-                  head, date = repo_state(nm_repo, branch)
+              for branch in ("dev", "master"):
+                  try:
+                      head, date = repo_state(nm_repo, branch)
+                  except Exception as e:
+                      notes.append(f"- WARN **NoMount/{branch}**: head lookup "
+                                   f"failed ({e})")
+                      continue
                   if head != nm_pinned and advanced(nm_repo, nm_pinned, head):
                       drift.append(
                           f"- **NoMount ({branch})** drift: pinned "
@@ -822,10 +861,11 @@ jobs:
                   "Compared against last successful **build-kernel-release** run on branch `"
                   + TARGET_BRANCH + "` (pins recorded "
                   + str(pins.get("recorded_at", "unknown")) + ") - "
-                  + str(run.get("html_url", "")) + "\n\n"
+                  + (str(run.get("html_url", "")) if run
+                     else "(anchor lookup failed this run)") + "\n\n"
                   + "\n".join(lines)
                   + "\n\n_Watched: BP kernel_patches, WD kernel_patches, "
-                    "NoMount (dev + main), susfs4ksu (all GKI/KMI branches in "
+                    "NoMount (dev + master), susfs4ksu (all GKI/KMI branches in "
                     "the pin store)._")
 
           title = "upstream-sync-monitor: susfs / kernel_patches pin drift"
