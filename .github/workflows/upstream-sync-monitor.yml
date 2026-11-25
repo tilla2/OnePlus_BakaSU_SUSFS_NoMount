@@ -30,6 +30,7 @@ on:
 
 permissions:
   contents: write
+  issues: write
   pull-requests: write
 
 concurrency:
@@ -69,7 +70,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PYEOF'
-          import json, os, re, subprocess, urllib.request
+          import json, os, re, subprocess, time, urllib.request
 
           TOKEN = os.environ["GH_TOKEN"]
           TARGET = os.environ["TARGET_BRANCH"]
@@ -133,6 +134,13 @@ jobs:
           ANDV = {"a14": "android14", "a15": "android15",
                   "a16": "android16", "a17": "android17"}
           KVER_RE = re.compile(r"(?:6|5)\.\d+")
+          # vendor-like unames only: a kernel release suffix always starts
+          # with a digit ("5-gb2a876903b49-ab14541642-4k"); brand strings
+          # like WD's "OP-WILD" are rejected and cleared
+          UNAME_VENDOR_RE = re.compile(r"^\d")
+
+          def vendor_uname(v):
+              return v if (v and UNAME_VENDOR_RE.match(v)) else ""
 
           def order_config(cfg):
               return {k: cfg[k] for k in TEMPLATE if k in cfg}
@@ -238,10 +246,55 @@ jobs:
                   cfg[k] = up.get(k, rcfg.get(k, d))
               for k in MISC_KEYS:
                   v = up.get(k, "")
+                  if k == "uname":
+                      if v and not UNAME_VENDOR_RE.match(v):
+                          dropped.append(f"uname={v!r} "
+                                         "(non-vendor-like, cleared)")
+                      v = vendor_uname(v)
                   if k == "build_time" and not v:
                       v = up.get("ktimestamp", "")
                   cfg[k] = v
               return {k: cfg[k] for k in TEMPLATE}, dropped, ignored, orphan
+
+          import xml.etree.ElementTree as ET
+
+          def diff_manifest(old_text, new_text, width=12):
+              # digest of what changed between the committed manifest and the
+              # rewritten upstream one (attribute-level old -> new)
+              def eat(text):
+                  out = {}
+                  for el in ET.fromstring(text.encode("utf-8")):
+                      key = el.tag
+                      if "name" in el.attrib:
+                          key += ":" + el.attrib["name"]
+                      elif "path" in el.attrib:
+                          key += ":" + el.attrib["path"]
+                      out[key] = dict(el.attrib)
+                  return out
+
+              try:
+                  old_m, new_m = eat(old_text), eat(new_text)
+              except ET.ParseError:
+                  return f"content changed ({len(new_text.splitlines())} lines)"
+              parts = []
+
+              def show(v):
+                  v = v or "(unset)"
+                  return v[:width] + "..." if len(v) > width + 4 else v
+
+              for key in sorted(set(old_m) | set(new_m)):
+                  disp = key.replace(":", " ", 1)
+                  if key not in old_m:
+                      parts.append(f"+{disp}")
+                      continue
+                  if key not in new_m:
+                      parts.append(f"-{disp}")
+                      continue
+                  for attr in sorted(set(old_m[key]) | set(new_m[key])):
+                      ov, nv = old_m[key].get(attr, ""), new_m[key].get(attr, "")
+                      if ov != nv:
+                          parts.append(f"{disp}.{attr}: {show(ov)} -> {show(nv)}")
+              return "; ".join(parts) if parts else "content changed"
 
           # pass 1: manifests - transform upstream sources, then sync content
           for andir, fname in sorted(set(wd_man) | set(bp_man)):
@@ -258,9 +311,10 @@ jobs:
                       open(ours_path, "w").write(up_text)
                   added_man.append(ours_path)
               elif open(ours_path).read() != up_text:
+                  digest = diff_manifest(open(ours_path).read(), up_text)
                   if APPLY:
                       open(ours_path, "w").write(up_text)
-                  upd_man.append(ours_path)
+                  upd_man.append(f"{ours_path}: {digest}")
 
           # pass 1b: pair configs to manifests - a local config whose
           # manifest is missing locally but exists upstream gets it copied
@@ -299,6 +353,15 @@ jobs:
                   changed = []
                   for k in ("uname", "build_time"):
                       nv = up.get(k, "")
+                      if k == "uname":
+                          nv = vendor_uname(nv)
+                          ov = ours.get(k, "")
+                          if nv != ov:
+                              changed.append(f"{k}: {ov!r} -> {nv!r}"
+                                             + ("" if nv else
+                                                " (non-vendor-like cleared)"))
+                              ours[k] = nv
+                          continue
                       if k == "build_time" and not nv:
                           nv = up.get("ktimestamp", "")
                       if nv and ours.get(k) != nv:
@@ -344,12 +407,27 @@ jobs:
               if (andir, fname) not in up_manifest_fields:
                   man_wo_cfg.append(mpath)
 
-          # CI action matrix: one buildable entry per synced config
+          # CI action matrix: one buildable entry per synced config; updated
+          # rows carry what changed (config values and/or manifest pin drift)
+          man_changes = {}
+          for mentry in upd_man:
+              mpath, digest = mentry.split(": ", 1)
+              man_changes[mpath] = digest
+
           entries = []
           for entry in added_cfg + upd_cfg:
-              p = entry.split(" [")[0]
+              if entry in upd_cfg:
+                  p, changes = entry.split(": ", 1)  # "path: what changed"
+              else:
+                  p, changes = entry.split(" [")[0], ""
               andir, name = p.split("/")[1], p.split("/", 2)[2]
-              cfg = json.load(open(p)) if APPLY else {}
+              # updated configs are committed, so they resolve even on dry runs
+              cfg = json.load(open(p)) if (APPLY or entry in upd_cfg) else {}
+              if cfg.get("manifest"):
+                  mp = f"manifests/{andir}/{cfg['manifest']}"
+                  if mp in man_changes:
+                      changes = (f"{changes}; manifest {man_changes[mp]}"
+                                 if changes else f"manifest {man_changes[mp]}")
               entries.append({
                   "model": cfg.get("model", re.sub(r"\.json$", "", name)),
                   "android": andir,
@@ -358,7 +436,30 @@ jobs:
                                if cfg.get("manifest") else ""),
                   "os": cfg.get("os_version", OSV.get(andir, "")),
                   "kernel": cfg.get("kernel_version", ""),
+                  "changes": changes,
               })
+
+          # manifest-only updates: give one paired config a matrix row so the
+          # manifest drift shows up in the matrix (and gets a verify build)
+          for mpath, digest in man_changes.items():
+              andir, fname = mpath.split("/")[1], mpath.split("/", 2)[2]
+              for ca, cn in sorted(our_cfg_set):
+                  cp = f"configs/{ca}/{cn}"
+                  if ca != andir or any(e["config"] == cp for e in entries):
+                      continue
+                  c = json.load(open(cp))
+                  if c.get("manifest") != fname:
+                      continue
+                  entries.append({
+                      "model": c.get("model", re.sub(r"\.json$", "", cn)),
+                      "android": ca,
+                      "config": cp,
+                      "manifest": mpath,
+                      "os": c.get("os_version", OSV.get(ca, "")),
+                      "kernel": c.get("kernel_version", ""),
+                      "changes": f"manifest {digest}",
+                  })
+                  break
 
           summary = ["## Upstream sync report", ""]
           for title, items in [
@@ -377,7 +478,9 @@ jobs:
               summary.append("")
           summary.append(f"### CI matrix ({len(entries)} entries)")
           if entries:
-              summary.extend(f"- `{e['config']}`" for e in entries)
+              summary.extend(f"- `{e['config']}`"
+                             + (f" - {e['changes']}" if e.get("changes") else "")
+                             for e in entries)
           else:
               summary.append("_empty_")
           report = "\n".join(summary)
@@ -419,6 +522,7 @@ jobs:
 
           body = report + ("\n\nGenerated configs take upstream values; "
                            "extras are forced on, bbr3 on, bore off, "
+                           "vendor-like unames only, "
                            "root_tag ChimeraKernel. Merge to "
                            f"`{TARGET}`; the sync branch is deleted "
                            "automatically on merge.\n")
@@ -458,7 +562,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PYEOF'
-          import json, os, re, subprocess, urllib.request
+          import json, os, re, subprocess, time, urllib.request
 
           TOKEN = os.environ["GH_TOKEN"]
 
@@ -469,16 +573,34 @@ jobs:
               with urllib.request.urlopen(req) as r:
                   return json.load(r)
 
-          bp = api("https://api.github.com/repos/"
-                   f"{os.environ['BP_PATCHES_REPO']}/commits/HEAD")["sha"]
-          wd = api("https://api.github.com/repos/"
-                   f"{os.environ['WD_PATCHES_REPO']}/commits/HEAD")["sha"]
-          sus = api("https://gitlab.com/api/v4/projects/"
-                    "susfs4ksu%2Fsusfs4ksu/repository/commits"
-                    "?ref_name=kernel-susfs-latest&per_page=1")[0]
+          # transient 429/5xx on the remotes must not red the nightly run
+          def with_retries(fn, tries=3, delay=5.0):
+              for attempt in range(tries):
+                  try:
+                      return fn()
+                  except Exception:
+                      if attempt == tries - 1:
+                          raise
+                      time.sleep(delay)
+
+          bp = with_retries(lambda: api(
+              "https://api.github.com/repos/"
+              f"{os.environ['BP_PATCHES_REPO']}/commits/HEAD"))["sha"]
+          wd = with_retries(lambda: api(
+              "https://api.github.com/repos/"
+              f"{os.environ['WD_PATCHES_REPO']}/commits/HEAD"))["sha"]
+          # simonpunk/susfs4ksu @ the ref the build's DEFAULT_SUSFS pins;
+          # the previous project path was a nonexistent repo (404)
+          sus_list = with_retries(lambda: api(
+              "https://gitlab.com/api/v4/projects/simonpunk%2Fsusfs4ksu"
+              "/repository/commits?ref_name=gki-android16-6.12&per_page=1"))
+          if not (isinstance(sus_list, list) and sus_list):
+              raise RuntimeError("susfs4ksu gitlab: no commits for "
+                                 "ref gki-android16-6.12")
+          sus = sus_list[0]
 
           action = open(".github/actions/build-kernel/action.yml").read()
-          lines = [f"- **susfs4ksu/kernel-susfs-latest** head: "
+          lines = [f"- **susfs4ksu/gki-android16-6.12** head: "
                    f"`{sus['id']}` ({sus['committed_date']})",
                    f"- **WD kernel_patches** head: `{wd}`"]
           m = re.search(r"BP_PATCHES_REF[^\n]*?([0-9a-f]{40})", action)
