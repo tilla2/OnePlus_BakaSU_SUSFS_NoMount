@@ -4,6 +4,8 @@ name: upstream-sync-monitor
 # trees and emit a CI action matrix (no writes, no PR). The sync branch is
 # force-pushed only on a manual run with apply=true; open the PR manually
 # from that branch - it is deleted automatically when the PR merges.
+# Apply runs also regenerate the device_a14/a15/a16 dispatch menus in
+# build-kernel-release.yml from configs/ onto the same sync branch.
 # Upstream manifests are rewritten to our
 # huangdihd AnyKernel3 (wild remote, gki-2.0) before they are saved, and
 # configs are generated from the canonical template with upstream values -
@@ -71,7 +73,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PYEOF'
-          import json, os, re, subprocess, time, urllib.request
+          import glob, json, os, re, subprocess, time, urllib.request
 
           TOKEN = os.environ["GH_TOKEN"]
           TARGET = os.environ["TARGET_BRANCH"]
@@ -450,6 +452,56 @@ jobs:
               if (andir, fname) not in up_manifest_fields:
                   man_wo_cfg.append(mpath)
 
+          # pass 2d: regenerate the device_a14/a15/a16 dispatch menus in
+          # build-kernel-release.yml from configs/ - alphabetical, none
+          # first; the a16 menu also offers the a17 tree. The rewrite
+          # lands on the sync branch with everything else (PR merged
+          # manually), never committed straight to the base branch.
+          wf_path = ".github/workflows/build-kernel-release.yml"
+
+          def wf_menu_entries(patterns):
+              names = set()
+              for pat in patterns:
+                  names.update(os.path.splitext(os.path.basename(p))[0]
+                               for p in glob.glob(pat))
+              return sorted(names)
+
+          WF_MENUS = (
+              ("device_a14", ["configs/a14/*.json"]),
+              ("device_a15", ["configs/a15/*.json"]),
+              ("device_a16", ["configs/a16/*.json", "configs/a17/*.json"]),
+          )
+
+          def apply_menus(text):
+              changed = []
+              for key, patterns in WF_MENUS:
+                  entries = wf_menu_entries(patterns)
+                  m = re.search(
+                      r"(?m)(^      " + re.escape(key) + r":\n"
+                      r"(?:^        .*\n)*?^        options:\n)"
+                      r"((?:^          - .*\n)+)", text)
+                  if not m:
+                      raise SystemExit("::error::options list for "
+                                       f"{key} not found in {wf_path}")
+                  old = [l.strip()[2:] for l in m.group(2).splitlines()]
+                  new = ["none"] + entries
+                  items = "".join(f"          - {e}\n" for e in new)
+                  text = text[:m.start(2)] + items + text[m.end(2):]
+                  if old != new:
+                      changed.append(f"{key}: {len(entries)} device(s) "
+                                     f"+ none (was {max(len(old) - 1, 0)})")
+              return text, changed
+
+          wf_new, regen = apply_menus(
+              open(wf_path, encoding="utf-8").read())
+          if apply_menus(wf_new)[1]:
+              raise SystemExit("::error::device-menu regeneration is "
+                               "not idempotent - aborting without writing")
+          if regen and APPLY:
+              open(wf_path, "w", encoding="utf-8").write(wf_new)
+          elif not regen:
+              print("device menus already canonical - nothing to regenerate")
+
           # CI action matrix: one buildable entry per synced config; updated
           # rows carry what changed (config values and/or manifest pin drift)
           man_changes = {}
@@ -511,6 +563,7 @@ jobs:
                   ("Updated manifests", upd_man),
                   ("Updated configs", upd_cfg),
                   ("Standardised configs (template enforced)", std_cfg),
+                  ("Regenerated device menus (build-kernel-release.yml)", regen),
                   ("Config references missing upstream manifest", orphan_cfg),
                   ("Manifests without upstream config counterpart "
                    "(copied, no build config)", man_wo_cfg)]:
@@ -541,7 +594,8 @@ jobs:
               print("Report/matrix only - no files written"
                     + (" (dry run)" if os.environ["DRY_RUN"] == "true" else ""))
               raise SystemExit(0)
-          if not (added_man + added_cfg + upd_man + upd_cfg + std_cfg):
+          if not (added_man + added_cfg + upd_man + upd_cfg + std_cfg
+                  + regen):
               print("No changes to apply")
               raise SystemExit(0)
 
@@ -554,10 +608,13 @@ jobs:
           branch = os.environ["SYNC_BRANCH"] + "-" + re.sub(
               r"[^A-Za-z0-9._-]", "-", TARGET).strip("-")
           subprocess.run(["git", "checkout", "-b", branch], check=True)
-          subprocess.run(["git", "add", "manifests/", "configs/"], check=True)
-          subprocess.run(["git", "commit", "-m",
-                          "sync: upstream manifests (huangdihd anykernel) "
-                          "& generated configs"], check=True)
+          subprocess.run(["git", "add", "manifests/", "configs/", wf_path],
+                         check=True)
+          commit_msg = ("sync: upstream manifests (huangdihd anykernel) "
+                        "& generated configs")
+          if regen:
+              commit_msg += "; regenerate device menus"
+          subprocess.run(["git", "commit", "-m", commit_msg], check=True)
           subprocess.run(["git", "push", "-f", "origin", branch], check=True)
 
           repo = os.environ.get("GITHUB_REPOSITORY", "")
