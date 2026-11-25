@@ -1738,7 +1738,7 @@ jobs:
             # Probe only plausible APK bundles: upstream also uploads mappings/ksud/lkm
             # artifacts that would burn rate-limited download attempts; release before debug.
             ART_ROWS=$(gh api "repos/${MANAGER_REPO}/actions/runs/${MANAGER_RUN_ID}/artifacts?per_page=100" \
-              --jq '[.artifacts[] | select(.expired == false) | select(.name | test("mappings|symbols|ksud|ksuinit|lkm|telegram"; "i") | not)] | sort_by([(.name | test("debug"; "i")), (.name | test("release"; "i")) | not]) | .[] | "\(.id) \(.name)"' || true)
+              --jq '[.artifacts[] | select(.expired == false) | select(.name | test("mappings|symbols|ksud|ksuinit|lkm|telegram"; "i") | not)] | sort_by([(.name | test("debug"; "i")), ((.name | test("release"; "i")) | not)]) | .[] | "\(.id) \(.name)"' || true)
             while read -r aid aname; do
               [ -z "$aid" ] && continue
               [ -s apk-map.tsv ] && break
@@ -1763,6 +1763,10 @@ jobs:
                 printf '%s\tartifact\t%s\n' "$new_apk" "$aid" >> apk-map.tsv
               done
             done <<< "$ART_ROWS"
+            # Debug-only means the release bundle was absent or undownloadable - say so loudly.
+            if ls ./*.apk >/dev/null 2>&1 && [ -z "$(ls ./*.apk 2>/dev/null | grep -vi 'debug' | head -n1 || true)" ]; then
+              echo "::warning::Manager fetch: only debug APK(s) came out of the commit-exact CI run (release artifacts absent or undownloadable)"
+            fi
           fi
 
           if ! ls ./*.apk >/dev/null 2>&1; then
@@ -2048,7 +2052,7 @@ jobs:
             mkdir -p /tmp/mgr
             # Probe only plausible APK bundles (skip mappings/ksud/lkm junk); release before debug.
             ART_ROWS=$(gh api "repos/${MANAGER_REPO}/actions/runs/${MANAGER_RUN_ID}/artifacts?per_page=100" \
-              --jq '[.artifacts[] | select(.expired == false) | select(.name | test("mappings|symbols|ksud|ksuinit|lkm|telegram"; "i") | not)] | sort_by([(.name | test("debug"; "i")), (.name | test("release"; "i")) | not]) | .[] | "\(.id) \(.name)"' || true)
+              --jq '[.artifacts[] | select(.expired == false) | select(.name | test("mappings|symbols|ksud|ksuinit|lkm|telegram"; "i") | not)] | sort_by([(.name | test("debug"; "i")), ((.name | test("release"; "i")) | not)]) | .[] | "\(.id) \(.name)"' || true)
             while read -r aid aname; do
               [ -z "$aid" ] && continue
               ls -1 *.apk 2>/dev/null | sort > /tmp/mgr/apks-before.txt || true
@@ -2070,6 +2074,10 @@ jobs:
               comm -13 /tmp/mgr/apks-before.txt /tmp/mgr/apks-after.txt > /tmp/mgr/new.txt
               [ -s /tmp/mgr/new.txt ] && break
             done <<< "$ART_ROWS"
+            # Debug-only means the release bundle was absent or undownloadable - say so loudly.
+            if ls ./*.apk >/dev/null 2>&1 && [ -z "$(ls ./*.apk 2>/dev/null | grep -vi 'debug' | head -n1 || true)" ]; then
+              echo "::warning::Manager fetch: only debug APK(s) came out of the commit-exact CI run (release artifacts absent or undownloadable)"
+            fi
           fi
 
           if ! ls ./*.apk >/dev/null 2>&1; then

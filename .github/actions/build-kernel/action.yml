@@ -4354,6 +4354,7 @@ runs:
         echo "::group::Patch stealth-guard audit"
         mkdir -p "$GITHUB_WORKSPACE/patch-faillogs"
         AUDIT="$GITHUB_WORKSPACE/patch-faillogs/patch-audit.txt"
+        audit_body="$GITHUB_WORKSPACE/patchgen/patch-audit.body"
         if [ -z "${PS_FILE:-}" ] || [ ! -f "$PS_FILE" ]; then
           echo "No patch status file; nothing to audit"
           echo "::endgroup::"
@@ -4367,7 +4368,31 @@ runs:
           [ -n "${name:-}" ] || continue
           last_status["$name"]="${status:-unknown}"
         done < "$PS_FILE"
-        stealth_fail=0; ok_applied=0; ok_already=0; info=0; oracle_checked=0
+        stealth_fail=0; ok_applied=0; ok_already=0; info=0; oracle_checked=0; superseded=0
+        # Supersession index: every '-' line in the patchset, scoped to the b/ path it
+        # edits. An applied patch's oracle line can legitimately vanish when a LATER
+        # patch rewrites the same file (re_write_* on top of add_*): those are excused
+        # as superseded; anything else stays a stealth failure.
+        SUP_IDX="$GITHUB_WORKSPACE/patchgen/supersession-index.tsv"
+        SUP_PATHS="$GITHUB_WORKSPACE/patchgen/supersession-paths.tsv"
+        : > "$SUP_IDX"
+        : > "$SUP_PATHS"
+        sup_dirs=""
+        if [ -d "$KERNEL_PATCHES_FOLDER" ]; then sup_dirs="$sup_dirs $KERNEL_PATCHES_FOLDER"; fi
+        if [ -d "$SUSFS_FOLDER/kernel_patches" ]; then sup_dirs="$sup_dirs $SUSFS_FOLDER/kernel_patches"; fi
+        while IFS= read -r -d '' pf; do
+          pname=$(basename "$pf" .patch)
+          bpath=""
+          while IFS= read -r pl; do
+            case "$pl" in
+              '+++ '*) bpath="${pl#\+\+\+ }"; bpath="${bpath%%$'\t'*}"; bpath="${bpath#b/}"; [ -n "$bpath" ] && printf '%s\t%s\n' "$pname" "$bpath" >> "$SUP_PATHS" || true ;;
+              '--- '*) ;;
+              -*) [ -n "$bpath" ] && printf '%s\t%s\t%s\n' "$bpath" "$pname" "$(printf '%s' "${pl#-}" | sed -e 's/[[:space:]]\{1,\}/ /g' -e 's/^ //' -e 's/ $//')" ;;
+            esac
+          done < "$pf"
+        done < <(find $sup_dirs -type f -name '*.patch' -print0 2>/dev/null) >> "$SUP_IDX"
+        sort -u -o "$SUP_IDX" "$SUP_IDX"
+        sort -u -o "$SUP_PATHS" "$SUP_PATHS" 2>/dev/null || true
         {
           echo "device=${OP_MODEL:-?} os=${OP_OS_VERSION:-?} kernel=${ANDROID_VER:-?}-${TKERNEL_VER:-?}"
           for name in $(printf '%s\n' "${!last_status[@]}" | sort); do
@@ -4380,8 +4405,24 @@ runs:
                   while IFS=$'\t' read -r root file line; do
                     [ -n "${file:-}" ] || continue
                     if [ ! -f "$root/$file" ] || ! grep -qF -- "$line" "$root/$file" 2>/dev/null; then
-                      echo "ORACLE-MISS ${name}: ${root}/${file}: ${line}"
-                      miss=$((miss+1))
+                      nline=$(printf '%s' "$line" | sed -e 's/[[:space:]]\{1,\}/ /g' -e 's/^ //' -e 's/ $//')
+                      sup_by=""
+                      while IFS= read -r cand; do
+                        case "$file" in
+                          */"$cand")
+                            sup_by=$(awk -F'\t' -v f="$cand" -v l="$nline" '$1 == f && $3 == l { print $2; exit }' "$SUP_IDX" 2>/dev/null || true)
+                            if [ -n "$sup_by" ]; then break; fi
+                            ;;
+                        esac
+                      done < <(awk -F'\t' -v n="$name" '$1 == n { print $2 }' "$SUP_PATHS" 2>/dev/null | sort -u)
+                      if [ -n "$sup_by" ] && [ "$sup_by" != "$name" ] \
+                         && { [ "${last_status[$sup_by]:-}" = applied ] || [ "${last_status[$sup_by]:-}" = already ]; }; then
+                        echo "superseded ${name}: oracle line replaced by later patch '${sup_by}' in ${file}: ${line}"
+                        superseded=$((superseded+1))
+                      else
+                        echo "ORACLE-MISS ${name}: ${root}/${file}: ${line}"
+                        miss=$((miss+1))
+                      fi
                     fi
                   done < "$oracle"
                   oracle_checked=$((oracle_checked+1))
@@ -4411,9 +4452,15 @@ runs:
                 ;;
             esac
           done
-          echo "applied_ok=${ok_applied} already_ok=${ok_already} oracle_checked=${oracle_checked} skipped_or_other=${info} ledger_entries=${ledger_entries}"
-        } | tee "$AUDIT"
+          echo "applied_ok=${ok_applied} already_ok=${ok_already} oracle_checked=${oracle_checked} superseded=${superseded} skipped_or_other=${info} ledger_entries=${ledger_entries}"
+        } > "$audit_body"
+        tee "$AUDIT" < "$audit_body"
         cat "$AUDIT" >> "${GITHUB_STEP_SUMMARY:-/dev/null}" 2>/dev/null || true
+        stealth_fail=0
+        if [ -f "$AUDIT" ]; then
+          stealth_fail=$(grep -c '^STEALTH-FAIL' "$AUDIT" 2>/dev/null || true)
+          [ -n "$stealth_fail" ] || stealth_fail=0
+        fi
         echo "::endgroup::"
         if [ "$stealth_fail" -gt 0 ]; then
           echo "::error::stealth-guard: ${stealth_fail} patch(es) missing from the tree; refusing to build (see patch-audit.txt)"
