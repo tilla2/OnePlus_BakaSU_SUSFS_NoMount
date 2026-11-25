@@ -1,0 +1,520 @@
+name: upstream-sync-monitor
+
+# Daily: detect new/changed devices in the WildKernels and Bouteillepleine
+# trees and emit a CI action matrix (no writes, no PR). PR creation happens
+# only on a manual run with create_pr=true; the sync branch is deleted
+# automatically when its PR merges. Upstream manifests are rewritten to our
+# huangdihd AnyKernel3 (wild remote, gki-2.0) before they are saved, and
+# configs are generated from the canonical template with upstream values -
+# nothing under manifests/ or configs/ is hand-edited here.
+
+on:
+  schedule:
+    - cron: "0 21 * * *"
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: "Base branch for the sync PR (default: the branch this run is dispatched from)"
+        default: ""
+        required: false
+      create_pr:
+        description: "Apply changes and open/update the sync PR"
+        type: boolean
+        default: false
+      dry_run:
+        description: "Detect and report only (no writes even with create_pr)"
+        type: boolean
+        default: false
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync-monitor
+  cancel-in-progress: false
+
+env:
+  WD_REPO: WildKernels/OnePlus_KernelSU_SUSFS
+  BP_REPO: Bouteillepleine/OnePlus-BakaSu_NMS
+  BP_PATCHES_REPO: Bouteillepleine/kernel_patches
+  WD_PATCHES_REPO: WildKernels/kernel_patches
+  AK_REMOTE_URL: https://github.com/huangdihd
+  AK_PROJECT: <project remote="wild" name="AnyKernel3" path="AnyKernel3" revision="gki-2.0"/>
+  SYNC_BRANCH: upstream-sync/auto
+
+jobs:
+  sync-devices:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.sync.outputs.matrix }}
+    steps:
+      - name: Checkout working branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_branch || github.ref_name }}
+          fetch-depth: 1
+
+      - name: Detect upstream changes, pair & rewrite sources, emit CI matrix
+        id: sync
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_BRANCH: ${{ inputs.target_branch || github.ref_name }}
+          CREATE_PR: ${{ inputs.create_pr && 'true' || 'false' }}
+          DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+          AK_REMOTE_URL: ${{ env.AK_REMOTE_URL }}
+          AK_PROJECT: ${{ env.AK_PROJECT }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          import json, os, re, subprocess, urllib.request
+
+          TOKEN = os.environ["GH_TOKEN"]
+          TARGET = os.environ["TARGET_BRANCH"]
+          APPLY = (os.environ["CREATE_PR"] == "true"
+                   and os.environ["DRY_RUN"] != "true")
+          WD_REPO, BP_REPO = os.environ["WD_REPO"], os.environ["BP_REPO"]
+          AK_REMOTE_URL = os.environ["AK_REMOTE_URL"]
+          AK_PROJECT = os.environ["AK_PROJECT"]
+
+          def api(url):
+              req = urllib.request.Request(url, headers={
+                  "Authorization": f"Bearer {TOKEN}",
+                  "User-Agent": "upstream-sync-monitor",
+                  "Accept": "application/vnd.github+json"})
+              with urllib.request.urlopen(req) as r:
+                  return json.load(r)
+
+          def default_branch(repo):
+              return api(f"https://api.github.com/repos/{repo}")["default_branch"]
+
+          def tree(repo, ref):
+              data = api(f"https://api.github.com/repos/{repo}/git/trees/{ref}?recursive=1")
+              out, stack = [], [data["tree"]]
+              while stack:
+                  for e in stack.pop():
+                      if e["type"] == "tree":
+                          stack.append(api(e["url"])["tree"])
+                      else:
+                          out.append(e["path"])
+              return sorted(set(out))
+
+          def raw(repo, ref, path):
+              req = urllib.request.Request(
+                  f"https://raw.githubusercontent.com/{repo}/{ref}/{path}",
+                  headers={"User-Agent": "upstream-sync-monitor"})
+              with urllib.request.urlopen(req) as r:
+                  return r.read().decode("utf-8")
+
+          # canonical config template: identity -> toolchain -> features;
+          # rekernel (patchset) above the blacklist block; naming/build-time
+          # misc at the bottom, root_tag last.
+          TEMPLATE = ["model", "soc", "branch", "manifest", "android_version",
+              "kernel_version", "os_version", "lto", "zyc_compiler",
+              "c_compiler", "rust_compiler", "bindgen", "rust_build",
+              "disk_cleanup", "hmbird", "susfs", "opt", "ds", "bbg", "bbr",
+              "bbr3", "bore", "lz4_upgrade", "zstd_upgrade", "rtmutex_cve",
+              "adios", "ttl", "ip_set", "unicode", "ntsync", "sdp900ma",
+              "usbadb_gate", "hide_adb_jdwp", "rekernel", "blacklist_apply",
+              "blacklist_modules", "uname", "build_user", "build_host",
+              "build_time", "root_tag"]
+          # fleet policy: extras always on, bbr3 always on, bore always off
+          DEFAULT_TRUE = ["rust_build", "disk_cleanup", "susfs", "opt", "ds",
+              "bbg", "bbr", "lz4_upgrade", "zstd_upgrade", "rtmutex_cve",
+              "adios", "ttl", "ip_set", "unicode", "ntsync", "rekernel"]
+          FORCED = {"bbr3": True, "bore": False, "sdp900ma": True,
+                    "usbadb_gate": True, "hide_adb_jdwp": True}
+          TOOLCHAIN_DEFAULTS = {"zyc_compiler": "", "c_compiler": "",
+                                "rust_compiler": "", "bindgen": ""}
+          MISC_KEYS = ["uname", "build_user", "build_host", "build_time"]
+          OSV = {"a14": "A14", "a15": "A15", "a16": "A16", "a17": "A17"}
+          ANDV = {"a14": "android14", "a15": "android15",
+                  "a16": "android16", "a17": "android17"}
+          KVER_RE = re.compile(r"(?:6|5)\.\d+")
+
+          def order_config(cfg):
+              return {k: cfg[k] for k in TEMPLATE if k in cfg}
+
+          def dump(cfg):
+              return json.dumps(cfg, indent=2, ensure_ascii=False) + "\n"
+
+          def transform_manifest(text):
+              # rewrite upstream sources to our anykernel implementation:
+              # the org remote becomes wild -> huangdihd and the AnyKernel3
+              # project is replaced by our canonical gki-2.0 entry; kernel,
+              # aosp and CLO prebuilt projects stay untouched.
+              text = re.sub(r'<remote[^>]*name="wild"[^>]*/>',
+                            f'<remote fetch="{AK_REMOTE_URL}" name="wild"/>',
+                            text)
+              text = re.sub(
+                  r'\n?[ \t]*<remote[^>]*fetch="https://github\.com/'
+                  r'(?:WildKernels|Bouteillepleine)"[^>]*/>', "", text)
+              text = re.sub(r'remote="(?:WildKernels|Bouteillepleine)"',
+                            'remote="wild"', text)
+              if 'name="wild"' not in text:
+                  text = text.replace(
+                      "  <default ",
+                      f'  <remote fetch="{AK_REMOTE_URL}" name="wild"/>\n'
+                      "  <default ", 1)
+              text = re.sub(r'<project[^>]*name="AnyKernel3"[^>]*/>',
+                            AK_PROJECT, text)
+              if 'name="AnyKernel3"' not in text:
+                  raise SystemExit("transform failed: no AnyKernel3 project")
+              return text
+
+          wd_ref, bp_ref = default_branch(WD_REPO), default_branch(BP_REPO)
+          print(f"upstream heads: {WD_REPO}@{wd_ref}  {BP_REPO}@{bp_ref}")
+          wd_paths, bp_paths = tree(WD_REPO, wd_ref), tree(BP_REPO, bp_ref)
+
+          def inv(paths, kind):
+              out = {}
+              for p in paths:
+                  m = re.match(rf"^{kind}/(a1[4-7])/([^/]+\.(?:xml|json))$", p)
+                  if m:
+                      out[(m.group(1), m.group(2))] = p
+              return out
+
+          wd_man, bp_man = inv(wd_paths, "manifests"), inv(bp_paths, "manifests")
+          wd_cfgs, bp_cfgs = inv(wd_paths, "configs"), inv(bp_paths, "configs")
+
+          our_man = subprocess.run(["git", "ls-files", "manifests/"],
+                                   capture_output=True, text=True).stdout.split()
+          our_cfgs = subprocess.run(["git", "ls-files", "configs/"],
+                                    capture_output=True, text=True).stdout.split()
+          our_man_set = {(p.split("/")[1], p.split("/", 2)[2])
+                         for p in our_man if p.count("/") >= 2}
+          our_cfg_set = {(p.split("/")[1], p.split("/", 2)[2])
+                         for p in our_cfgs if p.count("/") >= 2}
+
+          def ref_cfg_for(andir):
+              pref = [p for p in our_cfgs if p.startswith(f"configs/{andir}/")]
+              want = f"configs/{andir}/OP15.json"
+              pick = want if want in pref else (pref[0] if pref else None)
+              return json.load(open(pick)) if pick else {}
+
+          added_man, upd_man, added_cfg, upd_cfg = [], [], [], []
+          man_wo_cfg, orphan_cfg, up_manifest_fields = [], [], set()
+
+          def gen_config(up, rcfg, andir, cfg_name, up_man_paths):
+              mfield = up.get("manifest", "")
+              if not mfield:
+                  stem = re.sub(r"\.json$", "", cfg_name)
+                  cand = [f for (_, f) in up_man_paths if f == stem + ".xml"]
+                  mfield = cand[0] if cand else ""
+              orphan = bool(mfield) and (andir, mfield) not in up_man_paths
+              kv = up.get("kernel_version", "")
+              if not kv and mfield:
+                  mm = KVER_RE.search(mfield)
+                  kv = mm.group(0) if mm else ""
+              if not kv:
+                  kv = rcfg.get("kernel_version", "")
+              dropped = sorted(set(up) - set(TEMPLATE) - {"ktimestamp"})
+              policy = dict(FORCED)
+              policy.update({k: True for k in DEFAULT_TRUE})
+              ignored = sorted(k for k, v in policy.items() if k in up and up[k] != v)
+              cfg = {
+                  "model": up.get("model", re.sub(r"\.json$", "", cfg_name)),
+                  "soc": up.get("soc", rcfg.get("soc", "")),
+                  "branch": up.get("branch", rcfg.get("branch", "")),
+                  "manifest": mfield,
+                  "android_version": ANDV.get(andir, andir),
+                  "kernel_version": kv,
+                  "os_version": up.get("os_version",
+                                       OSV.get(andir, andir.upper())),
+                  "lto": up.get("lto", rcfg.get("lto", "none")),
+                  "hmbird": up.get("hmbird", rcfg.get("hmbird", False)),
+                  "blacklist_apply": up.get("blacklist_apply",
+                                            rcfg.get("blacklist_apply", True)),
+                  "blacklist_modules": up.get("blacklist_modules",
+                                              rcfg.get("blacklist_modules", "")),
+                  "root_tag": up.get("root_tag", "ChimeraKernel"),
+              }
+              for k in DEFAULT_TRUE:
+                  cfg[k] = True
+              cfg.update(FORCED)
+              for k, d in TOOLCHAIN_DEFAULTS.items():
+                  cfg[k] = up.get(k, rcfg.get(k, d))
+              for k in MISC_KEYS:
+                  v = up.get(k, "")
+                  if k == "build_time" and not v:
+                      v = up.get("ktimestamp", "")
+                  cfg[k] = v
+              return {k: cfg[k] for k in TEMPLATE}, dropped, ignored, orphan
+
+          # pass 1: manifests - transform upstream sources, then sync content
+          for andir, fname in sorted(set(wd_man) | set(bp_man)):
+              key = (andir, fname)
+              if key in bp_man:
+                  src_repo, src_ref, src_path = BP_REPO, bp_ref, bp_man[key]
+              else:
+                  src_repo, src_ref, src_path = WD_REPO, wd_ref, wd_man[key]
+              ours_path = f"manifests/{andir}/{fname}"
+              up_text = transform_manifest(raw(src_repo, src_ref, src_path))
+              if key not in our_man_set:
+                  if APPLY:
+                      os.makedirs(os.path.dirname(ours_path), exist_ok=True)
+                      open(ours_path, "w").write(up_text)
+                  added_man.append(ours_path)
+              elif open(ours_path).read() != up_text:
+                  if APPLY:
+                      open(ours_path, "w").write(up_text)
+                  upd_man.append(ours_path)
+
+          # pass 1b: pair configs to manifests - a local config whose
+          # manifest is missing locally but exists upstream gets it copied
+          local_man_set = set(our_man_set) | {
+              (p.split("/")[1], p.split("/", 2)[2]) for p in added_man}
+          for andir, cfg_name in sorted(our_cfg_set):
+              cfg = json.load(open(f"configs/{andir}/{cfg_name}"))
+              m = cfg.get("manifest", "")
+              if not m or (andir, m) in local_man_set:
+                  continue
+              if (andir, m) not in (set(wd_man) | set(bp_man)):
+                  continue
+              src_man = bp_man if (andir, m) in bp_man else wd_man
+              repo, ref = ((BP_REPO, bp_ref) if (andir, m) in bp_man
+                           else (WD_REPO, wd_ref))
+              mpath = f"manifests/{andir}/{m}"
+              up_text = transform_manifest(raw(repo, ref, src_man[(andir, m)]))
+              if APPLY:
+                  os.makedirs(os.path.dirname(mpath), exist_ok=True)
+                  open(mpath, "w").write(up_text)
+              added_man.append(mpath)
+              local_man_set.add((andir, m))
+
+          # pass 2: configs - paths and names come from upstream configs/,
+          # values from the upstream counterpart (BP priority), our template
+          for andir, cfg_name in sorted(set(wd_cfgs) | set(bp_cfgs)):
+              key = (andir, cfg_name)
+              bp_t = raw(BP_REPO, bp_ref, bp_cfgs[key]) if key in bp_cfgs else None
+              wd_t = raw(WD_REPO, wd_ref, wd_cfgs[key]) if key in wd_cfgs else None
+              up = json.loads(bp_t) if bp_t else (json.loads(wd_t) if wd_t else {})
+              if up.get("manifest"):
+                  up_manifest_fields.add((andir, up["manifest"]))
+              ours_path = f"configs/{andir}/{cfg_name}"
+              if key in our_cfg_set:
+                  ours = json.load(open(ours_path))
+                  changed = []
+                  for k in ("uname", "build_time"):
+                      nv = up.get(k, "")
+                      if k == "build_time" and not nv:
+                          nv = up.get("ktimestamp", "")
+                      if nv and ours.get(k) != nv:
+                          changed.append(f"{k}: {ours.get(k)!r} -> {nv!r}")
+                          ours[k] = nv
+                  for k in ("soc", "branch", "root_tag"):
+                      if not ours.get(k):
+                          nv = up.get(k, "ChimeraKernel" if k == "root_tag" else "")
+                          if nv:
+                              changed.append(f"{k}: set {nv!r}")
+                              ours[k] = nv
+                  rekeyed = order_config(ours)
+                  if changed:
+                      if APPLY:
+                          open(ours_path, "w").write(dump(rekeyed))
+                      upd_cfg.append(f"{ours_path}: " + "; ".join(changed))
+                  elif rekeyed != ours:
+                      if APPLY:
+                          open(ours_path, "w").write(dump(rekeyed))
+                      upd_cfg.append(f"{ours_path}: key order normalized")
+                  continue
+              rcfg = ref_cfg_for(andir)
+              ordered, dropped, ignored, orphan = gen_config(
+                  up, rcfg, andir, cfg_name, set(wd_man) | set(bp_man))
+              if orphan:
+                  orphan_cfg.append(f"{ours_path} -> "
+                                    f"manifests/{andir}/{ordered['manifest']}")
+              if APPLY:
+                  os.makedirs(os.path.dirname(ours_path), exist_ok=True)
+                  open(ours_path, "w").write(dump(ordered))
+              notes = []
+              if dropped:
+                  notes.append(f"dropped upstream-only: {', '.join(dropped)}")
+              if ignored:
+                  notes.append(f"extras kept on: {', '.join(ignored)}")
+              added_cfg.append(ours_path
+                               + (f" [{'; '.join(notes)}]" if notes else ""))
+
+          # pass 2b: pair manifests to configs - flag added manifests that
+          # no upstream config references (copied, but not buildable alone)
+          for mpath in added_man:
+              andir, fname = mpath.split("/")[1], mpath.split("/", 2)[2]
+              if (andir, fname) not in up_manifest_fields:
+                  man_wo_cfg.append(mpath)
+
+          # CI action matrix: one buildable entry per synced config
+          entries = []
+          for entry in added_cfg + upd_cfg:
+              p = entry.split(" [")[0]
+              andir, name = p.split("/")[1], p.split("/", 2)[2]
+              cfg = json.load(open(p)) if APPLY else {}
+              entries.append({
+                  "model": cfg.get("model", re.sub(r"\.json$", "", name)),
+                  "android": andir,
+                  "config": p,
+                  "manifest": (f"manifests/{andir}/{cfg['manifest']}"
+                               if cfg.get("manifest") else ""),
+                  "os": cfg.get("os_version", OSV.get(andir, "")),
+                  "kernel": cfg.get("kernel_version", ""),
+              })
+
+          summary = ["## Upstream sync report", ""]
+          for title, items in [
+                  ("New manifests (rewritten to huangdihd anykernel)", added_man),
+                  ("New configs", added_cfg),
+                  ("Updated manifests", upd_man),
+                  ("Updated configs", upd_cfg),
+                  ("Config references missing upstream manifest", orphan_cfg),
+                  ("Manifests without upstream config counterpart "
+                   "(copied, no build config)", man_wo_cfg)]:
+              summary.append(f"### {title} ({len(items)})")
+              if items:
+                  summary.extend(f"- {i}" for i in items)
+              else:
+                  summary.append("_none_")
+              summary.append("")
+          summary.append(f"### CI matrix ({len(entries)} entries)")
+          if entries:
+              summary.extend(f"- `{e['config']}`" for e in entries)
+          else:
+              summary.append("_empty_")
+          report = "\n".join(summary)
+          print(report)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(report)
+
+          with open("ci-matrix.json", "w") as f:
+              json.dump({"include": entries}, f, indent=2)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"matrix={json.dumps({'include': entries})}\n")
+
+          if not APPLY:
+              print("Report/matrix only - no files written"
+                    + (" (dry run)" if os.environ["DRY_RUN"] == "true" else ""))
+              raise SystemExit(0)
+          if not (added_man + added_cfg + upd_man + upd_cfg):
+              print("No changes to apply")
+              raise SystemExit(0)
+
+          subprocess.run(["git", "config", "user.name", "upstream-sync-bot"],
+                         check=True)
+          subprocess.run(["git", "config", "user.email",
+                          "actions@github.com"], check=True)
+          # per-target sync branch: dispatches against different bases must
+          # not force-push each other's open sync PR out from under it
+          branch = os.environ["SYNC_BRANCH"] + "-" + re.sub(
+              r"[^A-Za-z0-9._-]", "-", TARGET).strip("-")
+          subprocess.run(["git", "checkout", "-b", branch], check=True)
+          subprocess.run(["git", "add", "manifests/", "configs/"], check=True)
+          subprocess.run(["git", "commit", "-m",
+                          "sync: upstream manifests (huangdihd anykernel) "
+                          "& generated configs"], check=True)
+          subprocess.run(["git", "push", "-f", "origin", branch], check=True)
+
+          def gh(*args):
+              return subprocess.run(["gh"] + list(args),
+                                    capture_output=True, text=True)
+
+          body = report + ("\n\nGenerated configs take upstream values; "
+                           "extras are forced on, bbr3 on, bore off, "
+                           "root_tag ChimeraKernel. Merge to "
+                           f"`{TARGET}`; the sync branch is deleted "
+                           "automatically on merge.\n")
+          existing = gh("pr", "list", "--head", branch, "--state", "open",
+                        "--json", "number", "--jq", ".[0].number").stdout.strip()
+          if existing:
+              gh("pr", "comment", existing, "--body", body)
+              print(f"Updated existing PR #{existing}")
+          else:
+              pr = gh("pr", "create", "--base", TARGET, "--head", branch,
+                      "--title", "Upstream sync: new/updated devices & configs",
+                      "--body", body)
+              print(pr.stdout or pr.stderr)
+          PYEOF
+
+      - name: Upload CI matrix artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-matrix
+          path: ci-matrix.json
+          if-no-files-found: ignore
+
+  watch-pins:
+    runs-on: ubuntu-latest
+    if: ${{ inputs.dry_run != true }}
+    steps:
+      - name: Checkout working branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_branch || github.ref_name }}
+          fetch-depth: 1
+
+      - name: Watch susfs & kernel_patches pins for drift
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          import json, os, re, subprocess, urllib.request
+
+          TOKEN = os.environ["GH_TOKEN"]
+
+          def api(url):
+              req = urllib.request.Request(url, headers={
+                  "Authorization": f"Bearer {TOKEN}",
+                  "User-Agent": "upstream-sync-monitor"})
+              with urllib.request.urlopen(req) as r:
+                  return json.load(r)
+
+          bp = api("https://api.github.com/repos/"
+                   f"{os.environ['BP_PATCHES_REPO']}/commits/HEAD")["sha"]
+          wd = api("https://api.github.com/repos/"
+                   f"{os.environ['WD_PATCHES_REPO']}/commits/HEAD")["sha"]
+          sus = api("https://gitlab.com/api/v4/projects/"
+                    "susfs4ksu%2Fsusfs4ksu/repository/commits"
+                    "?ref_name=kernel-susfs-latest&per_page=1")[0]
+
+          action = open(".github/actions/build-kernel/action.yml").read()
+          lines = [f"- **susfs4ksu/kernel-susfs-latest** head: "
+                   f"`{sus['id']}` ({sus['committed_date']})",
+                   f"- **WD kernel_patches** head: `{wd}`"]
+          m = re.search(r"BP_PATCHES_REF[^\n]*?([0-9a-f]{40})", action)
+          if m and m.group(1) != bp:
+              lines.insert(0, f"- **BP kernel_patches drift**: pinned "
+                              f"`{m.group(1)}` but upstream head is `{bp}`")
+          body = ("### Upstream pin drift\n\n" + "\n".join(lines) +
+                  f"\n\n_Compared against action.yml @ "
+                  f"{os.environ.get('GITHUB_SHA', '')[:12]}_")
+
+          def gh(*args):
+              return subprocess.run(["gh"] + list(args),
+                                    capture_output=True, text=True)
+
+          title = "upstream-sync-monitor: susfs / kernel_patches pin drift"
+          found = gh("issue", "list", "--state", "open",
+                     "--search", f"{title} in:title",
+                     "--json", "number", "--jq", ".[0].number").stdout.strip()
+          if found:
+              gh("issue", "comment", found, "--body", body)
+              print(f"Updated issue #{found}")
+          else:
+              gh("issue", "create", "--title", title, "--body", body)
+          print(body)
+          PYEOF
+
+  cleanup-branch:
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.merged == true &&
+      startsWith(github.event.pull_request.head.ref, 'upstream-sync/')
+    steps:
+      - name: Delete merged sync branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X DELETE "repos/${{ github.repository }}/git/refs/heads/${{ github.event.pull_request.head.ref }}" \
+            || echo "sync branch already deleted"

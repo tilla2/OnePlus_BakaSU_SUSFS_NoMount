@@ -28,6 +28,16 @@ inputs:
     required: false
     type: string
     default: ""
+  susfs_ref_source:
+    description: 'Provenance label of the resolved SUSFS ref (set by the calling workflow); empty = derive locally'
+    required: false
+    type: string
+    default: ""
+  nomount_ref_source:
+    description: 'Provenance label of the resolved NoMount ref (set by the calling workflow); empty = derive locally'
+    required: false
+    type: string
+    default: ""
   use_rekernel:
     description: 'Integrate the Re-Kernel driver in-tree (CONFIG_REKERNEL, netlink freeze/kill notifier, manager-agnostic)'
     required: false
@@ -48,6 +58,11 @@ inputs:
     required: false
     type: string
     default: O2
+  mlgo:
+    description: 'Do you want to enable mlgo? [Machine Learning Guided Optimization]'
+    required: false
+    type: boolean
+    default: false
   clean:
     description: 'Force clean build without ccache acceleration'
     required: false
@@ -147,12 +162,9 @@ runs:
         PS_BASE="${P_MODEL}_${P_OSVER}"
         echo "PS_BASE=$PS_BASE" >> "$GITHUB_ENV"
         echo "PS_FILE=$GITHUB_WORKSPACE/patch-status-$PS_BASE.txt" >> "$GITHUB_ENV"
-        # Default only when the config omits the key. Do NOT test ${OP_BORE:-} here:
-        # the to_entries export above only lands in LATER steps, so OP_BORE is always
-        # unset in this same step and an unconditional default would clobber a parsed
-        # bore:false (last GITHUB_ENV write wins).
-        # BoRE is experimental: by owner decision it defaults to OFF when the key is missing
-        # (explicit exception to the default-on rule). Re-enable per config with "bore": true.
+        # Default only when the config omits the key: OP_BORE is unset in this same step (the to_entries
+        # export lands in later steps), and an unconditional default would clobber a parsed bore:false.
+        # BoRE defaults OFF (experimental; explicit exception to the default-on rule) - re-enable with "bore": true.
         if ! jq -e 'has("bore")' /tmp/config.json >/dev/null; then
           echo "OP_BORE=false" >> "$GITHUB_ENV"
         fi
@@ -211,6 +223,7 @@ runs:
         ds="$OP_DS"
         ntsync="$OP_NTSYNC"
         optimize='${{ inputs.optimize_level }}'
+        mlgo='${{ inputs.mlgo }}'
         
         errors=()
         
@@ -329,13 +342,13 @@ runs:
           errors+=("Input 'unicode' contains invalid characters. Allowed: 'true' or 'false'. Got: '$unicode'")
         fi
         
-        # OP_C_COMPILER currently has no checks!
+        # OP_C_COMPILER has no validation.
         
-        # OP_RUST_COMPILER currently has no checks!
+        # OP_RUST_COMPILER has no validation.
         
-        # OP_ZYC_COMPILER currently has no checks!
+        # OP_ZYC_COMPILER has no validation.
         
-        # OP_BINDGEN currently has no checks!
+        # OP_BINDGEN has no validation.
         
         if [[ -z "$ds" ]]; then
           errors+=("Input 'ds' cannot be empty")
@@ -353,7 +366,17 @@ runs:
           O2|O3) ;;
           *) errors+=("optimize_level must be O2 or O3. Got: '$optimize'"); ;;
         esac
+        case "${mlgo}" in
+          true|false) ;;
+          *) errors+=("mlgo must be 'true' or 'false'. Got: '${mlgo}'"); ;;
+        esac
         
+        for ident in OP_BUILD_USER OP_BUILD_HOST; do
+          val="${!ident:-}"
+          if [[ -n "$val" && ! "$val" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            errors+=("$ident contains invalid characters. Allowed: letters, digits, ., _, -. Got: '$val'")
+          fi
+        done
         for bool_opt in OP_LZ4_UPGRADE OP_ZSTD_UPGRADE OP_ADIOS OP_RTMUTEX_CVE OP_BBR3 OP_BORE OP_BLACKLIST_APPLY; do
           val="${!bool_opt:-}"
           if [[ -n "$val" && "$val" != "true" && "$val" != "false" ]]; then
@@ -465,6 +488,12 @@ runs:
       run: |
         set -euo pipefail
         mkdir -p "$GITHUB_WORKSPACE/patchgen" "$GITHUB_WORKSPACE/patch-faillogs"
+        cat > "$GITHUB_WORKSPACE/patchgen/expected-rejects.txt" <<'EXP_REJ_EOF'
+        # Expected-rejects ledger: one "name|hunk" per line, hunk = the exact
+        # hNNN.hunk basename gen_patch logs on failure, e.g. susfs-main|h002.hunk.
+        # Listed hunks may fail to place; the rest of the patch still applies.
+        # Unexpected rejects stay fatal.
+        EXP_REJ_EOF
         cat > "$GITHUB_WORKSPACE/patchgen/gen_patch.sh" <<'GEN_PATCH_EOF'
 
         split_hunks() {
@@ -499,11 +528,8 @@ runs:
           ' "$patch_file"
         }
         regen_hunk() {
-          # Exact drift-tolerant hunk regeneration (diff @ generate).
-          # Locates the hunk's core change in the sandbox copy of the live tree by
-          # exact line matching only - no fuzz, no anchor sidecars, no 3-way merge.
-          # Edits the sandbox copy in place; the caller regenerates the final diff
-          # from the sandbox, so the live-tree apply stays fuzz=0.
+          # Drift-tolerant hunk regeneration (diff @ generate): exact line matching only, no fuzz, no anchors.
+          # Edits the sandbox copy; the caller regenerates the diff from it, keeping the live-tree apply fuzz=0.
           # rc: 0 = edited exactly, 2 = change already present, 1 = not placeable.
           local hunk="$1" root="$2" floor="${3:-0}" tgt f src errf tmp_out rc diag
           tgt=$( { grep -m1 -E '^\+\+\+ ' "$hunk" || true; } | awk '{print $2}' | sed 's#^b/##;s#^a/##' )
@@ -716,8 +742,121 @@ runs:
           echo "${diag:-not placeable}"
           return 1
         }
+        regen_hunk_refit() {
+          # Curated-anchor refit for add-only hunks regen_hunk cannot place (e.g.
+          # attribute-prefixed function headers its line-start finder cannot see).
+          # Locates the hinted function with a top-level brace-depth scan, requires
+          # the anchor ERE to match exactly one trimmed line inside that scope, and
+          # inserts the + lines after it, transferring the anchor's indentation.
+          # Sandbox-only; the live-tree apply stays fuzz=0.
+          # rc: 0 = refit-staged, 2 = change already present, 1 = not placeable.
+          local hunk="$1" root="$2" floor="${3:-0}" anchor_re="$4" tgt f src
+          [ -n "$anchor_re" ] || { echo "refit: empty anchor"; return 1; }
+          tgt=$( { grep -m1 -E '^\+\+\+ ' "$hunk" || true; } | awk '{print $2}' | sed 's#^b/##;s#^a/##' )
+          if [ -z "$tgt" ] || [ "$tgt" = "/dev/null" ]; then
+            echo "refit: hunk has no file target"
+            return 1
+          fi
+          f="$root/$tgt"
+          if [ ! -f "$f" ]; then
+            echo "refit: target missing from sandbox: $tgt"
+            return 1
+          fi
+          if grep -q -- '^-[^-]' "$hunk"; then
+            echo "refit: hunk is not add-only; refusing to refit"
+            return 1
+          fi
+          errf=$(mktemp); tmp_out=$(mktemp); rc=0
+          awk -v are="$anchor_re" -v floor="$floor" '
+            function fail2(msg) { printf "FAIL %s\n", msg > "/dev/stderr"; exit 1 }
+            function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+            function leadws(s,   r) { r = s; sub(/[^ \t].*$/, "", r); return r }
+            FNR == NR {
+              if (!inh) { if ($0 ~ /^@@ /) { inh = 1; hint = $0; sub(/^@@[^@]*@@[ \t]?/, "", hint); sub(/[ \t]+$/, "", hint) }; next }
+              if ($0 ~ /^\\/) { noeno = 1; next }
+              b[++nb] = $0
+              next
+            }
+            { fl[++n] = $0 }
+            END {
+              if (noeno) fail2("no-newline marker in hunk; not refitting")
+              fnname = ""
+              if (match(hint, /[A-Za-z_][A-Za-z_0-9]*[ \t]*\(/)) fnname = substr(hint, RSTART, RLENGTH)
+              sub(/[ \t]*\($/, "", fnname)
+              if (fnname == "") fail2("refit: no function name in hunk hint")
+              depth = 0
+              for (i = 1; i <= n; i++) {
+                t = fl[i]
+                if (fnlo == 0 && depth == 0 && t !~ /^[ \t]*#/ && t !~ /;[ \t]*$/ && t ~ fnname "[ \t]*\\(") fnlo = i
+                ob = gsub(/{/, "{", t); cb = gsub(/}/, "}", t)
+                depth += ob - cb
+              }
+              if (fnlo == 0) fail2("refit: function " fnname "() not found at top level")
+              depth = 0; seen = 0; fnhi = 0
+              for (j = fnlo; j <= n; j++) {
+                t = fl[j]
+                ob = gsub(/{/, "{", t); cb = gsub(/}/, "}", t)
+                if (t ~ /{/) seen = 1
+                depth += ob - cb
+                if (seen && depth <= 0) { fnhi = j; break }
+                if (depth < 0) break
+              }
+              if (fnhi <= fnlo) fail2("refit: cannot bracket " fnname "() body")
+              for (i = 1; i <= nb; i++) {
+                c = substr(b[i], 1, 1)
+                if (c == "-") fail2("refit: removal line in hunk; refusing")
+                if (c == "+") add[++nadd] = substr(b[i], 2)
+              }
+              if (nadd == 0) fail2("refit: hunk adds nothing")
+              nm = 0; apos = 0
+              for (i = fnlo + 1; i < fnhi; i++) {
+                if (trim(fl[i]) ~ are) { nm++; apos = i }
+              }
+              if (nm == 0) fail2("refit: anchor not found in " fnname "()")
+              if (nm > 1) fail2("refit: anchor matches " nm " lines in " fnname "(); ambiguous")
+              for (j = fnlo + 1; j + nadd - 1 < fnhi; j++) {
+                ok2 = 1
+                for (m = 1; m <= nadd; m++) if (trim(fl[j + m - 1]) != trim(add[m])) { ok2 = 0; break }
+                if (ok2) { printf "ALREADY\n" > "/dev/stderr"; exit 2 }
+              }
+              if (floor > 0 && apos < floor) fail2("refit: anchor at line " apos " is before POS floor " floor)
+              bws = leadws(fl[apos])
+              minws = -1
+              for (m = 1; m <= nadd; m++) {
+                if (trim(add[m]) == "") continue
+                lws = length(leadws(add[m]))
+                if (minws < 0 || lws < minws) minws = lws
+              }
+              if (minws < 0) minws = 0
+              for (i = 1; i <= apos; i++) print fl[i]
+              for (m = 1; m <= nadd; m++) {
+                if (trim(add[m]) == "") { print ""; continue }
+                lws = leadws(add[m])
+                pad = (length(lws) >= minws) ? bws substr(lws, minws + 1) : bws
+                print pad trim(add[m])
+              }
+              for (i = apos + 1; i <= n; i++) print fl[i]
+              printf "refit: inserted %d line(s) after line %d (anchor in %s()) POS %d\n", nadd, apos, fnname, apos + nadd > "/dev/stderr"
+              exit 0
+            }
+          ' "$hunk" "$f" > "$tmp_out" 2> "$errf" || rc=$?
+          diag=$(paste -sd ';' "$errf" 2>/dev/null || true)
+          rm -f "$errf"
+          if [ "$rc" = "0" ]; then
+            cat "$tmp_out" > "$f"; rm -f "$tmp_out"
+            echo "${diag:-refit staged}"
+            return 0
+          elif [ "$rc" = "2" ]; then
+            rm -f "$tmp_out"
+            echo "${diag:-already present (refit)}"
+            return 2
+          fi
+          rm -f "$tmp_out"
+          echo "${diag:-refit: not placeable}"
+          return 1
+        }
         gen_patch() {
-          local name="$1" patch_file="$2" sed_expr="${3:-}" verify_spec="${4:-}"
+          local name="$1" patch_file="$2" sed_expr="${3:-}" verify_spec="${4:-}" refit_spec="${5:-}"
           local base="$GITHUB_WORKSPACE/patchgen/${name}"
           local um="${base}/unmodified" md="${base}/modified"
           local psf="${PS_FILE:-patch-status-raw.txt}"
@@ -737,8 +876,21 @@ runs:
             mkdir -p "${um}/$(dirname "$f")" "${md}/$(dirname "$f")"
             cp "$f" "${um}/$f" && cp "$f" "${md}/$f"
           done
-          local hunk_dir="${base}/hunks" h hlist staged already_ct failed_ct failed_list htarget verdict rcv floor_pos
+          local hunk_dir="${base}/hunks" h hlist staged already_ct failed_ct failed_list htarget verdict rcv floor_pos hkey refit_re rcv2
           local -A hpos=()
+          local -A refit_for=()
+          if [ -n "$refit_spec" ]; then
+            local rspec
+            local -a rlist
+            IFS=';' read -ra rlist <<< "$refit_spec"
+            for rspec in "${rlist[@]}"; do
+              [ -n "$rspec" ] || continue
+              case "$rspec" in
+                *\|*) refit_for["${rspec%%|*}"]="${rspec#*|}" ;;
+                *) echo "::warning::[patchgen] ${name}: malformed refit spec '${rspec}' (want file|regex); ignoring" ;;
+              esac
+            done
+          fi
           mkdir -p "$hunk_dir"
           split_hunks "$src" "$hunk_dir"
           hlist=$(ls "$hunk_dir"/*.hunk 2>/dev/null || true)
@@ -762,7 +914,7 @@ runs:
               return 0
             fi
           else
-            staged=0; already_ct=0; failed_ct=0; failed_list=""
+            staged=0; already_ct=0; failed_ct=0; expected_ct=0; failed_list=""
             for h in $hlist; do
               htarget=$( { grep -m1 -E '^\+\+\+ ' "$h" || true; } | awk '{print $2}')
               if patch -p1 --forward --fuzz=0 --no-backup-if-mismatch -d "$md" < "$h" >> "${base}/stage.log" 2>&1; then
@@ -784,16 +936,41 @@ runs:
                   echo "hunk ${h##*/} already in tree: ${verdict}" >> "${base}/stage.log"
                   echo "[patchgen] ${name}: SKIP ${h##*/} (${htarget:-?}): already in tree"
                 else
-                  failed_ct=$((failed_ct+1))
-                  echo "hunk not stageable: ${h##*/} (${verdict})" >> "${base}/stage.log"
-                  echo "[patchgen] ${name}: FAIL ${h##*/} (${htarget:-?}): ${verdict}"
-                  failed_list+="$(basename "$h") "
+                  hkey="${htarget#a/}"; hkey="${hkey#b/}"
+                  refit_re="${refit_for[$hkey]:-}"
+                  if [ -n "$refit_re" ]; then
+                    rcv2=0
+                    verdict=$(regen_hunk_refit "$h" "$md" "$floor_pos" "$refit_re") || rcv2=$?
+                    if [ "$rcv2" = "0" ]; then
+                      staged=$((staged+1))
+                      floor_pos=$(printf '%s' "$verdict" | { grep -o 'POS [0-9]*' || true; } | tail -1 | awk '{print $2}')
+                      [ -n "$floor_pos" ] && hpos["$htarget"]="$floor_pos"
+                      echo "hunk ${h##*/} refit-staged: ${verdict}" >> "${base}/stage.log"
+                      echo "[patchgen] ${name}: REFIT ${h##*/} (${htarget:-?}): ${verdict}"
+                      continue
+                    elif [ "$rcv2" = "2" ]; then
+                      already_ct=$((already_ct+1))
+                      echo "hunk ${h##*/} already in tree (refit): ${verdict}" >> "${base}/stage.log"
+                      echo "[patchgen] ${name}: SKIP ${h##*/} (${htarget:-?}): already in tree (refit)"
+                      continue
+                    fi
+                  fi
+                  if grep -qxF "${name}|${h##*/}" "$GITHUB_WORKSPACE/patchgen/expected-rejects.txt" 2>/dev/null; then
+                    expected_ct=$((expected_ct+1))
+                    echo "hunk ${h##*/} expected-reject (ledger): ${verdict}" >> "${base}/stage.log"
+                    echo "[patchgen] ${name}: EXPECTED-REJECT ${h##*/} (${htarget:-?}): ${verdict}"
+                  else
+                    failed_ct=$((failed_ct+1))
+                    echo "hunk not stageable: ${h##*/} (${verdict})" >> "${base}/stage.log"
+                    echo "[patchgen] ${name}: FAIL ${h##*/} (${htarget:-?}): ${verdict}"
+                    failed_list+="$(basename "$h") "
+                  fi
                 fi
               fi
             done
             find "$md" -name '*.rej' -delete 2>/dev/null || true
             find "$md" -name '*.orig' -delete 2>/dev/null || true
-            echo "[patchgen] ${name}: staged=${staged} already=${already_ct} failed=${failed_ct}"
+            echo "[patchgen] ${name}: staged=${staged} already=${already_ct} failed=${failed_ct} expected-rejects=${expected_ct}"
             if [ "$failed_ct" -gt 0 ]; then
               cp "${base}/stage.log" "$GITHUB_WORKSPACE/patch-faillogs/${name}_stage.log" 2>/dev/null || true
               echo "::warning::[patchgen] ${name}: ${failed_ct} of $((staged + already_ct + failed_ct)) hunk(s) not stageable at fuzz=0; NOT applying a partial patch"
@@ -833,7 +1010,7 @@ runs:
             echo "${name}|failed" >> "$psf"
             return 0
           fi
-          if ! verify_applied "$name" "$src"; then
+          if ! verify_applied "$name" "${base}/regen.patch"; then
             {
               echo "[patchgen] ${name} self-verification FAILED (sampled added lines missing after apply)."
               echo "  Reverse-applying the patch to keep the tree consistent."
@@ -872,9 +1049,34 @@ runs:
           else
             echo "[patchgen] ${name}: verification passed"
           fi
+          emit_oracle "$name" "${base}/regen.patch"
           echo "✅ ${name} verified"
           echo "${name}|applied" >> "$psf"
           return 0
+        }
+        emit_oracle() {
+          local name="$1" patch_file="$2"
+          local outf="$GITHUB_WORKSPACE/patchgen/${name}/oracle.tsv"
+          awk -v root="$PWD" '
+            /^--- / { next }
+            /^\+\+\+ / {
+              p = $2
+              if (p == "/dev/null") { cur = ""; next }
+              sub(/^[^\/]+\//, "", p)
+              cur = p; next
+            }
+            /^@@/ { next }
+            /^\+/ {
+              if (cur == "") next
+              line = substr($0, 2); sub(/\r$/, "", line)
+              if (line ~ /^[ \t]*$/) next
+              if (length(line) > 240) next
+              if (seen[cur] >= 2) next
+              if (total >= 24) next
+              print root "\t" cur "\t" line
+              seen[cur]++; total++
+            }
+          ' "$patch_file" > "$outf" 2>/dev/null || true
         }
         verify_grep() {
           local spec="$1"
@@ -961,7 +1163,7 @@ runs:
         }
         fetch_patch() {
           local url="$1" out="$2" min="${3:-200}"
-          curl -sSL --fail -o "$out" "$url" || return 1
+          curl -sSL --fail --retry 3 --retry-all-errors --connect-timeout 15 --max-time 300 -o "$out" "$url" || return 1
           local sz
           sz="$(stat -c%s "$out" 2>/dev/null || echo 0)"
           if [ "$sz" -lt "$min" ]; then
@@ -1036,14 +1238,14 @@ runs:
         fi
         echo "::endgroup::"
 
-    - name: 🏷️ Set Build Identity (Hardcoded)
+    - name: 🏷️ Set Build Identity
       shell: bash
       run: |
         set -euo pipefail
         echo "::group::Set build user/host"
                 
-        BUILD_USER="OnePlus"
-        BUILD_HOST="ubuntu-build"
+        BUILD_USER="${OP_BUILD_USER:-OnePlus}"
+        BUILD_HOST="${OP_BUILD_HOST:-ubuntu-build}"
         
         echo "BUILD_USER=$BUILD_USER" >> "$GITHUB_ENV"
         echo "BUILD_HOST=$BUILD_HOST" >> "$GITHUB_ENV"
@@ -1349,14 +1551,11 @@ runs:
       run: |
         echo "::group::Fetch dependencies"
         set -euo pipefail
-        echo "Fetching SusFS and other dependencies..."
-        
-        
+
         if [ "${{ env.OP_SUSFS }}" = true ]; then
-          # Determine SUSFS branch/commit to use
+          # SUSFS ref: explicit input, else the KMI-default branch (refusing to
+          # guess on unknown KMIs).
           SUSFS_INPUT="${{ inputs.susfs_commit_hash_or_branch }}"
-          
-          # Default SUSFS branches for each kernel version
           declare -A DEFAULT_SUSFS=(
             ["android12-5.10"]="gki-android12-5.10"
             ["android13-5.15"]="gki-android13-5.15"
@@ -1364,152 +1563,131 @@ runs:
             ["android15-6.6"]="gki-android15-6.6"
             ["android16-6.12"]="gki-android16-6.12"
           )
-          
-          # Determine which SUSFS ref to use
           KERNEL_KEY="${{ env.ANDROID_VER }}-${{ env.KERNEL_VER }}"
           if [ -z "$SUSFS_INPUT" ]; then
-            # use kernel-specific default
-            SUSFS_BRANCH="${DEFAULT_SUSFS[$KERNEL_KEY]:-gki-android15-6.6}"
+            if [ -z "${DEFAULT_SUSFS[$KERNEL_KEY]:-}" ]; then
+              echo "::error::No default SUSFS branch mapped for KMI '$KERNEL_KEY'. Add it to DEFAULT_SUSFS or pass an explicit susfs_commit_hash_or_branch input; refusing to silently build against a mismatched SUSFS branch."
+              exit 1
+            fi
+            SUSFS_BRANCH="${DEFAULT_SUSFS[$KERNEL_KEY]}"
             SUSFS_REF_SOURCE="kmi-default branch"
-            echo "ℹ️  Using default SUSFS branch for $KERNEL_KEY: $SUSFS_BRANCH"
           else
-            # 40-char hash or branch/commit passed directly
             SUSFS_BRANCH="$SUSFS_INPUT"
-            SUSFS_REF_SOURCE="explicit input pin"
-            echo "🔧 Using resolved SUSFS ref: $SUSFS_BRANCH"
+            SUSFS_REF_SOURCE="${{ inputs.susfs_ref_source }}"
+            [ -n "$SUSFS_REF_SOURCE" ] || SUSFS_REF_SOURCE="explicit input pin"
           fi
+          echo "SUSFS ref: $SUSFS_BRANCH (${SUSFS_REF_SOURCE})"
           echo "SUSFS_REF=$SUSFS_BRANCH" >> "$GITHUB_ENV"
           echo "SUSFS_REF_SOURCE=$SUSFS_REF_SOURCE" >> "$GITHUB_ENV"
         fi
-        
-        retry_fetch_archive() {
-          local url="$1"
-          local branch="${2:-main}"
-          local max_attempts=3
-          local attempt=1
-          
-          local repo_name=$(basename "$url" .git)
-          local safe_branch=$(echo "$branch" | tr '/' '_')
-          local archive_name="${repo_name}_${safe_branch}.tar.gz"
-          local shm_path="/dev/shm/$archive_name"
-          
-          local nproc=$(nproc 2>/dev/null || echo 4)
-          
-          local aria_log_flags="--quiet --summary-interval=0"
-          if [ "${{ inputs.debug }}" = "true" ]; then
-              aria_log_flags="--summary-interval=5" # Show progress every 5s in debug
-          fi
-          
-          local aria2_headers=(
-            "--header=User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            "--header=Accept: */*"
-            "--header=Connection: keep-alive"
-          )
-          
-          local download_url=""
-          if [[ "$url" == *"github.com"* ]]; then
-              download_url="${url%.git}/archive/refs/heads/${branch}.tar.gz"
-          elif [[ "$url" == *"gitlab.com"* ]]; then
-              download_url="${url%.git}/-/archive/${branch}/${repo_name}-${branch}.tar.gz"
-          else
-              echo "::error::Unsupported host: $url"
-              return 1
-          fi
-          
-          while [ $attempt -le $max_attempts ]; do
-              echo " Attempt $attempt/$max_attempts: High-speed fetch for $repo_name ($branch)"
-              
-              local aria_splits="-x16 -s16 -j16"
-          if [[ "$url" == *"gitlab.com"* ]]; then
-            # GitLab throttles per-IP bursts; 16-way segmentation invites 429s
-            aria_splits="-x4 -s4"
-          fi
-          if aria2c $aria_splits -k1M --retry-wait=2 --max-tries=5 -d "/dev/shm" -o "$archive_name" --allow-overwrite=true "${aria2_headers[@]}" $aria_log_flags "$download_url"; then
-                  mkdir -p "$repo_name"
-                  if tar -I "pigz -p $nproc -b 256" -x --record-size=1M -f "$shm_path" -C "$repo_name" --strip-components=1 --no-same-owner; then
-                      echo "✅ Success: $repo_name synced"
-                      rm -f "$shm_path"
-                      return 0
-                  fi
-              fi
-              
-              echo "⚠️ Attempt $attempt failed, clearing RAM and retrying..."
-              rm -rf "$repo_name" "$shm_path" 2>/dev/null
-              [ $attempt -lt $max_attempts ] && sleep $((attempt * 15))
-              attempt=$((attempt + 1))
-          done
-          
-          echo "::warning::Archive fetch failed for $url after $max_attempts attempts - caller will fall back to git clone"
-          return 1
-        }
-        
+
         retry_clone() {
+          # git clone with retries; everything after the URL is passed through,
+          # so callers keep their own flags (--no-checkout, --depth, -b ...).
           local url="$1"
-          local branch="${2:-main}"
-          local depth="${3:-1}"
-          local dir="$(basename "$url" .git)"
+          shift
           local max_attempts=3
           local attempt=1
-          
-          # Build git clone args
-          local clone_args=(--branch "$branch")
-          if [ "$depth" != "0" ] && [ -n "$depth" ]; then
-            clone_args+=(--depth "$depth")
-          fi
-          
-          while [ $attempt -le $max_attempts ]; do
-            echo "🔄 Attempt $attempt/$max_attempts: cloning $url ($branch)${depth:+ [depth=$depth]}"
-            
-            # Clone with dynamic args
-            git clone "${clone_args[@]}" "$url" "$dir" && {
-              echo "✅ Success"
+          local dir
+          dir="$(basename "$url" .git)"
+          while [ "$attempt" -le "$max_attempts" ]; do
+            echo "🔄 Attempt $attempt/$max_attempts: cloning $url"
+            if git clone "$@" "$url" "$dir"; then
+              echo "✅ $dir cloned"
               return 0
-            }
-            
-            echo "❌ Failed, cleaning up..."
-            rm -rf "$dir" 2>/dev/null
-            sleep $((attempt++ * 5))
+            fi
+            rm -rf "$dir" 2>/dev/null || true
+            [ "$attempt" -lt "$max_attempts" ] && sleep $((attempt * 5))
+            attempt=$((attempt + 1))
           done
-          
-          echo "💥 All attempts failed"
+          echo "::error::git clone failed after $max_attempts attempts: $url"
           return 1
         }
 
-        retry_download() {
+        fetch_susfs_archive() {
+          # High-speed SUSFS fetch (GitLab only): aria2 multi-connection with a
+          # browser-header set against throttling, extracted straight into
+          # $SUSFS_FOLDER. Nothing is left behind on failure, so the git-clone
+          # fallback starts clean.
           local url="$1"
-          local file_name="$2"
+          local branch="$2"
+          local repo_name
+          repo_name="$(basename "$url" .git)"
+          local safe_branch
+          safe_branch="$(echo "$branch" | tr '/' '_')"
+          local archive_name="${repo_name}_${safe_branch}.tar.gz"
+          local shm_path="/dev/shm/$archive_name"
+          local nproc
+          nproc="$(nproc 2>/dev/null || echo 4)"
+          local aria_log_flags="--quiet --summary-interval=0"
+          if [ "${{ inputs.debug }}" = "true" ]; then
+            aria_log_flags="--summary-interval=5"
+          fi
+          local user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          local aria2_headers=(
+            --user-agent="$user_agent"
+            --header="Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,application/octet-stream,*/*;q=0.8"
+            --header="Accept-Language: en-US,en;q=0.9"
+            --header="Sec-Fetch-Dest: document"
+            --header="Sec-Fetch-Mode: navigate"
+            --header="Sec-Fetch-Site: none"
+            --header="Sec-Fetch-User: ?1"
+            --header="Upgrade-Insecure-Requests: 1"
+          )
+          local download_url
+          case "$url" in
+            *gitlab.com*)
+              local project_path
+              project_path="$(echo "$url" | sed -E 's#^https?://gitlab\.com/##; s#\.git$##; s#/#%2F#g')"
+              download_url="https://gitlab.com/api/v4/projects/${project_path}/repository/archive.tar.gz?sha=${branch}"
+              ;;
+            *)
+              echo "::error::fetch_susfs_archive supports gitlab.com URLs only: $url"
+              return 1
+              ;;
+          esac
           local max_attempts=3
           local attempt=1
-          
-          while [ $attempt -le $max_attempts ]; do
-            echo "🔄 Attempt $attempt/$max_attempts: downloading $url"
-            
-            wget "$url" -O "$file_name" && {
-              echo "✅ Success"
+          local conn
+          while [ "$attempt" -le "$max_attempts" ]; do
+            case "$attempt" in
+              1) conn=16 ;;
+              2) conn=4 ;;
+              *) conn=1 ;;
+            esac
+            echo "🔄 Attempt $attempt/$max_attempts: high-speed fetch for $repo_name ($branch)"
+            if aria2c -x"$conn" -s"$conn" -k1M --retry-wait=2 --max-tries=5 -d "/dev/shm" -o "$archive_name" --allow-overwrite=true "${aria2_headers[@]}" $aria_log_flags "$download_url" \
+               && mkdir -p "$SUSFS_FOLDER" \
+               && tar -I "pigz -p $nproc -b 256" -x --record-size=1M -f "$shm_path" -C "$SUSFS_FOLDER" --strip-components=1 --no-same-owner; then
+              rm -f "$shm_path"
+              echo "✅ $repo_name synced ($branch)"
               return 0
-            }
-            
-            echo "❌ Failed, cleaning up..."
-            rm -f "$file_name" 2>/dev/null
-            sleep $((attempt++ * 5))
+            fi
+            echo "⚠️ Attempt $attempt failed, clearing RAM and retrying..."
+            rm -rf "$SUSFS_FOLDER" "$shm_path" 2>/dev/null || true
+            [ "$attempt" -lt "$max_attempts" ] && sleep $((attempt * 15))
+            attempt=$((attempt + 1))
           done
-          
-          echo "💥 All attempts failed"
+          echo "::warning::SUSFS archive fetch failed after $max_attempts attempts - falling back to git clone"
           return 1
         }
-        
-        retry_clone "https://github.com/WildKernels/kernel_patches.git" "main" "1"
+
+        retry_clone "https://github.com/WildKernels/kernel_patches.git" --depth 1 --branch main
         if [ "${{ inputs.ksu_type }}" = "FinaSU" ]; then
           # NoMount ships inside FinaSU's ksud (embedded per KMI, built by LyraVoid/FinaSU).
           # No kernel-side integration and no upstream module fetch - report native.
           NOMOUNT_COMMIT_SHA="native (ksud-embedded)"
           NOMOUNT_REF_SOURCE="FinaSU native"
-          echo "NoMount: native (ksud-embedded, ships with the FinaSU manager)"
         else
-          git clone --no-checkout --depth 1 "https://github.com/maxsteeel/nomount.git" nomount
           NOMOUNT_TARGET="${{ inputs.nomount_commit }}"
           if [ -n "$NOMOUNT_TARGET" ]; then
-            echo "Using NoMount commit: $NOMOUNT_TARGET"
+            NOMOUNT_REF_SOURCE="explicit input pin"
+          else
+            NOMOUNT_REF_SOURCE="upstream latest"
+            echo "::warning::No NoMount commit provided; tracking upstream latest"
+          fi
+          retry_clone "https://github.com/maxsteeel/nomount.git" --no-checkout --depth 1
+          if [ -n "$NOMOUNT_TARGET" ]; then
             git -C nomount fetch --depth 1 origin "$NOMOUNT_TARGET"
             git -C nomount checkout --detach "$NOMOUNT_TARGET"
             NOMOUNT_COMMIT_SHA="$(git -C nomount rev-parse HEAD)"
@@ -1520,28 +1698,23 @@ runs:
           else
             git -C nomount checkout --detach origin/HEAD 2>/dev/null || git -C nomount checkout --detach
             NOMOUNT_COMMIT_SHA="$(git -C nomount rev-parse HEAD)"
-            NOMOUNT_REF_SOURCE="upstream latest"
-            echo "::warning::No NoMount commit provided; tracking upstream latest (${NOMOUNT_COMMIT_SHA})"
           fi
-          if [ -z "${NOMOUNT_REF_SOURCE:-}" ]; then NOMOUNT_REF_SOURCE="explicit input pin"; fi
+          if [ -n "${{ inputs.nomount_ref_source }}" ]; then NOMOUNT_REF_SOURCE="${{ inputs.nomount_ref_source }}"; fi
           git -C nomount log --oneline -1
         fi
-        echo "NOMOUNT_REF_SOURCE=$NOMOUNT_REF_SOURCE" >> "$GITHUB_ENV"
         echo "NOMOUNT_COMMIT_SHA=$NOMOUNT_COMMIT_SHA" >> "$GITHUB_ENV"
-        echo "Using NoMount commit: $NOMOUNT_COMMIT_SHA"
+        echo "NOMOUNT_REF_SOURCE=$NOMOUNT_REF_SOURCE" >> "$GITHUB_ENV"
+        echo "NoMount: $NOMOUNT_COMMIT_SHA (${NOMOUNT_REF_SOURCE})"
         if [ "${{ env.OP_SUSFS }}" = true ]; then
-          echo "Using SUSFS branch/commit: $SUSFS_BRANCH"
           resolve_susfs_sha() {
-            # Resolve a susfs4ksu branch/tag ref to its true commit SHA via the GitLab API.
+            # Resolve a susfs4ksu branch/tag ref to its commit SHA via the GitLab API.
             local api="https://gitlab.com/api/v4/projects/simonpunk%2Fsusfs4ksu/repository/commits/$1"
-            local sha=""
-            sha="$(curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 "$api" 2>/dev/null \
-              | grep -o '"id" *: *"[0-9a-fA-F]\{40\}"' | head -n1 | sed 's/.*"id" *: *"//; s/"$//')" || true
-            printf '%s' "$sha"
+            jq -r '.id // empty' 2>/dev/null \
+              < <(curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 "$api") || true
           }
-          if ! retry_fetch_archive "https://gitlab.com/simonpunk/susfs4ksu.git" "$SUSFS_BRANCH"; then
+          rm -rf "$SUSFS_FOLDER"
+          if ! fetch_susfs_archive "https://gitlab.com/simonpunk/susfs4ksu.git" "$SUSFS_BRANCH"; then
             echo "::warning::SUSFS archive fetch throttled; falling back to a plain git clone"
-            rm -rf "$SUSFS_FOLDER"
             if git clone --no-checkout "https://gitlab.com/simonpunk/susfs4ksu.git" "$SUSFS_FOLDER" \
                && git -C "$SUSFS_FOLDER" checkout --detach "$SUSFS_BRANCH"; then
               echo "SUSFS tree fetched via git clone fallback at $SUSFS_BRANCH"
@@ -1567,7 +1740,7 @@ runs:
             echo "SUSFS_COMMIT_SHA=$SUSFS_BRANCH" >> "$GITHUB_ENV"
           fi
         fi
-        echo "✅ Dependencies cloned"
+        echo "✅ Dependencies fetched"
         echo "::endgroup::"
 
     - name: Clean Up ABI Protected Exports
@@ -1759,10 +1932,8 @@ runs:
       run: |
         set -euo pipefail
         echo "::group::Fetch FinaSU compat suite"
-        # Remote-first, local fallback: track the maintained copies at runtime.
-        # LyraVoid/FinaSU upstream ships no compat scripts; LingLuo's repos do.
-        # OnePlusOSS manifests -> OnePlus_KernelSU_SUSFS set, AOSP-hybrid (gki)
-        # manifests -> AnyKernel3 set; the other repo mirrors as second hop.
+        # Remote-first, local fallback for compat scripts (FinaSU upstream ships none; LingLuo's repos maintain them).
+        # OnePlusOSS manifests -> OnePlus_KernelSU_SUSFS set, AOSP-hybrid (gki) manifests -> AnyKernel3 set.
         COMPAT_DIR="$GITHUB_WORKSPACE/scripts/finasu_compat"
         mkdir -p "$COMPAT_DIR"
         if [[ "${OP_MANIFEST:-}" == *_gki_* ]]; then
@@ -1807,10 +1978,8 @@ runs:
             || { git -C KernelSU fetch origin "$KSU_INPUT" && git -C KernelSU checkout --detach "$KSU_INPUT"; }
         fi
 
-        # FinaSU keeps its UAPI headers at the repo root; the driver reaches them via
-        # include/uapi -> ../../uapi, which only resolves in upstream's M= build layout.
-        # In-tree, drivers/kernelsu addresses KernelSU/kernel, so materialize the root
-        # uapi/ inside the driver dir; fail loudly if upstream moves it.
+        # FinaSU keeps its UAPI headers at the repo root (include/uapi -> ../../uapi resolves only in M= builds);
+        # for in-tree use, materialize root uapi/ inside drivers/kernelsu. Fail loudly if upstream moves it.
         if [ ! -e KernelSU/kernel/uapi/app_profile.h ]; then
           [ -f KernelSU/uapi/app_profile.h ] \
             || { echo "::error::FinaSU uapi headers not found at KernelSU/uapi (upstream layout changed)"; exit 1; }
@@ -1818,9 +1987,8 @@ runs:
           cp KernelSU/uapi/*.h KernelSU/kernel/uapi/
         fi
 
-        # FinaSU ships no setup.sh for in-tree use - wire it manually:
-        # symlink the kernel dir, mount Makefile/Kconfig (trailing-newline guard
-        # for vendor trees whose drivers/Makefile lacks a final newline).
+        # FinaSU ships no setup.sh for in-tree use: symlink the kernel dir, mount Makefile/Kconfig
+        # (trailing-newline guard for vendor trees whose drivers/Makefile lacks a final newline).
         DRIVER_DIR="$COMMON_KERNEL_FOLDER/drivers"
         ln -sfn "$(realpath --relative-to="$DRIVER_DIR" "$KERNEL_PLATFORM_FOLDER/KernelSU/kernel")" "$DRIVER_DIR/kernelsu"
         grep -q "obj-.*CONFIG_KSU.*kernelsu/" "$DRIVER_DIR/Makefile" \
@@ -1831,9 +1999,8 @@ runs:
         CONFIG_KSU=y
         EOF
 
-        # Trust the official FinaSU manager via the second signature slot.
-        # Without it the upstream KernelSU manager hijacks the manager identity
-        # and the FinaSU manager reports "not installed".
+        # Trust the official FinaSU manager via the second signature slot; without it the upstream
+        # KernelSU manager hijacks the manager identity and the FinaSU manager reports "not installed".
         REL_APK="$(mktemp -d)/manager.apk"
         REL_JSON=""
         for ATTEMPT in 1 2 3; do
@@ -1890,10 +2057,34 @@ runs:
     - name: Apply SUSFS Patches
       shell: bash
       if: ${{ env.OP_SUSFS == 'true' }}
+      env:
+        KSU_TYPE: ${{ inputs.ksu_type }}
       run: |
         set -euo pipefail
         echo "::group::Apply SUSFS patches"
         cd "$KERNEL_PLATFORM_FOLDER"
+        # Pre-patch SUSFS parity check (BakaSU): before any patching, the dispatcher
+        # must already implement every CMD_SUSFS_* command declared by the staged
+        # (gitlab) susfs headers - BakaSU main carries the wiring natively and the
+        # temporary dispatcher grafts are gone. KSU/KSUN are exempt: their
+        # 10_enable patching below adds the handlers.
+        if [ "${{ inputs.ksu_type }}" = "BakaSU" ] && [ -f "$SUSFS_FOLDER/kernel_patches/include/linux/susfs_def.h" ]; then
+          grep -oE 'CMD_SUSFS_[A-Z0-9_]+' "$SUSFS_FOLDER/kernel_patches/include/linux/susfs_def.h" | sort -u > /tmp/susfs_pre_declared.txt
+          grep -rhoE 'case CMD_SUSFS_[A-Z0-9_]+' "$KSU_FOLDER/kernel" 2>/dev/null | sed 's/^case //' | sort -u > /tmp/susfs_pre_impl.txt || true
+          printf '%s\n' CMD_SUSFS_SUS_SU CMD_SUSFS_IS_SUS_SU_READY \
+            CMD_SUSFS_SHOW_SUS_SU_WORKING_MODE CMD_SUSFS_ADD_SUS_MOUNT \
+            CMD_SUSFS_ADD_TRY_UMOUNT CMD_SUSFS_UMOUNT_FOR_ZYGOTE_ISO_SERVICE \
+            CMD_SUSFS_SET_ANDROID_DATA_ROOT_PATH CMD_SUSFS_SET_SDCARD_ROOT_PATH \
+            > /tmp/susfs_pre_legacy.txt
+          pre_missing="$(comm -23 /tmp/susfs_pre_declared.txt /tmp/susfs_pre_impl.txt | grep -Fvx -f /tmp/susfs_pre_legacy.txt || true)"
+          if [ -n "$pre_missing" ]; then
+            echo "::error::Pre-patch SUSFS parity failed: the BakaSU dispatcher is missing commands declared by the staged susfs headers: $(printf '%s ' $pre_missing)"
+            echo "        BakaSU main is out of sync with susfs ${SUSFS_REF:-unknown} - sync the dispatcher upstream or pin a matching susfs vintage."
+            exit 1
+          fi
+          echo "✅ Pre-patch SUSFS parity ok: BakaSU dispatcher implements all $(wc -l < /tmp/susfs_pre_declared.txt) declared commands"
+        fi
+
         echo "Applying SUSFS patches..."
         cp "$SUSFS_FOLDER/kernel_patches/fs/"* "$COMMON_KERNEL_FOLDER/fs/"
         cp "$SUSFS_FOLDER/kernel_patches/include/linux/"* "$COMMON_KERNEL_FOLDER/include/linux/"
@@ -1916,7 +2107,7 @@ runs:
         
         case "$susfs_version" in
           "v1.5.8")
-            if [ "${{ inputs.ksu_type }}" = "KSU" ]; then
+            if [ "${KSU_TYPE:-}" = "KSU" ]; then
               cd "$KSU_FOLDER"
               source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
               gen_patch susfs-ksu-enable "$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || echo "::warning::[susfs] 10_enable_susfs_for_ksu.patch did not stage cleanly (soft-fail, continuing)"
@@ -1925,7 +2116,7 @@ runs:
             fi
             ;;
           "v1.5.9"|"v1.5.10"|"v1.5.11"|"v1.5.12"|"v2.0.0"|"v2.1.0")
-            if [ "${{ inputs.ksu_type }}" = "KSU" ]; then
+            if [ "${KSU_TYPE:-}" = "KSU" ]; then
               cd "$KSU_FOLDER"
               source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
               gen_patch susfs-ksu-enable "$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
@@ -1933,8 +2124,14 @@ runs:
               echo "ℹ️ Skipping KernelSU folder patch for BakaSU"
             fi
             ;;
-          "v2.2.0"|"v2.3.0")
-            if [ "${{ inputs.ksu_type }}" = "KSUN" ]; then
+          *)
+            if [ -d "$SUSFS_FOLDER/.git" ]; then
+              susfs_title="$(git -C "$SUSFS_FOLDER" log -1 --pretty=%s 2>/dev/null || true)"
+            else
+              susfs_title="$(curl -fsSL --retry 3 --retry-delay 2 "https://gitlab.com/api/v4/projects/simonpunk%2Fsusfs4ksu/repository/commits/${SUSFS_COMMIT_SHA}" 2>/dev/null | grep -o '"title" *: *"[^"]*"' | head -n1 | sed 's/.*"title" *: *"//; s/"$//')" || true
+            fi
+            echo "SusFS ${susfs_version} | ${susfs_title:-commit title unavailable}"
+            if [ "${KSU_TYPE:-}" = "KSUN" ]; then
               cd "$KSUN_FOLDER"
               susfs_ksun_patch="$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
               filtered_susfs_patch="$(mktemp)"
@@ -1979,16 +2176,15 @@ runs:
                 mv "$tmp_kconfig" ./kernel/Kconfig
               fi
 
-              # The v3.3.0 source omits the dispatcher guard in both x86
-              # blocks and has trailing whitespace in the init guard comment.
-              # Restore the v2.2.0 compatibility patch's exact preimage.
+              # v3.3.0 omits the dispatcher guard in both x86 blocks and has trailing whitespace in the
+              # init guard comment; restore the v2.2.0 compatibility patch's exact preimage.
               init_source=./kernel/core/init.c
               if [ "$(grep -Fxc '#if defined(__x86_64__)' "$init_source")" -ne 2 ]; then
-                echo "::error::Unexpected KernelSU Next v3.3.0 x86 guard layout"
+                echo "::error::Unexpected KernelSU Next x86 guard layout (kernel/core/init.c does not match the expected preimage)"
                 exit 1
               fi
               if [ "$(grep -Fxc '    // If the kernel has the hardening patch, X86_FEATURE_INDIRECT_SAFE must be set ' "$init_source")" -ne 1 ]; then
-                echo "::error::Unexpected KernelSU Next v3.3.0 init guard comment"
+                echo "::error::Unexpected KernelSU Next init guard comment (kernel/core/init.c does not match the expected preimage)"
                 exit 1
               fi
               sed -i \
@@ -2000,16 +2196,24 @@ runs:
                   gen_patch "susfs-fix-${compatibility_patch%.patch}" "$KERNEL_PATCHES_FOLDER/next/susfs_fix_patches/$susfs_version/$compatibility_patch"
                 done
               else
-                # WK has no susfs fix set for this version (e.g. v2.3.0).
-                # Bouteillepleine tracks newer susfs releases and additionally
-                # ships fix_dispatch.c.patch, so fall back to that set.
-                susfs_fix_base="https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/next/susfs_fix_patches/${susfs_version}"
+                # WK has no susfs fix set for this version (e.g. v2.3.0); Bouteillepleine tracks newer
+                # susfs releases and additionally ships fix_dispatch.c.patch, so fall back to that set.
+                # Pinned to BP head 3e7e48f0746fee8e131637f8e884ae4caaa539e6 (2026-11-18)
+                # instead of a moving 'main'; override with BP_PATCHES_REF if ever needed.
+                BP_PATCHES_REF="${BP_PATCHES_REF:-3e7e48f0746fee8e131637f8e884ae4caaa539e6}"
+                susfs_fix_base="https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/${BP_PATCHES_REF}/next/susfs_fix_patches/${susfs_version}"
                 susfs_fix_dir="$(mktemp -d)"
                 if fetch_patch "$susfs_fix_base/fix_Kbuild.patch" "$susfs_fix_dir/fix_Kbuild.patch"; then
                   for compatibility_patch in fix_init.c.patch fix_kernel_umount.c.patch fix_setuid_hook.c.patch fix_sucompat.c.patch fix_supercall.c.patch fix_dispatch.c.patch; do
                     if ! fetch_patch "$susfs_fix_base/$compatibility_patch" "$susfs_fix_dir/$compatibility_patch"; then
                       echo "::error::Bouteillepleine susfs fix set for ${susfs_version} is incomplete (missing ${compatibility_patch})"
                       exit 1
+                    fi
+                    if curl -fsSL --retry 3 --retry-all-errors --connect-timeout 15 "$susfs_fix_base/${compatibility_patch}.sha256" -o "$susfs_fix_dir/${compatibility_patch}.sha256" 2>/dev/null; then
+                      (cd "$susfs_fix_dir" && sha256sum -c --quiet "${compatibility_patch}.sha256") || {
+                        echo "::error::Bouteillepleine susfs fix ${compatibility_patch} failed its sha256 manifest"
+                        exit 1
+                      }
                     fi
                   done
                   for compatibility_patch in fix_Kbuild.patch fix_init.c.patch fix_kernel_umount.c.patch fix_setuid_hook.c.patch fix_sucompat.c.patch fix_supercall.c.patch fix_dispatch.c.patch; do
@@ -2027,7 +2231,7 @@ runs:
               if [ "$(grep -Fxc '#include <linux/ptrace.h>' "$sucompat_source")" -ne 1 ] ||
                  [ "$(grep -Fxc '#include <linux/uidgid.h>' "$setuid_hook_source")" -ne 1 ] ||
                  [ "$(grep -Fxc 'static char __user *ksud_user_path(void)' "$sucompat_source")" -ne 1 ]; then
-                echo "::error::Unexpected KernelSU Next v3.3.0 SUSFS helper layout"
+                echo "::error::Unexpected KernelSU Next SUSFS helper layout (sucompat.c/setuid_hook.c do not match the expected preimage)"
                 exit 1
               fi
               sed -i '/^#include <linux\/ptrace.h>$/a #include <linux/fs_struct.h>\n#include <linux/susfs_def.h>\n#include "selinux/selinux.h"' "$sucompat_source"
@@ -2052,7 +2256,7 @@ runs:
                   gen_patch "susfs-fix-${compatibility_patch%.patch}" "$fix_path"
                 fi
               done
-            elif [ "${{ inputs.ksu_type }}" = "KSU" ]; then
+            elif [ "${KSU_TYPE:-}" = "KSU" ]; then
               cd "$KSU_FOLDER"
               susfs_ksu_patch="$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
               filtered_susfs_patch="$(mktemp)"
@@ -2117,13 +2321,14 @@ runs:
               # Keep v3.2.5's existing reboot kprobe for KSU fd installation;
               # the SUSFS dispatch commands remain in the surrounding switch.
               sed -i '/^    if (magic2 == KSU_INSTALL_MAGIC2)$/,+1d' "$dispatch_source"
+            elif [ "${KSU_TYPE:-}" = "BakaSU" ]; then
+              # 10_enable targets KSU/KSUN dispatcher layouts; BakaSU main carries the full
+              # susfs dispatcher wiring natively (enforced by the pre-patch parity check
+              # above), so there is nothing to patch in the KernelSU folder here.
+              echo "ℹ️ BakaSU: KernelSU folder needs no susfs patching (native dispatcher wiring)"
             else
-              echo "ℹ️ Skipping KernelSU folder patch for BakaSU"
+              echo "ℹ️ Skipping KernelSU folder patch for ${KSU_TYPE:-}"
             fi
-            ;;
-          *)
-            echo "::error::Unsupported SUSFS version: $susfs_version"
-            exit 1
             ;;
         esac
         echo "::endgroup::"
@@ -2134,10 +2339,8 @@ runs:
       run: |
         set -euo pipefail
         echo "::group::Apply FinaSU SUSFS integration"
-        # Kernel-side fs/include copies already happened in 'Apply SUSFS Patches'.
-        # This applies the KSU-side 10_enable patch + maintained drift fixes
-        # (two-step git apply with hard verification) to the FinaSU tree and
-        # forces manual-hook mode (inline hook machinery is removed by the patches).
+        # Applies the KSU-side 10_enable patch + drift fixes to the FinaSU tree (fs/include copies already
+        # done in 'Apply SUSFS Patches'); forces manual-hook mode (patches remove the inline hook machinery).
         SUSFS4KSU="$SUSFS_FOLDER" bash "$GITHUB_WORKSPACE/scripts/finasu_compat/apply.sh" "$KSU_FOLDER"
         echo "NEED_HOOKS=false" >> "$GITHUB_ENV"
         echo "susfs-finasu|applied" >> "$PS_FILE"
@@ -2231,9 +2434,8 @@ runs:
         filtered_kernel_patch=""
         if [ "${{ inputs.ksu_type }}" = "KSU" ]; then
           filtered_kernel_patch="$(mktemp)"
-          # Classic KernelSU v3.2.5 already hooks these syscalls through its
-          # syscall table. Drop only the duplicate newer-hook hunks while
-          # retaining the remaining SUSFS kernel integration.
+          # Classic KernelSU v3.2.5 hooks these syscalls via its syscall table: drop only the duplicate
+          # newer-hook hunks, retaining the remaining SUSFS kernel integration.
           awk '
             function flush_hunk() {
               if (hunk == "")
@@ -2277,20 +2479,16 @@ runs:
           ' "$susfs_kernel_patch" > "$filtered_kernel_patch"
           patch_to_apply="$filtered_kernel_patch"
         fi
-        # Stage SUSFS through patchgen (diff & generate), fuzz=0 only. The
-        # SUS_MAP include pre-shim runs only when the patch lacks the block
-        # itself; on gki-android16-6.12 the upstream hunk adds it and a shim
-        # would break that hunk's context.
+        # Stage SUSFS through patchgen (diff & generate), fuzz=0 only. The SUS_MAP include pre-shim runs
+        # only when the patch lacks the block itself (on gki-android16-6.12 the upstream hunk adds it).
         if ! grep -q 'CONFIG_KSU_SUSFS_SUS_MAP' mm/memory.c && grep -q '#include <linux/vmalloc.h>' mm/memory.c \
            && ! grep -q 'CONFIG_KSU_SUSFS_SUS_MAP' "$patch_to_apply"; then
           echo "[patchgen] susfs-main: pre-shimming mm/memory.c SUS_MAP include block (patch lacks it)"
           sed -i '/#include <linux\/vmalloc.h>/a #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n#include <linux\/susfs_def.h>\n#endif \/\/ #ifdef CONFIG_KSU_SUSFS_SUS_MAP' mm/memory.c
         fi
         source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        # susfs-main is redundant (and self-contradictory) when the synced tree
-        # already wires SUSFS into fs/Makefile (pre-integrated community/FinaSU
-        # sources). Nothing earlier in this run wires it: 10_enable_susfs_for_ksu
-        # only touches kernel/*. Skip instead of stacking a second integration.
+        # Skip susfs-main when the synced tree already wires SUSFS into fs/Makefile (pre-integrated sources):
+        # 10_enable_susfs_for_ksu only touches kernel/*, so a second integration would be self-contradictory.
         if grep -qF 'obj-$(CONFIG_KSU_SUSFS) += susfs.o' fs/Makefile; then
           echo "[patchgen] susfs-main: fs/Makefile already wires CONFIG_KSU_SUSFS - skipping susfs-main"
           echo "susfs-main|already" >> "$PS_FILE"
@@ -2335,9 +2533,8 @@ runs:
           fi
         fi
 
-        # Newer SUSFS patches use the VMA padding API in the open-redirect
-        # path. Keep the original vm_end behavior for trees that did not use
-        # that API before patching, including incomplete vendor backports.
+        # Newer SUSFS patches use the VMA padding API in the open-redirect path; keep the original vm_end
+        # behavior for trees that never used that API, including incomplete vendor backports.
         if [ "$had_task_mmu_vma_pad_start" -eq 0 ]; then
           vma_pad_compat_count=$(grep -Fc 'VMA_PAD_START(vma)' ./fs/proc/task_mmu.c || true)
           if [ "$vma_pad_compat_count" -gt 0 ]; then
@@ -2410,6 +2607,7 @@ runs:
         CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
         CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         CONFIG_KSU_SUSFS_SUS_MAP=y
+        CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER=y
         CONFIG_KSU_SUSFS_SUS_SU=n
         EOF
         grep -nE '^CONFIG_KSU_SUSFS' "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" | head -n 20 || true
@@ -2422,9 +2620,8 @@ runs:
           exit 1
         fi
 
-        # pershoot SuSFS/Toolkit coexistence: upstream only ENABLES the uname-spoof
-        # static key, so track the reset and disable the key. Optional: warn+continue
-        # if it can't stage at fuzz=0. Upstream paths carry kernel_patches/ - rewrite to -p1.
+        # pershoot SuSFS/Toolkit coexistence: upstream only ENABLES the uname-spoof static key, so track the
+        # reset and disable it; warn+continue if staging at fuzz=0 fails. Upstream paths are kernel_patches/ - rewrite to -p1.
         pershoot_uname_url="https://raw.githubusercontent.com/Bouteillepleine/kernel_patches/main/pershoot/susfs4ksu/0002-pershoot-Implement-SuSFS-and-Toolkit-coexistence.patch"
         if fetch_patch "$pershoot_uname_url" /tmp/pershoot_uname_coexistence.patch; then
           gen_patch pershoot-uname-coexistence /tmp/pershoot_uname_coexistence.patch 's|kernel_patches/fs/|fs/|g'
@@ -2536,11 +2733,24 @@ runs:
         fi
         cd "$COMMON_KERNEL_FOLDER"
         source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        ZSTD_REPO="cctv18/oppo_oplus_realme_sm8850"
         if grep -Eq 'ZSTD_VERSION_RELEASE[[:space:]]+7' include/linux/zstd_lib.h && grep -q 'compression_level' crypto/zstd.c; then
           echo "zstd already at 1.5.7 with tunable level, skipping"
           echo "zstd-upgrade|already" >> "$PS_FILE"
         else
-          zstd_url="https://raw.githubusercontent.com/cctv18/oppo_oplus_realme_sm8850/6c1ffdac3ebf7ebb80254427a7972262b0a8f64e/zram_patch/002-zstd.patch"
+          ZSTD_REF="$(git ls-remote "https://github.com/${ZSTD_REPO}.git" refs/heads/main 2>/dev/null | awk '{print $1}')" || true
+          if [ -z "$ZSTD_REF" ]; then
+            echo "::warning::Could not resolve ${ZSTD_REPO}@main via ls-remote; falling back to previous commit via API"
+            ZSTD_REF="$(curl -fsSL "https://api.github.com/repos/${ZSTD_REPO}/commits?per_page=2" 2>/dev/null | jq -r '.[1].sha // empty' 2>/dev/null)" || true
+          fi
+          if [ -z "$ZSTD_REF" ]; then
+            echo "::warning::Could not resolve ${ZSTD_REPO}@main nor previous commit; continuing without the zstd upgrade"
+            echo "zstd-upgrade|skipped" >> "$PS_FILE"
+            echo "::endgroup::"
+            exit 0
+          fi
+          echo "zstd patch source: ${ZSTD_REPO}@main (${ZSTD_REF:0:7}), live head-tracking"
+          zstd_url="https://raw.githubusercontent.com/${ZSTD_REPO}/${ZSTD_REF}/zram_patch/002-zstd.patch"
           if ! fetch_patch "$zstd_url" /tmp/zstd_157.patch; then
             echo "::warning::zstd 1.5.7 patch unavailable upstream; continuing without it"
             echo "zstd-upgrade|skipped" >> "$PS_FILE"
@@ -2560,7 +2770,9 @@ runs:
         grep -q 'module_param(compression_level' crypto/zstd.c
         grep -n 'ZSTD_VERSION_RELEASE' include/linux/zstd_lib.h || true
         echo "ZSTD_UPGRADED=true" >> "$GITHUB_ENV"
-        echo "ZSTD_SOURCE=https://github.com/cctv18/oppo_oplus_realme_sm8850 zram_patch/002-zstd.patch @6c1ffda" >> "$GITHUB_ENV"
+        ZSTD_SRC_LABEL="https://github.com/${ZSTD_REPO} zram_patch/002-zstd.patch"
+        if [ -n "${ZSTD_REF:-}" ]; then ZSTD_SRC_LABEL="${ZSTD_SRC_LABEL} @${ZSTD_REF:0:7}"; fi
+        echo "ZSTD_SOURCE=${ZSTD_SRC_LABEL}" >> "$GITHUB_ENV"
         echo "✅ zstd upgraded to 1.5.7 with tunable crypto compression level"
         echo "::endgroup::"
 
@@ -2646,14 +2858,16 @@ runs:
 
     - name: Apply KSU Hooks
       shell: bash
-      if: ${{ env.NEED_HOOKS == 'true' }}
+      # WD next/ hooks are the KernelSU-Next integration: KSUN-only.
+      # NEED_HOOKS (susfs <= 1.5.12) stays as the second gate.
+      if: ${{ inputs.ksu_type == 'KSUN' && env.NEED_HOOKS == 'true' }}
       run: |
         set -euo pipefail
         echo "::group::Apply KSU hooks"
         cd "$COMMON_KERNEL_FOLDER"
         echo "Applying KSU hooks patch..."
         source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        gen_patch ksu-hooks-manual "$KERNEL_PATCHES_FOLDER/next/scope_min_manual_hooks_v1.4.patch"
+        gen_patch ksu-hooks-manual "$KERNEL_PATCHES_FOLDER/next/scope_min_manual_hooks_v1.6.patch"
         if ! grep -Eq '^ksu-hooks-manual\|(applied|already)' "$PS_FILE" 2>/dev/null; then
           echo "::error::KSU hooks patch failed to stage at fuzz=0 (see patch-faillogs)"
           exit 1
@@ -2696,13 +2910,25 @@ runs:
         KERNEL_VERSION="${{ env.KERNEL_VER }}"
         SUBLEVEL="$(awk '/^SUBLEVEL *=/ { print $3; exit }' Makefile 2>/dev/null || true)"
         RTM="kernel/locking/rtmutex.c"
-        RTMUTEX_PIN="d6255c5f44e3871743c7d1570436822227b4b2fd"
-        RTMUTEX_BASE="https://raw.githubusercontent.com/LingLuo17/AnyKernel3/${RTMUTEX_PIN}/security_patch"
         skip_cve() {
           echo "rtmutex-cve|skipped" >> "$PS_FILE"
           echo "::endgroup::"
           exit 0
         }
+        # No hard pin, no config override: live-track LingLuo17/AnyKernel3@main.
+        # If main is unresolvable, fall back to the previous commit via the API.
+        RTMUTEX_REPO="LingLuo17/AnyKernel3"
+        RTMUTEX_PIN="$(git ls-remote "https://github.com/${RTMUTEX_REPO}.git" refs/heads/main 2>/dev/null | awk '{print $1}')" || true
+        if [ -z "$RTMUTEX_PIN" ]; then
+          echo "::warning::Could not resolve ${RTMUTEX_REPO}@main via ls-remote; falling back to previous commit via API"
+          RTMUTEX_PIN="$(curl -fsSL "https://api.github.com/repos/${RTMUTEX_REPO}/commits?per_page=2" 2>/dev/null | jq -r '.[1].sha // empty' 2>/dev/null)" || true
+        fi
+        if [ -z "$RTMUTEX_PIN" ]; then
+          echo "::warning::Could not resolve ${RTMUTEX_REPO}@main nor previous commit; continuing without the CVE-2026-43499 fix"
+          skip_cve
+        fi
+        echo "rtmutex CVE chain source: ${RTMUTEX_REPO}@main (${RTMUTEX_PIN:0:7}), live head-tracking"
+        RTMUTEX_BASE="https://raw.githubusercontent.com/${RTMUTEX_REPO}/${RTMUTEX_PIN}/security_patch"
         ensure_followup_fixes() {
           # CVE-2026-53163: fixes the regression the 43499 backport introduced.
           if ! grep -q 'if (!waiter_task) /\* never enqueued \*/' "$RTM"; then
@@ -3109,11 +3335,8 @@ runs:
         echo "::group::Apply WildKernels' optimisations (opt bundle, patchgen staging @ fuzz=0)"
         cd "$COMMON_KERNEL_FOLDER"
         source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
-        # The opt switch only decides WHETHER the bundle runs, never HOW: every
-        # member still goes through patchgen staging (fuzz=0 or not applied, exact
-        # anchor rescue, post-apply self-verification). gen_patch returns 0 even
-        # when a member can't stage (it writes '<name>|failed' to $PS_FILE), so one
-        # drifted member skips itself instead of aborting the remaining members.
+        # The opt switch decides WHETHER the bundle runs, never HOW: every member goes through patchgen staging
+        # (fuzz=0, anchor rescue, self-verification); a member that can't stage writes '<name>|failed' and skips itself.
         WK_SKIPPED=""
         wk_tally() { # <name>: read the latest status gen_patch recorded
           local st
@@ -3232,9 +3455,8 @@ runs:
         fi
         
         echo "Patching $(basename $NTSYNC_PATCH)!"
-        # Pre-shim: only when this compat patch actually targets lockdep.h,
-        # idempotently add the missing no-op lockdep macros (formerly the
-        # post-failure .rej rescue) so the hunk lands at fuzz=0.
+        # Pre-shim: only when this compat patch targets lockdep.h, idempotently add the missing no-op
+        # lockdep macros so the hunk lands at fuzz=0.
         if grep -Eq '^\+\+\+ (a/|b/)?include/linux/lockdep\.h' "$NTSYNC_PATCH" && [ -f include/linux/lockdep.h ]; then
           grep -q '#define lockdep_assert(c)' include/linux/lockdep.h || \
             sed -i '/#define lockdep_is_held_type(l, r)/a\#define lockdep_assert(c)\t\t\tdo { } while (0)' include/linux/lockdep.h
@@ -3449,6 +3671,7 @@ runs:
         echo "Add TTL Target Support"
         cat >> "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" <<EOF
         CONFIG_IP_NF_TARGET_TTL=y
+        CONFIG_NETFILTER_XT_TARGET_HL=y
         CONFIG_IP6_NF_TARGET_HL=y
         CONFIG_IP6_NF_MATCH_HL=y
         EOF
@@ -3570,10 +3793,10 @@ runs:
         fi
         
         cat >> "$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig" <<EOF
-        CONFIG_SYSVIPC = y
-        CONFIG_DEVTMPFS = y
-        CONFIG_PID_NS = y
-        CONFIG_POSIX_MQUEUE = y
+        CONFIG_SYSVIPC=y
+        CONFIG_DEVTMPFS=y
+        CONFIG_PID_NS=y
+        CONFIG_POSIX_MQUEUE=y
         EOF
         echo "ds|applied" >> "$PS_FILE"
         echo "✅ LXC / Droidspaces support added (SYSVIPC enabled, namespaces + POSIX mqueue configured)"
@@ -3626,10 +3849,13 @@ runs:
         CONFIG_DEVTMPFS=y
         CONFIG_PID_NS=y
         CONFIG_POSIX_MQUEUE=y
-        CONFIG_NETFILTER_XT_TARGET_REJECT=y
         CONFIG_NETFILTER_XT_TARGET_LOG=y
         CONFIG_NETFILTER_XT_MATCH_RECENT=y
         CONFIG_USER_NS=y
+        CONFIG_IPC_NS=y
+        CONFIG_UTS_NS=y
+        CONFIG_NET_NS=y
+        CONFIG_MACVLAN=y
         EOF
         
         gen_patch ds-guard-userns "$KERNEL_PATCHES_FOLDER/common/droidspaces/0001-Guard-USER_NS-for-non-root-users.patch"
@@ -3857,6 +4083,102 @@ runs:
         echo "CONFIG_FAKE_DISABLE=${CONFIG_STRING}" >> $GITHUB_ENV
         echo "✅ Fake config.gz patched (KCONFIG_CONFIG_PATCHED verified in kernel/Makefile; CONFIG_FAKE_DISABLE=${CONFIG_STRING:-none})"
 
+    - name: Hide ADB/JDWP Sockets (SusFS)
+      shell: bash
+      if: ${{ env.OP_SUSFS == 'true' && env.OP_HIDE_ADB_JDWP != 'false' }}
+      run: |
+        set -euo pipefail
+        echo "Hide ADB/JDWP Sockets (SusFS)"
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch hide-adb-jdwp "$KERNEL_PATCHES_FOLDER/common/hide_adb_jdwp_sockets.patch" "" \
+          "g:net/unix/af_unix.c|susfs_is_hidden_adb_jdwp_addr;g:fs/susfs.c|d_u\.d_alias" \
+          "fs/susfs.c|struct fuse_inode [*]fi = NULL;"
+        if ! grep -Eq '^hide-adb-jdwp\|(applied|already)' "$PS_FILE" 2>/dev/null; then
+          echo "::error::hide_adb_jdwp_sockets patch failed to stage at fuzz=0 (see patch-faillogs)"
+          exit 1
+        fi
+        grep -q 'SUSFS_FILLDIR_SKIP' include/linux/susfs_def.h
+        grep -q 'susfs_is_hidden_adb_jdwp_addr' net/unix/af_unix.c
+        grep -q 'DT_SOCK' fs/readdir.c
+        echo "✅ ADB/JDWP socket hiding staged (af_unix interception + filldir skip verified)"
+
+    - name: Oplus SDP 900mA Charging
+      shell: bash
+      if: ${{ env.OP_SDP900MA == 'true' }}
+      run: |
+        set -euo pipefail
+        echo "Oplus SDP 900mA Charging"
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        gen_patch sdp900ma "$KERNEL_PATCHES_FOLDER/oneplus/0001-misc-oplus-sdp-900ma.patch" "" "g:drivers/misc/Kconfig|config OPLUS_SDP_900MA"
+        if ! grep -Eq '^sdp900ma\|(applied|already)' "$PS_FILE" 2>/dev/null; then
+          echo "::error::oplus_sdp_900ma patch failed to stage at fuzz=0 (see patch-faillogs)"
+          exit 1
+        fi
+        [ -f drivers/misc/oplus_sdp_900ma.c ]
+        grep -q '^CONFIG_OPLUS_SDP_900MA=y' arch/arm64/configs/gki_defconfig || \
+          echo 'CONFIG_OPLUS_SDP_900MA=y' >> arch/arm64/configs/gki_defconfig
+        grep -n '^CONFIG_OPLUS_SDP_900MA=y' arch/arm64/configs/gki_defconfig
+        echo "✅ SDP 900mA driver staged (DT edit for oplus_chg V1 + oplus_chg_v2 V2, /proc/sdp900ma readback, oplus_sdp_900ma=0 to disable at runtime)"
+
+    - name: USB ADB Gate (kernel side)
+      shell: bash
+      if: ${{ env.OP_USBADB_GATE == 'true' }}
+      run: |
+        set -euo pipefail
+        echo "USB ADB Gate (kernel side)"
+        cd "$COMMON_KERNEL_FOLDER"
+        source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
+        GATE_SRC="$KERNEL_PATCHES_FOLDER/common/usbadb-gate"
+        [ -d "$GATE_SRC/drivers/misc/usbadb_gate" ] || { echo "::error::usbadb-gate bundle missing from the kernel_patches clone"; exit 1; }
+        mkdir -p drivers/misc/usbadb_gate
+        cp -a "$GATE_SRC/drivers/misc/usbadb_gate/." drivers/misc/usbadb_gate/
+        append_nl() { f=$1; if [ -s "$f" ] && [ -n "$(tail -c 1 "$f" 2>/dev/null)" ]; then printf '\n' >> "$f"; fi; printf '%s\n' "$2" >> "$f"; }
+        if ! grep -q 'usbadb_gate/Kconfig' drivers/misc/Kconfig; then
+          append_nl drivers/misc/Kconfig ''
+          append_nl drivers/misc/Kconfig 'source "drivers/misc/usbadb_gate/Kconfig"'
+        fi
+        if ! grep -q 'usbadb_gate/' drivers/misc/Makefile; then
+          append_nl drivers/misc/Makefile ''
+          printf 'obj-$(CONFIG_USBADB_GATE)\t+= usbadb_gate/\n' >> drivers/misc/Makefile
+        fi
+        gen_patch usbadb-gate-notifier "$GATE_SRC/patches/0001-usb-gadget-state-notifier.patch" "" "g:drivers/usb/gadget/udc/core.c|usb_gadget_register_state_notifier"
+        if ! grep -Eq '^usbadb-gate-notifier\|(applied|already)' "$PS_FILE" 2>/dev/null; then
+          echo "::error::usb-gadget-state-notifier patch failed to stage at fuzz=0; WD ships an anchor-based fallback at common/usbadb-gate/patches/apply_notifier_fallback.sh"
+          exit 1
+        fi
+        grep -q '^CONFIG_USBADB_GATE=y' arch/arm64/configs/gki_defconfig || \
+          echo 'CONFIG_USBADB_GATE=y' >> arch/arm64/configs/gki_defconfig
+        grep -n '^CONFIG_USBADB_GATE=y' arch/arm64/configs/gki_defconfig
+        if [ "${{ inputs.ksu_type }}" = "KSUN" ]; then
+          KSU_RC_TARGET=""
+          for d in drivers/kernelsu kernel/KernelSU drivers/KernelSU KernelSU-Next; do
+            if [ -f "$d/runtime/ksud_integration.c" ]; then KSU_RC_TARGET="$d/runtime/ksud_integration.c"; break; fi
+          done
+          if [ -n "$KSU_RC_TARGET" ] && ! grep -q 'usbadb_gate' "$KSU_RC_TARGET"; then
+            KSU_RC_ROOT="$(dirname "$(dirname "$KSU_RC_TARGET")")"
+            if [ -f "$KSU_RC_ROOT/kernel/runtime/ksud_integration.c" ]; then KSU_RC_STRIP=p1
+            elif [ -f "$KSU_RC_ROOT/runtime/ksud_integration.c" ]; then KSU_RC_STRIP=p2
+            else KSU_RC_STRIP=""
+            fi
+            if [ -n "$KSU_RC_STRIP" ] && \
+               (cd "$KSU_RC_ROOT" && patch -"$KSU_RC_STRIP" --dry-run -s < "$GATE_SRC/patches/0002-kernelsu-usbadb-gate-rc.patch") >/dev/null 2>&1 && \
+               (cd "$KSU_RC_ROOT" && patch -"$KSU_RC_STRIP" --no-backup-if-mismatch -s < "$GATE_SRC/patches/0002-kernelsu-usbadb-gate-rc.patch"); then
+              echo "✅ KSUN rc trigger wired into $KSU_RC_TARGET (-$KSU_RC_STRIP)"
+            else
+              echo "::warning::could not apply the KSUN rc trigger patch to $KSU_RC_TARGET; driver publishes but nothing acts on the verdict"
+            fi
+          else
+            echo "::warning::ksud_integration.c not found (or already patched); driver publishes but nothing acts on the verdict"
+          fi
+        else
+          echo "::warning::the usbadb_gate rc trigger is KSUN-only upstream (0002 patches ksud_integration.c); on ${KSU_TYPE:-this root flavor} the driver publishes to /dev/usbadb_gate but no reader acts on it yet"
+        fi
+        echo "usbadb-gate|applied" >> "$PS_FILE"
+        echo "✅ usbadb_gate staged (/dev/usbadb_gate + /sys/kernel/usbadb_gate/{state,link}; UDC node defaults to a600000.dwc3)"
+
+
     - name: Disable Vendor / Kernel Modules
       if: ${{ env.OP_BLACKLIST_APPLY == 'true' }}
       shell: bash
@@ -3866,11 +4188,8 @@ runs:
         cd "$COMMON_KERNEL_FOLDER"
         source "$GITHUB_WORKSPACE/patchgen/gen_patch.sh"
 
-        # Kernel-side refusal of vendor module loads via
-        # CONFIG_DEBLOAT_VENDOR_MODULES (comma-separated list compiled into the
-        # kernel and checked in blacklisted()). The debloater disables itself
-        # via a static key on non-normal boots (recovery/OTA), so it can never
-        # break non-standard boot paths.
+        # Kernel-side refusal of vendor module loads via CONFIG_DEBLOAT_VENDOR_MODULES (comma-separated list
+        # checked in blacklisted()); a static key disables it on non-normal boots (recovery/OTA).
         RISKY_MODULES=("coresight" "rust_binder" "msm_kgsl" "camera" "oplusboot" "rmnet_wlan" "rmnet_core" "msm_drm" "cnss2" "oplus_chg_v2" "reboot_mode" "rfkill" "bootloader_log")
 
         declare -a modules=()
@@ -3938,6 +4257,46 @@ runs:
         echo "✅ [vendor-modules-blacklist] verified"
         echo "::endgroup::"
 
+    - name: SUSFS Command Parity Gate
+      if: ${{ env.OP_SUSFS == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::SUSFS command parity gate"
+        susfs_def_h="$COMMON_KERNEL_FOLDER/include/linux/susfs_def.h"
+        if [ ! -f "$susfs_def_h" ]; then
+          echo "::error::Staged susfs_def.h not found at $susfs_def_h"
+          exit 1
+        fi
+        # Commands declared by the staged SUSFS headers
+        grep -oE 'CMD_SUSFS_[A-Z0-9_]+' "$susfs_def_h" | sort -u > /tmp/susfs_declared.txt
+        # Legacy sus_su/sus_mount-era commands the roots handle out of band
+        printf '%s\n' CMD_SUSFS_SUS_SU CMD_SUSFS_IS_SUS_SU_READY \
+          CMD_SUSFS_SHOW_SUS_SU_WORKING_MODE CMD_SUSFS_ADD_SUS_MOUNT \
+          CMD_SUSFS_ADD_TRY_UMOUNT CMD_SUSFS_UMOUNT_FOR_ZYGOTE_ISO_SERVICE \
+          CMD_SUSFS_SET_ANDROID_DATA_ROOT_PATH CMD_SUSFS_SET_SDCARD_ROOT_PATH \
+          > /tmp/susfs_legacy.txt
+        parity_fail=0
+        for parity_root in "$KSU_FOLDER" "$KSUN_FOLDER"; do
+          [ -d "$parity_root/kernel" ] || continue
+          sort -u /tmp/susfs_declared.txt -o /tmp/susfs_declared.txt
+          grep -rhoE 'case CMD_SUSFS_[A-Z0-9_]+' "$parity_root/kernel" 2>/dev/null \
+            | sed 's/^case //' | sort -u > /tmp/susfs_impl_"$(basename "$parity_root")".txt || true
+          parity_missing="$(comm -23 /tmp/susfs_declared.txt /tmp/susfs_impl_"$(basename "$parity_root")".txt \
+            | grep -Fvx -f /tmp/susfs_legacy.txt || true)"
+          if [ -n "$parity_missing" ]; then
+            parity_list="$(printf '%s ' $parity_missing)"
+            echo "::error::SUSFS parity gate: dispatcher under $parity_root/kernel does not implement commands declared by the staged susfs headers: $parity_list"
+            parity_fail=1
+          fi
+        done
+        if [ "$parity_fail" -ne 0 ]; then
+          echo "::endgroup::"
+          exit 1
+        fi
+        echo "✅ SUSFS parity gate passed ($(wc -l < /tmp/susfs_declared.txt) declared commands, all implemented or legacy-exempt)"
+        echo "::endgroup::"
+
     - name: Patch dry-run verdict
       if: ${{ inputs.patch_dry_run == true || inputs.patch_dry_run == 'true' }}
       shell: bash
@@ -3988,6 +4347,126 @@ runs:
         if-no-files-found: error
         retention-days: 7
 
+    - name: Patch stealth-guard audit
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Patch stealth-guard audit"
+        mkdir -p "$GITHUB_WORKSPACE/patch-faillogs"
+        AUDIT="$GITHUB_WORKSPACE/patch-faillogs/patch-audit.txt"
+        audit_body="$GITHUB_WORKSPACE/patchgen/patch-audit.body"
+        if [ -z "${PS_FILE:-}" ] || [ ! -f "$PS_FILE" ]; then
+          echo "No patch status file; nothing to audit"
+          echo "::endgroup::"
+          exit 0
+        fi
+        ledger="$GITHUB_WORKSPACE/patchgen/expected-rejects.txt"
+        ledger_entries=0
+        [ -f "$ledger" ] && ledger_entries=$(grep -cv -e '^[[:space:]]*#' -e '^[[:space:]]*$' "$ledger" || true)
+        declare -A last_status=()
+        while IFS='|' read -r name status _; do
+          [ -n "${name:-}" ] || continue
+          last_status["$name"]="${status:-unknown}"
+        done < "$PS_FILE"
+        stealth_fail=0; ok_applied=0; ok_already=0; info=0; oracle_checked=0; superseded=0
+        # Supersession index: every '-' line in the patchset, scoped to the b/ path it
+        # edits. An applied patch's oracle line can legitimately vanish when a LATER
+        # patch rewrites the same file (re_write_* on top of add_*): those are excused
+        # as superseded; anything else stays a stealth failure.
+        SUP_IDX="$GITHUB_WORKSPACE/patchgen/supersession-index.tsv"
+        SUP_PATHS="$GITHUB_WORKSPACE/patchgen/supersession-paths.tsv"
+        : > "$SUP_IDX"
+        : > "$SUP_PATHS"
+        sup_dirs=""
+        if [ -d "$KERNEL_PATCHES_FOLDER" ]; then sup_dirs="$sup_dirs $KERNEL_PATCHES_FOLDER"; fi
+        if [ -d "$SUSFS_FOLDER/kernel_patches" ]; then sup_dirs="$sup_dirs $SUSFS_FOLDER/kernel_patches"; fi
+        while IFS= read -r -d '' pf; do
+          pname=$(basename "$pf" .patch)
+          bpath=""
+          while IFS= read -r pl; do
+            case "$pl" in
+              '+++ '*) bpath="${pl#\+\+\+ }"; bpath="${bpath%%$'\t'*}"; bpath="${bpath#b/}"; [ -n "$bpath" ] && printf '%s\t%s\n' "$pname" "$bpath" >> "$SUP_PATHS" || true ;;
+              '--- '*) ;;
+              -*) [ -n "$bpath" ] && printf '%s\t%s\t%s\n' "$bpath" "$pname" "$(printf '%s' "${pl#-}" | sed -e 's/[[:space:]]\{1,\}/ /g' -e 's/^ //' -e 's/ $//')" ;;
+            esac
+          done < "$pf"
+        done < <(find $sup_dirs -type f -name '*.patch' -print0 2>/dev/null) >> "$SUP_IDX"
+        sort -u -o "$SUP_IDX" "$SUP_IDX"
+        sort -u -o "$SUP_PATHS" "$SUP_PATHS" 2>/dev/null || true
+        {
+          echo "device=${OP_MODEL:-?} os=${OP_OS_VERSION:-?} kernel=${ANDROID_VER:-?}-${TKERNEL_VER:-?}"
+          for name in $(printf '%s\n' "${!last_status[@]}" | sort); do
+            status="${last_status[$name]}"
+            case "$status" in
+              applied)
+                oracle="$GITHUB_WORKSPACE/patchgen/${name}/oracle.tsv"
+                if [ -f "$oracle" ]; then
+                  miss=0
+                  while IFS=$'\t' read -r root file line; do
+                    [ -n "${file:-}" ] || continue
+                    if [ ! -f "$root/$file" ] || ! grep -qF -- "$line" "$root/$file" 2>/dev/null; then
+                      nline=$(printf '%s' "$line" | sed -e 's/[[:space:]]\{1,\}/ /g' -e 's/^ //' -e 's/ $//')
+                      sup_by=""
+                      while IFS= read -r cand; do
+                        case "$file" in
+                          */"$cand")
+                            sup_by=$(awk -F'\t' -v f="$cand" -v l="$nline" '$1 == f && $3 == l { print $2; exit }' "$SUP_IDX" 2>/dev/null || true)
+                            if [ -n "$sup_by" ]; then break; fi
+                            ;;
+                        esac
+                      done < <(awk -F'\t' -v n="$name" '$1 == n { print $2 }' "$SUP_PATHS" 2>/dev/null | sort -u)
+                      if [ -n "$sup_by" ] && [ "$sup_by" != "$name" ] \
+                         && { [ "${last_status[$sup_by]:-}" = applied ] || [ "${last_status[$sup_by]:-}" = already ]; }; then
+                        echo "superseded ${name}: oracle line replaced by later patch '${sup_by}' in ${file}: ${line}"
+                        superseded=$((superseded+1))
+                      else
+                        echo "ORACLE-MISS ${name}: ${root}/${file}: ${line}"
+                        miss=$((miss+1))
+                      fi
+                    fi
+                  done < "$oracle"
+                  oracle_checked=$((oracle_checked+1))
+                  if [ "$miss" -gt 0 ]; then
+                    stealth_fail=$((stealth_fail+1))
+                    echo "STEALTH-FAIL ${name}: applied but ${miss} oracle line(s) missing from the tree"
+                  else
+                    ok_applied=$((ok_applied+1))
+                    echo "ok ${name}: applied (oracle re-verified)"
+                  fi
+                else
+                  ok_applied=$((ok_applied+1))
+                  echo "ok ${name}: applied (no oracle; applied outside gen_patch)"
+                fi
+                ;;
+              already)
+                ok_already=$((ok_already+1))
+                echo "ok ${name}: already in tree"
+                ;;
+              failed)
+                stealth_fail=$((stealth_fail+1))
+                echo "STEALTH-FAIL ${name}: reported failed; tree is missing the patch"
+                ;;
+              *)
+                info=$((info+1))
+                echo "info ${name}: ${status}"
+                ;;
+            esac
+          done
+          echo "applied_ok=${ok_applied} already_ok=${ok_already} oracle_checked=${oracle_checked} superseded=${superseded} skipped_or_other=${info} ledger_entries=${ledger_entries}"
+        } > "$audit_body"
+        tee "$AUDIT" < "$audit_body"
+        cat "$AUDIT" >> "${GITHUB_STEP_SUMMARY:-/dev/null}" 2>/dev/null || true
+        stealth_fail=0
+        if [ -f "$AUDIT" ]; then
+          stealth_fail=$(grep -c '^STEALTH-FAIL' "$AUDIT" 2>/dev/null || true)
+          [ -n "$stealth_fail" ] || stealth_fail=0
+        fi
+        echo "::endgroup::"
+        if [ "$stealth_fail" -gt 0 ]; then
+          echo "::error::stealth-guard: ${stealth_fail} patch(es) missing from the tree; refusing to build (see patch-audit.txt)"
+          exit 1
+        fi
+        echo "✅ stealth-guard audit passed"
     - name: Upload patch status
       if: ${{ always() && env.PS_FILE != '' }}
       uses: actions/upload-artifact@v7
@@ -4002,7 +4481,10 @@ runs:
       uses: actions/upload-artifact@v7
       with:
         name: patch-faillogs-${{ env.PS_BASE }}
-        path: ${{ github.workspace }}/patch-faillogs/
+        path: |
+          ${{ github.workspace }}/patch-faillogs/
+          ${{ github.workspace }}/kernel_workspace/**/*.rej
+          ${{ github.workspace }}/*.rej
         if-no-files-found: ignore
         retention-days: 7
 
@@ -4039,6 +4521,18 @@ runs:
         MPMAP="-fmacro-prefix-map=${WORKSPACE}=."
         FPMAP="-ffile-prefix-map=${WORKSPACE}=."
         
+        add_kcflag() {
+          if printf 'int g(int a){return a+1;} int f(int a){return g(a)*2;}\n' \
+            | clang --target=aarch64-linux-gnu -O2 "$@" -x c - -c -o /dev/null 2>/dev/null; then
+            KCFLAGS="${KCFLAGS:+$KCFLAGS }$*"
+          else
+            echo "::warning::clang rejected flag(s), skipping: $*"
+          fi
+        }
+        
+        if [[ "${{ inputs.mlgo }}" = "true" ]]; then
+          add_kcflag -mllvm -regalloc-enable-advisor=release
+        fi
         export KCFLAGS="${KCFLAGS:-} $MAP $MPMAP $FPMAP -no-canonical-prefixes -fdiagnostics-color=never -Qunused-arguments -Wno-unused-command-line-argument -D__ANDROID_COMMON_KERNEL__"
         export KCPPFLAGS="${KCPPFLAGS:-} $MAP $MPMAP $FPMAP"
         
@@ -4049,11 +4543,9 @@ runs:
         export LD=ld.lld HOSTLD=ld.lld AR=llvm-ar NM=llvm-nm 
         export OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
 
-        # FinaSU's Kbuild computes KSU_KERNEL_DIR := $(srctree)/$(src), which
-        # double-prefixes $(src) in O= in-tree builds and breaks both the -I flags
-        # and the preinit runner.elf prerequisite. The `ifndef KSU_KERNEL_DIR`
-        # guard is an override hook: export the absolute path and every KSU_KERNEL_DIR
-        # use (includes, runner rule, wildcard deps) resolves correctly.
+        # FinaSU's Kbuild computes KSU_KERNEL_DIR := $(srctree)/$(src), double-prefixing $(src) in O= in-tree
+        # builds (breaks -I flags and the runner.elf prerequisite). The `ifndef KSU_KERNEL_DIR` guard is the
+        # override hook: export an absolute path and every KSU_KERNEL_DIR use resolves correctly.
         if [ "${{ inputs.ksu_type }}" = "FinaSU" ] && [ -d "$KERNEL_PLATFORM_FOLDER/KernelSU/kernel" ]; then
           export KSU_KERNEL_DIR="$KERNEL_PLATFORM_FOLDER/KernelSU/kernel"
         fi
@@ -4120,10 +4612,8 @@ runs:
         ccache -s | head -n 20
         echo "============================================"
         
-        # Dedup gki_defconfig before kconfig runs: fragment appends can repeat
-        # symbols already present, and kconfig emits "override: reassigning to
-        # symbol" for each duplicate. Keeping the LAST occurrence of each symbol
-        # is exactly the semantics kconfig applies — without the warning noise.
+        # Dedup gki_defconfig before kconfig runs: fragment appends can repeat symbols and kconfig warns
+        # "override: reassigning to symbol" per duplicate; keeping the LAST occurrence matches kconfig semantics.
         DF="$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig"
         if [ -f "$DF" ]; then
           awk '
@@ -4169,7 +4659,13 @@ runs:
 
         case "$OP_BRANCH" in
           wild/sm8750|wild/sm8850|wild/sm8845)
-            KCFLAGS_EXTRA="-mcpu=oryon-1 ${KCFLAGS_EXTRA}"
+            CLANG_PROBE="clang"
+            if [ -n "${CLANG_BIN_PATH:-}" ] && [ -x "${CLANG_BIN_PATH}/clang" ]; then CLANG_PROBE="${CLANG_BIN_PATH}/clang"; fi
+            if printf 'int x;\n' | "$CLANG_PROBE" --target=aarch64-linux-gnu -mcpu=oryon-1 -x c -c - -o /dev/null 2>/dev/null; then
+              KCFLAGS_EXTRA="-mcpu=oryon-1 ${KCFLAGS_EXTRA}"
+            else
+              echo "⚠️ Toolchain rejects -mcpu=oryon-1 — Oryon CPU tuning flag skipped"
+            fi
             ;;
         esac
         
@@ -4270,6 +4766,38 @@ runs:
         echo "✅ Kernel build completed"
         echo "::endgroup::"
 
+    - name: ❌ Compile failure summary
+      if: ${{ failure() && steps.build_kernel_step.conclusion == 'failure' }}
+      shell: bash
+      run: |
+        {
+          echo "## ❌ Kernel compilation failed"
+          echo ""
+          echo "| Field | Value |"
+          echo "| --- | --- |"
+          echo "| **Model** | \`${{ env.OP_MODEL }}_${{ env.OP_OS_VERSION }}\` |"
+          echo "| **Fail log artifact** | \`fail_compile-${{ env.PS_BASE }}\` |"
+          echo ""
+          echo "<details><summary>Last 100 lines of build.log</summary>"
+          echo ''
+          echo '```text'
+          tail -n 100 "$COMMON_KERNEL_FOLDER/build.log" 2>/dev/null || echo "build.log not available"
+          echo '```'
+          echo "</details>"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Upload compile failure log
+      if: ${{ failure() && steps.build_kernel_step.conclusion == 'failure' }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: fail_compile-${{ env.PS_BASE }}
+        path: |
+          ${{ env.COMMON_KERNEL_FOLDER }}/build.log
+          ${{ env.COMMON_KERNEL_FOLDER }}/out/.config
+        if-no-files-found: ignore
+        include-hidden-files: true
+        retention-days: 7
+
     - name: 📊 ccache Post-Build Statistics
       id: ccache_stats
       if: ${{ success() && (inputs.clean == false || inputs.clean == 'false') && !(inputs.patch_dry_run == true || inputs.patch_dry_run == 'true') }}
@@ -4284,8 +4812,8 @@ runs:
         ccache -c
         
         echo "Perform ccache eviction!"
-        # 0.5 days = 12 Hrs. Delete cache unused in 12 hrs. 12 hrs is considered for safety.
-        # Yes. ccache uses mtime as a store of time due to cross compatibility with different OS.
+        # Evict cache files untouched for 12 hours; ccache records mtime as its timestamp for cross-OS
+        # compatibility, so age-based eviction keys on mtime.
         find "$CCACHE_DIR" -type f -mtime +0.5 -delete
         # Remove empty layout subdirectories
         find "$CCACHE_DIR" -type d -empty -delete
@@ -4357,9 +4885,9 @@ runs:
         fi
         
         if [ -f "$COMMON_KERNEL_FOLDER/build.log" ]; then
-          # Compiler diagnostics only (file:line:col: warning: …). The previous
-          # case-insensitive substring grep also swept script/config notices such as
-          # the "Unexpected CONFIG_* value found" self-check into this count.
+          # Compiler diagnostics only (file:line:col: warning: …); script and
+          # config notices such as the "Unexpected CONFIG_* value found"
+          # self-check do not match this pattern.
           WARNINGS_COUNT="$(grep -cE '^[^ :]+:[0-9]+:[0-9]+: warning: ' "$COMMON_KERNEL_FOLDER/build.log" 2>/dev/null || true)"
           [ -n "$WARNINGS_COUNT" ] || WARNINGS_COUNT="0"
         else
@@ -4388,9 +4916,8 @@ runs:
         BUILD_TIME="${BUILD_TIME:-0}"
         
         KERNEL_UNAME_BANNER=$(strings "$IMG" | grep -E 'Linux version.*#' | tail -n1)
-        # Keep only the release string (e.g. 6.12.58-android16-6-g925a103d123c-ab15898589-4k) for
-        # the summary; the full banner (compiler, build user@host, SMP PREEMPT + timestamp) stays in
-        # this log group only, mirroring a clean uname like BP's build reports.
+        # Keep only the release string (e.g. 6.12.58-android16-6-g925a103d123c-ab15898589-4k) for the summary;
+        # the full banner (compiler, build user@host, SMP PREEMPT + timestamp) stays in this log group only.
         KERNEL_UNAME=$(printf '%s' "$KERNEL_UNAME_BANNER" | sed -e 's/^Linux version //' -e 's/ .*//')
         echo "Kernel Uname (full banner): $KERNEL_UNAME_BANNER"
         echo "Kernel Uname: $KERNEL_UNAME"
