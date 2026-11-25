@@ -356,10 +356,11 @@ jobs:
                       if k == "uname":
                           nv = vendor_uname(nv)
                           ov = ours.get(k, "")
-                          if nv != ov:
-                              changed.append(f"{k}: {ov!r} -> {nv!r}"
-                                             + ("" if nv else
-                                                " (non-vendor-like cleared)"))
+                          # a populated local uname is never cleared: an empty or
+                          # non-vendor-like upstream value (e.g. WD's "OP-WILD")
+                          # means "keep ours" - sync fills/replaces, never blanks
+                          if nv and nv != ov:
+                              changed.append(f"{k}: {ov!r} -> {nv!r}")
                               ours[k] = nv
                           continue
                       if k == "build_time" and not nv:
@@ -529,12 +530,20 @@ jobs:
           existing = gh("pr", "list", "--head", branch, "--state", "open",
                         "--json", "number", "--jq", ".[0].number").stdout.strip()
           if existing:
-              gh("pr", "comment", existing, "--body", body)
+              c = gh("pr", "comment", existing, "--body", body)
+              if c.returncode != 0:
+                  raise RuntimeError("gh pr comment failed: "
+                                     + (c.stderr.strip()
+                                        or c.stdout.strip()))
               print(f"Updated existing PR #{existing}")
           else:
               pr = gh("pr", "create", "--base", TARGET, "--head", branch,
                       "--title", "Upstream sync: new/updated devices & configs",
                       "--body", body)
+              if pr.returncode != 0:
+                  raise RuntimeError("gh pr create failed: "
+                                     + (pr.stderr.strip()
+                                        or pr.stdout.strip()))
               print(pr.stdout or pr.stderr)
           PYEOF
 
