@@ -34,10 +34,14 @@ on:
 permissions:
   contents: write
   issues: write
-  # the sync branch commit may rewrite device menus inside
-  # .github/workflows/build-kernel-release.yml - pushing workflow files
-  # requires this or the remote rejects the push
-  workflows: write
+  # NOTE: do NOT add a "workflows" scope here - no such key exists in the
+  # workflow-permissions syntax and adding one invalidates the whole file
+  # ("Unexpected value 'workflows'"). GITHUB_TOKEN can never push
+  # workflow-file changes by design; to let the sync branch carry the
+  # regenerated build-kernel-release.yml, set an optional repo secret
+  # SYNC_PAT (classic PAT with repo scope, or fine-grained with Contents +
+  # Workflows read/write). Without it this job pushes the sync branch
+  # WITHOUT workflow files and attaches the regen to the ci-matrix artifact.
 
 concurrency:
   group: upstream-sync-monitor
@@ -69,6 +73,7 @@ jobs:
         id: sync
         env:
           GH_TOKEN: ${{ github.token }}
+          SYNC_PAT: ${{ secrets.SYNC_PAT }}
           TARGET_BRANCH: ${{ inputs.target_branch || github.ref_name }}
           APPLY_FLAG: ${{ inputs.apply && 'true' || 'false' }}
           DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
@@ -635,7 +640,58 @@ jobs:
           if regen:
               commit_msg += "; regenerate device menus"
           subprocess.run(["git", "commit", "-m", commit_msg], check=True)
-          subprocess.run(["git", "push", "-f", "origin", branch], check=True)
+
+          # GITHUB_TOKEN can never push workflow-file changes (there is no
+          # "workflows" scope in workflow-permissions syntax). An optional
+          # repo secret SYNC_PAT lifts that; without it the commit is
+          # rebuilt without the workflow file and the regen lands in the
+          # ci-matrix artifact instead.
+          def _push(remote):
+              return subprocess.run(["git", "push", "-f", remote, branch],
+                                    capture_output=True, text=True)
+
+          sync_pat = os.environ.get("SYNC_PAT", "").strip()
+          remote = (f"https://x-access-token:{sync_pat}@github.com/"
+                    f"{os.environ['GITHUB_REPOSITORY']}.git"
+                    if sync_pat else "origin")
+          pushed = _push(remote)
+          if pushed.returncode != 0:
+              errtxt = pushed.stderr + pushed.stdout
+              if sync_pat:
+                  errtxt = errtxt.replace(sync_pat, "***")
+              if ("create or update workflow" in errtxt) and not sync_pat:
+                  with open("regen-build-kernel-release.yml", "w") as f_out:
+                      f_out.write(open(wf_path, encoding="utf-8").read())
+                  subprocess.run(["git", "reset", "--soft", "HEAD~1"],
+                                 check=True)
+                  subprocess.run(["git", "checkout", "HEAD", "--", wf_path],
+                                 check=True)
+                  subprocess.run(["git", "commit", "-m",
+                                  "sync: upstream manifests (huangdihd "
+                                  "anykernel) & generated configs "
+                                  "(device-menu regen withheld - needs "
+                                  "SYNC_PAT)"], check=True)
+                  pushed = _push("origin")
+                  if pushed.returncode != 0:
+                      print(pushed.stderr + pushed.stdout)
+                      raise SystemExit(1)
+                  warn = (
+                      "> [!WARNING]\n"
+                      "> GITHUB_TOKEN cannot push workflow-file changes, so "
+                      "the sync branch was pushed WITHOUT the regenerated "
+                      f"`{wf_path}`.\n"
+                      "> The regenerated file is attached to the ci-matrix "
+                      "artifact as `regen-build-kernel-release.yml` - apply "
+                      "it by hand, or add a repo secret `SYNC_PAT` (classic "
+                      "PAT with repo scope, or fine-grained with Contents + "
+                      "Workflows read/write) and re-run to let the sync "
+                      "branch carry it directly.")
+                  print(warn)
+                  with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                      f.write("\n" + warn + "\n")
+              else:
+                  print(errtxt)
+                  raise SystemExit(1)
 
           repo = os.environ.get("GITHUB_REPOSITORY", "")
           compare = f"https://github.com/{repo}/compare/{TARGET}...{branch}"
@@ -652,7 +708,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ci-matrix
-          path: ci-matrix.json
+          path: |
+            ci-matrix.json
+            regen-build-kernel-release.yml
           if-no-files-found: ignore
 
   watch-pins:
