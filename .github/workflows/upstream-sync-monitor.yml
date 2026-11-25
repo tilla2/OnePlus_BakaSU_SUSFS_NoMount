@@ -14,8 +14,8 @@ on:
   workflow_dispatch:
     inputs:
       target_branch:
-        description: "Base branch for the sync PR"
-        default: "UID-Filter-Fix"
+        description: "Base branch for the sync PR (default: the branch this run is dispatched from)"
+        default: ""
         required: false
       create_pr:
         description: "Apply changes and open/update the sync PR"
@@ -54,14 +54,14 @@ jobs:
       - name: Checkout working branch
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.target_branch || 'UID-Filter-Fix' }}
+          ref: ${{ inputs.target_branch || github.ref_name }}
           fetch-depth: 1
 
       - name: Detect upstream changes, pair & rewrite sources, emit CI matrix
         id: sync
         env:
           GH_TOKEN: ${{ github.token }}
-          TARGET_BRANCH: ${{ inputs.target_branch || 'UID-Filter-Fix' }}
+          TARGET_BRANCH: ${{ inputs.target_branch || github.ref_name }}
           CREATE_PR: ${{ inputs.create_pr && 'true' || 'false' }}
           DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
           AK_REMOTE_URL: ${{ env.AK_REMOTE_URL }}
@@ -402,7 +402,10 @@ jobs:
                          check=True)
           subprocess.run(["git", "config", "user.email",
                           "actions@github.com"], check=True)
-          branch = os.environ["SYNC_BRANCH"]
+          # per-target sync branch: dispatches against different bases must
+          # not force-push each other's open sync PR out from under it
+          branch = os.environ["SYNC_BRANCH"] + "-" + re.sub(
+              r"[^A-Za-z0-9._-]", "-", TARGET).strip("-")
           subprocess.run(["git", "checkout", "-b", branch], check=True)
           subprocess.run(["git", "add", "manifests/", "configs/"], check=True)
           subprocess.run(["git", "commit", "-m",
@@ -446,7 +449,7 @@ jobs:
       - name: Checkout working branch
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.target_branch || 'UID-Filter-Fix' }}
+          ref: ${{ inputs.target_branch || github.ref_name }}
           fetch-depth: 1
 
       - name: Watch susfs & kernel_patches pins for drift
