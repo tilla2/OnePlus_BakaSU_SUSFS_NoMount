@@ -1,9 +1,10 @@
 name: upstream-sync-monitor
 
 # Daily: detect new/changed devices in the WildKernels and Bouteillepleine
-# trees and emit a CI action matrix (no writes, no PR). PR creation happens
-# only on a manual run with create_pr=true; the sync branch is deleted
-# automatically when its PR merges. Upstream manifests are rewritten to our
+# trees and emit a CI action matrix (no writes, no PR). The sync branch is
+# force-pushed only on a manual run with apply=true; open the PR manually
+# from that branch - it is deleted automatically when the PR merges.
+# Upstream manifests are rewritten to our
 # huangdihd AnyKernel3 (wild remote, gki-2.0) before they are saved, and
 # configs are generated from the canonical template with upstream values -
 # nothing under manifests/ or configs/ is hand-edited here.
@@ -17,12 +18,12 @@ on:
         description: "Base branch for the sync PR (default: the branch this run is dispatched from)"
         default: ""
         required: false
-      create_pr:
-        description: "Apply changes and open/update the sync PR"
+      apply:
+        description: "Apply changes and force-push the sync branch (open the PR manually)"
         type: boolean
         default: false
       dry_run:
-        description: "Detect and report only (no writes even with create_pr)"
+        description: "Detect and report only (no writes even with apply)"
         type: boolean
         default: false
   pull_request:
@@ -31,7 +32,6 @@ on:
 permissions:
   contents: write
   issues: write
-  pull-requests: write
 
 concurrency:
   group: upstream-sync-monitor
@@ -63,7 +63,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TARGET_BRANCH: ${{ inputs.target_branch || github.ref_name }}
-          CREATE_PR: ${{ inputs.create_pr && 'true' || 'false' }}
+          APPLY_FLAG: ${{ inputs.apply && 'true' || 'false' }}
           DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
           AK_REMOTE_URL: ${{ env.AK_REMOTE_URL }}
           AK_PROJECT: ${{ env.AK_PROJECT }}
@@ -74,7 +74,7 @@ jobs:
 
           TOKEN = os.environ["GH_TOKEN"]
           TARGET = os.environ["TARGET_BRANCH"]
-          APPLY = (os.environ["CREATE_PR"] == "true"
+          APPLY = (os.environ["APPLY_FLAG"] == "true"
                    and os.environ["DRY_RUN"] != "true")
           WD_REPO, BP_REPO = os.environ["WD_REPO"], os.environ["BP_REPO"]
           AK_REMOTE_URL = os.environ["AK_REMOTE_URL"]
@@ -517,34 +517,14 @@ jobs:
                           "& generated configs"], check=True)
           subprocess.run(["git", "push", "-f", "origin", branch], check=True)
 
-          def gh(*args):
-              return subprocess.run(["gh"] + list(args),
-                                    capture_output=True, text=True)
-
-          body = report + ("\n\nGenerated configs take upstream values; "
-                           "extras are forced on, bbr3 on, bore off, "
-                           "vendor-like unames only, "
-                           "root_tag ChimeraKernel. Merge to "
-                           f"`{TARGET}`; the sync branch is deleted "
-                           "automatically on merge.\n")
-          existing = gh("pr", "list", "--head", branch, "--state", "open",
-                        "--json", "number", "--jq", ".[0].number").stdout.strip()
-          if existing:
-              c = gh("pr", "comment", existing, "--body", body)
-              if c.returncode != 0:
-                  raise RuntimeError("gh pr comment failed: "
-                                     + (c.stderr.strip()
-                                        or c.stdout.strip()))
-              print(f"Updated existing PR #{existing}")
-          else:
-              pr = gh("pr", "create", "--base", TARGET, "--head", branch,
-                      "--title", "Upstream sync: new/updated devices & configs",
-                      "--body", body)
-              if pr.returncode != 0:
-                  raise RuntimeError("gh pr create failed: "
-                                     + (pr.stderr.strip()
-                                        or pr.stdout.strip()))
-              print(pr.stdout or pr.stderr)
+          repo = os.environ.get("GITHUB_REPOSITORY", "")
+          compare = f"https://github.com/{repo}/compare/{TARGET}...{branch}"
+          note = (f"Sync branch ready: {branch}\n"
+                  f"Open the PR manually: {compare}\n"
+                  "Merging the PR deletes the branch automatically.")
+          print(note)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write("\n" + note + "\n")
           PYEOF
 
       - name: Upload CI matrix artifact
