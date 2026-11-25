@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <manifest>
   <remote fetch="https://git.codelinaro.org/clo/la" name="clo-la" review="codelinaro.org"/>
-  <remote fetch="https://github.com/OnePlusOSS" name="origin"/>
+  <remote fetch="https://github.com/OnePlusOSS" name="origin"/>
   <remote fetch="https://github.com/huangdihd" name="wild"/>
   <default remote="clo-la" revision="dummy_revision" sync-c="true" sync-tags="false"/>
   <project remote="wild" name="AnyKernel3" path="AnyKernel3" revision="gki-2.0"/>

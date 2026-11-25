@@ -1,11 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <manifest>
   <remote fetch="https://git.codelinaro.org/clo/la" name="clo-la"/>
+  <remote fetch="https://github.com/huangdihd" name="wild"/>
   <default remote="clo-la" revision="dummy_revision" sync-c="true" sync-tags="false"/>
   <remote fetch="https://github.com/OnePlusOSS" name="origin"/>
-    <remote fetch="https://github.com/huangdihd" name="wild"/>
   <project remote="wild" name="AnyKernel3" path="AnyKernel3" revision="gki-2.0"/>
-
   <project remote="origin" name="android_kernel_oneplus_mt6835" path="kernel-5.15" revision="oneplus/mt6835_b_16.0_n6x">
     <linkfile dest="kernel_platform/common" src="."/>
   </project>
