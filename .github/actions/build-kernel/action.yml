@@ -4364,6 +4364,7 @@ runs:
         retention-days: 7
 
     - name: Patch stealth-guard audit
+      id: audit
       shell: bash
       run: |
         set -euo pipefail
@@ -4494,21 +4495,46 @@ runs:
         fi
         echo "::endgroup::"
         if [ "$stealth_fail" -gt 0 ]; then
+          echo "upload_faillogs=true" >> "$GITHUB_OUTPUT"
           echo "::error::stealth-guard: ${stealth_fail} patch(es) missing from the tree; refusing to build (see patch-audit.txt)"
           exit 1
         fi
-        echo "✅ stealth-guard audit passed"
+        # Forensics gate: the patch-faillogs artifact ships only when something actually
+        # failed. A clean audit stages its report into the patch-status artifact instead;
+        # stray evidence (stage/apply/verify logs, leftover .rej files) flips the gate on.
+        upload_faillogs=false
+        stray="$(find "$GITHUB_WORKSPACE/patch-faillogs" -type f ! -name 'patch-audit.txt' 2>/dev/null | head -n 1 || true)"
+        if [ -z "$stray" ]; then
+          stray="$(find "$GITHUB_WORKSPACE/kernel_workspace" -name '*.rej' -type f 2>/dev/null | head -n 1 || true)"
+        fi
+        if [ -z "$stray" ]; then
+          stray="$(find "$GITHUB_WORKSPACE" -maxdepth 1 -name '*.rej' -type f 2>/dev/null | head -n 1 || true)"
+        fi
+        if [ -n "$stray" ]; then
+          upload_faillogs=true
+          echo "⚠️ stealth-guard audit passed, but forensic evidence exists — patch-faillogs will still be uploaded: $stray"
+        fi
+        echo "upload_faillogs=$upload_faillogs" >> "$GITHUB_OUTPUT"
+        if [ "$upload_faillogs" = "false" ]; then
+          mkdir -p "$GITHUB_WORKSPACE/patch-status-audit"
+          cp "$AUDIT" "$GITHUB_WORKSPACE/patch-status-audit/patch-audit.txt"
+          echo "✅ stealth-guard audit passed — no forensic evidence; audit report staged into patch-status, faillogs upload skipped"
+        fi
     - name: Upload patch status
       if: ${{ always() && env.PS_FILE != '' }}
       uses: actions/upload-artifact@v7
       with:
         name: patch-status-${{ env.PS_BASE }}
-        path: ${{ env.PS_FILE }}
+        path: |
+          ${{ env.PS_FILE }}
+          ${{ github.workspace }}/patch-status-audit/
         if-no-files-found: ignore
         retention-days: 7
 
     - name: Upload patch failure forensics
-      if: ${{ always() && env.PS_FILE != '' }}
+      # Uploads only when the stealth-guard audit found failures (upload_faillogs=true)
+      # or could not vouch for a clean run (no verdict = fail-safe, old behaviour).
+      if: ${{ always() && env.PS_FILE != '' && steps.audit.outputs.upload_faillogs != 'false' }}
       uses: actions/upload-artifact@v7
       with:
         name: patch-faillogs-${{ env.PS_BASE }}
@@ -4647,7 +4673,11 @@ runs:
         # "override: reassigning to symbol" per duplicate; keeping the LAST occurrence matches kconfig semantics.
         DF="$COMMON_KERNEL_FOLDER/arch/arm64/configs/gki_defconfig"
         if [ -f "$DF" ]; then
-          awk '
+          # NOTE: `next` is illegal inside an END block (mawk: "next used in END action",
+          # a fatal compile error that silently no-oped this dedup on every run).
+          # `continue` keeps the skip inside the for-loop; an awk failure now warns
+          # instead of quietly leaving the duplicates in place.
+          if ! awk '
             {
               line[NR] = $0; sym = ""
               if (match($0, /^# CONFIG_[A-Za-z0-9_]+ is not set$/)) { s = substr($0, 3); sub(/ is not set$/, "", s); sym = s }
@@ -4659,11 +4689,16 @@ runs:
                 cur = line[i]; s = ""
                 if (match(cur, /^# CONFIG_[A-Za-z0-9_]+ is not set$/)) { t = substr(cur, 3); sub(/ is not set$/, "", t); s = t }
                 else if (match(cur, /^CONFIG_[A-Za-z0-9_]+=/)) { s = substr(cur, RSTART, RLENGTH - 1) }
-                if (s != "" && seen[s] > 1 && last[s] != i) next
+                if (s != "" && seen[s] > 1 && last[s] != i) continue
                 print cur
               }
             }
-          ' "$DF" > "$DF.tmp" && mv "$DF.tmp" "$DF"
+          ' "$DF" > "$DF.tmp"; then
+            rm -f "$DF.tmp"
+            echo "::warning::gki_defconfig dedup awk failed; keeping the original config (duplicate symbol warnings possible)"
+          else
+            mv "$DF.tmp" "$DF"
+          fi
         fi
         
         make LD="$COMMON_KERNEL_FOLDER/ld-wrapper" HOSTLD="$COMMON_KERNEL_FOLDER/ld-wrapper" O="$OUT" gki_defconfig
